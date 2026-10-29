@@ -1593,6 +1593,13 @@ answer a probe rather than a person. They also answer different questions: `/hea
 nothing, `/readyz` asks the store whether the index is usable. Collapsing them gives you a
 liveness probe that restarts a healthy process because a database file is briefly locked.
 
+`/readyz` answers in bounded time however busy the process is. It runs one constant query (not a
+count of the index), concurrent probes share it, and if the store has not replied in two seconds
+the answer is the last one it gave, for up to two minutes after its last yes. A store that errors
+is unready at once. `GET /api/v1/health` bounds each check the same way: one that outlasts twenty
+seconds, or starts after the sixty-second budget is spent, is reported `unknown` ("not measured")
+and the others still answer.
+
 Both are unauthenticated, so both carry `{"status": …}` and nothing else — no counts, no
 configuration and no reason for an unready answer. "412 documents, chunker structural" is a
 corpus fingerprint, and so, more quietly, is the text of a database error. What "ready" *means*

@@ -18,7 +18,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, bindparam, delete, func, insert, or_, select, update
+from sqlalchemy import (
+    String,
+    and_,
+    bindparam,
+    delete,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+    tuple_,
+    type_coerce,
+    update,
+)
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -107,6 +120,16 @@ def _relation_is_not(fingerprint: str) -> ColumnElement[bool]:
     started.
     """
     return (models.Document.relation_fp.is_(None)) | (models.Document.relation_fp != fingerprint)
+
+
+def _parse_is_not_current(current: Collection[str]) -> ColumnElement[bool]:
+    """Documents whose parse lineage is not one of ``current``, ``NULL`` included.
+
+    Shared by the selection and its count so a plan and the run it plans cannot disagree about
+    what stale means. An empty ``current`` selects everything, which is the ``notin_`` of an
+    empty list.
+    """
+    return (models.Document.parse_fp.is_(None)) | (models.Document.parse_fp.notin_(list(current)))
 
 
 LISTABLE_FILTER_FIELDS: Final = frozenset(
@@ -1118,17 +1141,36 @@ class SqliteDocStore(
                 row.failed_stage = None
             return len(rows)
 
+    async def ping(self) -> None:
+        """Answer one constant query, to show the database opens and responds.
+
+        What a readiness probe asks instead of :meth:`count_documents`, which scans every live
+        document of the workspace: on a large index kept on network storage that is seconds
+        of I/O spent to learn nothing a ``SELECT 1`` does not. It still takes a pooled
+        connection, so a database that cannot be opened or read fails here exactly as it
+        would for a real request.
+        """
+        async with self._sessions() as session:
+            await session.execute(select(1))
+
     async def count_documents(
         self,
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        parse_fp_current: Collection[str] | None = None,
+        unretained: bool = False,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
         relation_fp_other_than: str | None = None,
         relation_fp_unrecorded: bool = False,
     ) -> int:
         """How many live documents match, counted in the database.
+
+        ``parse_fp_current`` and ``unretained`` are :meth:`select_documents`' predicates of the
+        same names, here so a plan of a corpus-wide re-parse is one count rather than a walk:
+        on a few hundred thousand documents paging the selection with a growing ``OFFSET`` is
+        quadratic, and a dry run that never finishes tells the operator nothing.
 
         ``glossary_fp_other_than`` answers ``doctor``'s question — how many documents hold
         entries the installed detector did not produce — over the indexed column alone, so the
@@ -1157,6 +1199,10 @@ class SqliteDocStore(
             statement = statement.where(models.Document.source == source)
         if statuses is not None:
             statement = statement.where(models.Document.status.in_(list(statuses)))
+        if parse_fp_current is not None:
+            statement = statement.where(_parse_is_not_current(parse_fp_current))
+        if unretained:
+            statement = statement.where(models.Document.original_ref.is_(None))
         if glossary_fp_other_than is not None:
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if glossary_fp_unrecorded:
@@ -1211,10 +1257,15 @@ class SqliteDocStore(
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
+
+        ``unretained`` keeps only documents with no retained original, the ones a re-parse
+        cannot reach.
 
         ``chunk_fp_other_than`` is what makes invalidation set-valued: "everything a different
         chunker built" is one indexed predicate, so a grammar upgrade repairs the documents in
@@ -1247,6 +1298,11 @@ class SqliteDocStore(
         mean anything: ``created_at`` alone is not unique, so two documents written in the same
         millisecond could swap places between pages and one of them would never be returned.
         The id breaks the tie, so the order is total and stable across calls.
+
+        ``after`` is the same cursor without the counting: documents strictly past a
+        ``(created_at, id)`` position, found by seeking ``ix_documents_workspace_id_created_at_id``
+        rather than by reading and discarding ``offset`` rows. Use it for a sweep over a corpus
+        too large for the offset to be cheap, which :meth:`selection_cursor` supplies.
         """
         statement = (
             select(models.Document)
@@ -1268,14 +1324,22 @@ class SqliteDocStore(
                 | (models.Document.chunk_fp != chunk_fp_other_than)
             )
         if parse_fp_current is not None:
-            statement = statement.where(
-                (models.Document.parse_fp.is_(None))
-                | (models.Document.parse_fp.notin_(list(parse_fp_current)))
-            )
+            statement = statement.where(_parse_is_not_current(parse_fp_current))
         if glossary_fp_other_than is not None:
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if relation_fp_other_than is not None:
             statement = statement.where(_relation_is_not(relation_fp_other_than))
+        if unretained:
+            statement = statement.where(models.Document.original_ref.is_(None))
+        if after is not None:
+            position_at, position_id = after
+            # A row value, not `created_at > x OR (created_at = x AND id > y)`: SQLite seeks the
+            # index for the first and only filters from the start of the workspace for the
+            # second, which is the scan this cursor exists to avoid.
+            statement = statement.where(
+                tuple_(models.Document.created_at, models.Document.id)
+                > tuple_(type_coerce(position_at, UtcDateTime()), literal(position_id, String()))
+            )
         if limit is not None:
             statement = statement.limit(limit)
         if offset:
@@ -1283,6 +1347,20 @@ class SqliteDocStore(
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
             return [to_document(row) for row in rows]
+
+    async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
+        """Where a document sits in :meth:`select_documents`' order, or ``None`` if it is gone.
+
+        Soft-deleted rows still have a position: it is the row, not its visibility, that the
+        order is made of.
+        """
+        statement = select(models.Document.created_at).where(
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.id == document_id,
+        )
+        async with self._sessions() as session:
+            created_at = (await session.execute(statement)).scalar_one_or_none()
+        return None if created_at is None else (created_at, document_id)
 
     # --- index state ------------------------------------------------------------------------
 

@@ -1,6 +1,13 @@
 {% extends layout %}
 {% import "macros.html" as m %}
 {% block content %}
+{% if pending %}
+<section class="panel">
+  <h2>Counting</h2>
+  <p>The counts and checks are being computed for the first time since this server started.
+  On a large index that takes a few minutes. Reload this page shortly.</p>
+</section>
+{% else %}
 
 <section class="cards">
   {% if panels.stats.ok %}
@@ -40,8 +47,11 @@
   {% else %}{{ m.failed(panels.doctor) }}{% endif %}
 </section>
 
+<p class="muted">Counts and checks as of {{ as_of }}; they refresh in the background.</p>
+
 <p class="muted">
   Documents arrive through <code>manicule index &lt;path&gt;</code> or a configured connector.
   There is no upload here, and that is deliberate — see Settings.
 </p>
+{% endif %}
 {% endblock %}

@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, update
 
 from manicule.core.acquisition import AcquisitionFence
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
@@ -823,3 +823,84 @@ async def test_paging_the_selection_returns_each_document_once_and_in_one_order(
     assert len(every) == 5
     assert paged == every, "two pages disagreed about which documents lie between them"
     assert await store.select_documents(offset=5) == []
+
+
+async def test_keyset_pages_partition_the_selection_exactly_as_offset_pages_do(
+    store: SqliteDocStore,
+) -> None:
+    """``after`` walks the same order ``offset`` does, one page at a time, with nothing between.
+
+    The cursor is read from the store for the last document of each page and handed back, which
+    is the sweep's own loop; the concatenation must equal the unpaged answer.
+    """
+    for index in range(5):
+        await store.upsert_document(make_document(source_id=f"keyset-{index}"))
+    every = [document.id for document in await store.select_documents()]
+
+    paged: list[str] = []
+    cursor = None
+    while page := await store.select_documents(limit=2, after=cursor):
+        paged.extend(document.id for document in page)
+        cursor = await store.selection_cursor(page[-1].id)
+
+    assert paged == every
+    assert await store.selection_cursor("no-such-document") is None
+
+
+async def test_a_keyset_cursor_breaks_a_created_at_tie_on_the_id(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """Two rows stamped the same instant are told apart by id, not skipped or repeated."""
+    for index in range(3):
+        await store.upsert_document(make_document(source_id=f"tie-{index}"))
+    ids = [document.id for document in await store.select_documents()]
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(models.Document).values(created_at=datetime(2026, 1, 1, tzinfo=UTC))
+        )
+
+    tied = [document.id for document in await store.select_documents()]
+    assert sorted(ids) == tied, "a tie is ordered by id"
+    cursor = await store.selection_cursor(tied[0])
+    assert cursor is not None
+    after = [document.id for document in await store.select_documents(after=cursor)]
+
+    assert after == tied[1:]
+
+
+async def test_a_keyset_page_seeks_the_created_at_index_rather_than_scanning_to_the_cursor(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The query plan, because the fake store cannot tell a seek from a scan.
+
+    ``created_at > x OR (created_at = x AND id > y)`` restricts the index to the workspace and
+    filters from its start, which is the quadratic cost the cursor exists to remove. The plan
+    must bound ``created_at`` as well as the workspace.
+    """
+    await store.upsert_document(make_document(source_id="plan"))
+    cursor = (datetime(2026, 1, 1, tzinfo=UTC), "x")
+    captured: list[tuple[str, object]] = []
+
+    def observe(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if "FROM documents" in statement and "ORDER BY" in statement:
+            captured.append((statement, parameters))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", observe)
+    try:
+        await store.select_documents(parse_fp_current=["p"], limit=10, after=cursor)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe)
+
+    statement, parameters = captured[-1]
+    async with engine.connect() as connection:
+        plan = await connection.exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)  # type: ignore[arg-type]
+        details = " ".join(str(row[3]) for row in plan)
+    assert "ix_documents_workspace_id_created_at_id" in details
+    assert "created_at,id)>" in details, details

@@ -37,6 +37,8 @@ repair, and they are exactly the ones an operator needs named.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
@@ -63,8 +65,10 @@ if TYPE_CHECKING:
     from manicule.core.protocols import Embedder, VectorStore
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.pipeline import BlobSink, DocumentOutcome, IngestPipeline
-    from manicule.ingest.ports import GlossaryStore, IngestStore
+    from manicule.ingest.ports import GlossaryStore, IngestStore, SelectionCursor
 
+
+_LOG = logging.getLogger(__name__)
 
 NO_RETAINED_BYTES = "no retained bytes (original_ref is unset); only a forced re-sync can repair it"
 """Why a document cannot be re-parsed, worded once.
@@ -161,6 +165,7 @@ async def select(
     relation_fingerprint: RelationFingerprint | None = None,
     limit: int | None = None,
     offset: int = 0,
+    after: SelectionCursor | None = None,
 ) -> Sequence[Document]:
     """The documents a repair verb should run over.
 
@@ -201,9 +206,11 @@ async def select(
     rather than in either, which is almost never what a repair wants — one repair, one stage,
     one fingerprint.
 
-    ``offset`` is for the caller that repairs what it selects: see :func:`re_parse_stale`,
-    which is the only one, and :meth:`~manicule.ingest.ports.IngestStore.select_documents` for
-    why a page number would be the wrong cursor for a set that shrinks under it.
+    ``offset`` is for the caller that repairs what it selects, and ``after`` is the same thing
+    without the counting: a position to resume from, which :func:`re_parse_stale` uses so that a
+    page costs the same at the end of a large selection as at the start. See
+    :meth:`~manicule.ingest.ports.IngestStore.select_documents` for why a page number would be
+    the wrong cursor for a set that shrinks under it.
     """
     current = (
         {fingerprint.canonical() for fingerprint in parse_fingerprints}
@@ -220,6 +227,7 @@ async def select(
         relation_fp_other_than=(relation_fingerprint.canonical() if relation_fingerprint else None),
         limit=limit,
         offset=offset,
+        after=after,
     )
 
 
@@ -581,6 +589,9 @@ def _fold_outcome(report: ReindexReport, outcome: DocumentOutcome) -> None:
         report.chunks += outcome.chunks
 
 
+SWEEP_PROGRESS_INTERVAL_S: Final = 30.0
+"""How often a corpus-wide sweep logs where it has got to."""
+
 DEFAULT_SWEEP_BATCH = 25
 """How many documents one page of the sweep holds.
 
@@ -588,6 +599,10 @@ Small, because the page is not where the work is. A document costs a parse, a ch
 embedding pass, and those are serialized anyway — so a larger page buys nothing but a longer
 window in which an interrupted run has read rows it will not reach.
 """
+
+
+PLAN_NAMED_UNREPAIRABLE = 50
+"""How many unrepairable documents a dry run names; the rest are counted."""
 
 
 @dataclass
@@ -684,7 +699,6 @@ async def plan_stale(
     *,
     store: IngestStore,
     parse_fingerprints: Collection[ParseFingerprint],
-    batch: int = DEFAULT_SWEEP_BATCH,
 ) -> StaleSweep:
     """What :func:`re_parse_stale` would do. The selection, and nothing else.
 
@@ -702,27 +716,27 @@ async def plan_stale(
     Args:
         store: Where the selection is queried.
         parse_fingerprints: What every installed parser would produce now.
-        batch: Documents per page.
 
     Returns:
         A sweep marked ``dry_run``, carrying ``selected`` and the unrepairable documents.
     """
+    current = {fingerprint.canonical() for fingerprint in parse_fingerprints}
     sweep = StaleSweep(dry_run=True)
-    while True:
-        # The offset is the count, exactly: a plan repairs nothing, so every document it has
-        # seen is still in the selection and still in front of the next page.
-        page = await select(
-            store, parse_fingerprints=parse_fingerprints, limit=batch, offset=sweep.selected
+    # Two counts and one bounded listing, never a walk. This paged the whole selection with a
+    # growing OFFSET, which on a few hundred thousand documents is quadratic and did not
+    # finish in thirteen hours; the counts are the same predicates the run selects with.
+    sweep.selected = await store.count_documents(parse_fp_current=current)
+    sweep.unrepairable = await store.count_documents(parse_fp_current=current, unretained=True)
+    named = await store.select_documents(
+        parse_fp_current=current, unretained=True, limit=PLAN_NAMED_UNREPAIRABLE
+    )
+    for document in named:
+        sweep.unrepairable_documents.append(f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}")
+    if sweep.unrepairable > PLAN_NAMED_UNREPAIRABLE:
+        sweep.unrepairable_documents.append(
+            f"... and {sweep.unrepairable - PLAN_NAMED_UNREPAIRABLE} more with no retained bytes"
         )
-        if not page:
-            return sweep
-        for document in page:
-            sweep.selected += 1
-            if document.original_ref is None:
-                sweep.unrepairable += 1
-                sweep.unrepairable_documents.append(
-                    f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}"
-                )
+    return sweep
 
 
 async def re_parse_stale(
@@ -741,13 +755,22 @@ async def re_parse_stale(
     on a connector sync. This is that sweep, and it touches no connector and no network —
     every byte it parses comes out of the blob store.
 
-    **Paged, and the cursor is the count of documents left behind rather than a page number.**
-    A repaired document leaves the selection, so the set shrinks under the iteration; an
-    unrepairable one stays in it forever. Counting pages would skip the documents that shifted
-    forward, and starting from zero every time would re-read the same unrepairable prefix until
-    the end of the world. Advancing by exactly the documents this pass did *not* remove from
-    the set is right in both directions, and it is what makes the sweep terminate on a corpus
-    where nothing can be repaired at all.
+    **Paged by position, not by count.** The cursor is the ``(created_at, id)`` of the last
+    document of the previous page, and the next page is everything strictly after it in the
+    store's total order. Position survives what a count cannot: a repaired document leaves the
+    selection and an unrepairable one stays, and neither moves the cursor, because it names a
+    place rather than a number of rows to step over. The cursor advances past every document
+    the pass looked at, repaired or not, so the sweep terminates on a corpus where nothing can
+    be repaired at all.
+
+    **Why not the offset it used to carry.** An ``OFFSET`` is counted from the start of the
+    selection on every page, so a corpus that leaves most of its documents selected (hundreds
+    of thousands of media types no parser takes) made each page read everything before it: the
+    sweep was quadratic in the selection. The keyset seeks instead, so the rows read are the
+    rows swept. It also made the arithmetic that kept the offset honest unnecessary — a
+    read-back after every document to decide whether to step the count back — and that is gone.
+    What stays is the read-back *before* a document is re-parsed, which answers a different
+    question (is the snapshot's copy still stale?) and has nothing to do with the cursor.
 
     **A document is the transaction boundary.** Each one is committed by the pipeline before
     the next is read, so an interrupted run — ``Ctrl-C``, a killed process, a canceled task —
@@ -777,28 +800,43 @@ async def re_parse_stale(
     """
     sweep = StaleSweep()
     current = {fingerprint.canonical() for fingerprint in parse_fingerprints}
-    left_behind = 0
+    total = await store.count_documents(parse_fp_current=current)
+    last_logged = time.monotonic()
+    cursor: SelectionCursor | None = None
     while True:
-        page = await select(
-            store, parse_fingerprints=parse_fingerprints, limit=batch, offset=left_behind
-        )
+        page = await select(store, parse_fingerprints=parse_fingerprints, limit=batch, after=cursor)
         if not page:
             return sweep
+        # A long run is told apart from a stuck one by this line and nothing else: the report
+        # prints once, at the end, and a corpus-wide sweep can run for hours.
+        if time.monotonic() - last_logged >= SWEEP_PROGRESS_INTERVAL_S:
+            last_logged = time.monotonic()
+            _LOG.info(
+                "stale re-parse progress: %d of %d selected at the start, %d repaired, "
+                "%d failed, %d unrepairable",
+                sweep.selected,
+                total,
+                sweep.reparsed,
+                sweep.failed,
+                sweep.unrepairable,
+            )
+        # Taken before any document of the page is touched, because a repair can replace a row
+        # and a position can only be read from a row that exists. The last document that still
+        # has one is the cursor; a page whose every row vanished since it was read keeps the old
+        # cursor, and the next query no longer returns them.
+        for document in reversed(page):
+            position = await store.selection_cursor(document.id)
+            if position is not None:
+                cursor = position
+                break
         for document in page:
             sweep.selected += 1
-            # Unconditional, and it is the loop's termination argument rather than a detail: a
-            # document this pass repairs leaves the selection and a document it does not stays
-            # in it, so the cursor has to move past everything in the second class. Counting
-            # from the start of the page and correcting downwards for successes would be the
-            # same arithmetic with one more way to get it wrong.
-            left_behind += 1
             # Read again, because the selection is a snapshot and a container earlier in this
             # sweep may have re-derived this document since: a mail attachment recorded with no
             # lineage is selected beside its message, and the message's re-parse replaces it
             # with a current row. Re-parsing the snapshot after that is superseded by the
             # replacement it just made, and used to leave the row `parsing` on the way.
             if await _left_the_selection(store, document.id, current):
-                left_behind -= 1
                 continue
             before = {chunk.id for chunk in await store.document_chunks(document.id)}
             report, inside = await _re_parse_judged(document, pipeline=pipeline, blobs=blobs)
@@ -809,8 +847,7 @@ async def re_parse_stale(
             # a document that failed at the store contributes the passes it had already spent.
             sweep.embedding = _total(_total(sweep.embedding, report.embedding), inside.embedding)
             # Named, and not counted: a member that failed is a document somebody has to look
-            # at, but it is not the one this pass selected, and counting it here skipped the
-            # read-back below — leaving the cursor past a document that had left the selection.
+            # at, but it is not the one this pass selected.
             sweep.failures.extend(inside.failures)
             if report.unrepairable:
                 sweep.unrepairable += 1
@@ -823,13 +860,6 @@ async def re_parse_stale(
             if report.superseded:
                 sweep.superseded += 1
                 sweep.superseded_documents.extend(report.superseded)
-                # The cursor follows the *selection*, not the outcome, so a superseded document
-                # gets the same read-back a repaired one gets. A sync that overtook this
-                # document usually left it carrying a current fingerprint, so it is gone from
-                # the selection and counting it as left behind would step the offset past a
-                # document nobody has looked at.
-                if await _left_the_selection(store, document.id, current):
-                    left_behind -= 1
                 continue
             sweep.reparsed += 1
             after = {chunk.id for chunk in await store.document_chunks(document.id)}
@@ -839,19 +869,15 @@ async def re_parse_stale(
                 sweep.unchanged += 1
             else:
                 sweep.changed += 1
-            if await _left_the_selection(store, document.id, current):
-                left_behind -= 1
 
 
 async def _left_the_selection(
     store: IngestStore, document_id: str, current: Collection[str]
 ) -> bool:
-    """Whether a document the sweep has finished with is out of the selection now.
+    """Whether a document from the sweep's snapshot is out of the selection now.
 
-    Read back rather than assumed. A successful re-parse usually records a current fingerprint
-    and leaves the selection — but not always, and the exception is the one that would hang the
-    loop: a parser manicule does not ship records nothing, so the document is repaired, still
-    selected, and has to keep its place in the cursor.
+    Read back rather than assumed, because the snapshot goes stale while a page is worked: a
+    sibling's re-parse can replace this document with a current row before the sweep reaches it.
     """
     rebuilt = await store.get_document(document_id)
     return rebuilt is not None and rebuilt.parse_fp in current

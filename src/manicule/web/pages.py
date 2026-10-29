@@ -37,7 +37,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 # Imported at run time rather than under `TYPE_CHECKING`: FastAPI resolves a handler's return
 # annotation to build the schema, and a forward reference it cannot resolve is a failure at
@@ -53,6 +53,7 @@ from manicule.web.security import Guest, Operator, Reader
 
 if TYPE_CHECKING:
     from manicule.app.results import Payload
+    from manicule.web.snapshots import SnapshotCache
 
 router = APIRouter(prefix="/ui", tags=["web"])
 
@@ -97,20 +98,26 @@ async def script() -> PlainTextResponse:
 # --- dashboard --------------------------------------------------------------------------------
 
 
+COLD_DASHBOARD_WAIT_S = 3.0
+"""How long the first dashboard request waits before saying the counts are still being computed."""
+
+
 @router.get("", name="ui_dashboard", summary="What this installation holds, at a glance.")
-async def dashboard(service: Service, caller: Reader) -> HTMLResponse:
+async def dashboard(request: Request, service: Service, caller: Reader) -> HTMLResponse:
     """Counts, the diagnosis, and the workspaces — the three a viewer may read.
 
     Deliberately not ``index_status``: the fingerprints and the data directory are an admin's,
     on the API and therefore here. The settings area shows them.
+
+    **Served from a snapshot** (:mod:`manicule.web.snapshots`), because the counts and the
+    diagnosis are O(index) and a refresh must not start another walk. The page says when the
+    snapshot was taken. None of the three is the reader's own — they are the workspace's — so
+    one snapshot per workspace serves every reader.
     """
-    return render(
-        "dashboard.html",
-        area="dashboard",
-        title="Dashboard",
-        service=service,
-        caller=caller,
-        panels=await panels(
+    cache: SnapshotCache = request.app.state.dashboard_snapshots
+    snapshot = await cache.get(
+        service.workspace,
+        lambda: panels(
             service,
             {
                 "stats": ("stats", service.stats),
@@ -118,6 +125,19 @@ async def dashboard(service: Service, caller: Reader) -> HTMLResponse:
                 "workspaces": ("workspace_list", service.workspace_list),
             },
         ),
+        wait_s=COLD_DASHBOARD_WAIT_S,
+    )
+    return render(
+        "dashboard.html",
+        area="dashboard",
+        title="Dashboard",
+        service=service,
+        caller=caller,
+        panels=snapshot.panels if snapshot else {},
+        extra={
+            "pending": snapshot is None,
+            "as_of": snapshot.taken_at.strftime("%Y-%m-%d %H:%M:%S UTC") if snapshot else "",
+        },
     )
 
 

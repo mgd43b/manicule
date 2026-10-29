@@ -2186,7 +2186,6 @@ class _Ingestion:
             return await plan_stale(
                 store=store,  # pyright: ignore[reportArgumentType] - it satisfies IngestStore
                 parse_fingerprints=current,
-                batch=batch,
             )
         return await re_parse_stale(
             store=store,  # pyright: ignore[reportArgumentType] - the store satisfies IngestStore

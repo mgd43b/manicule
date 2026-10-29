@@ -50,6 +50,10 @@ if TYPE_CHECKING:
     from manicule.core.sources import EnumerationProgress, SourceId, Watermark
 
 
+type SelectionCursor = tuple[datetime, str]
+"""A position in the repair selection: ``(created_at, id)``, the store's total order."""
+
+
 @runtime_checkable
 class IngestStore(Protocol):
     """The relational operations one ingest run performs.
@@ -265,12 +269,17 @@ class IngestStore(Protocol):
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        parse_fp_current: Collection[str] | None = None,
+        unretained: bool = False,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
         relation_fp_other_than: str | None = None,
         relation_fp_unrecorded: bool = False,
     ) -> int:
         """How many documents match. A count, so a diagnostic need not page a corpus.
+
+        ``parse_fp_current`` and ``unretained`` are :meth:`select_documents`' predicates, so a
+        plan counts its selection instead of paging it.
 
         ``glossary_fp_other_than`` is here rather than only on :meth:`select_documents`
         because ``doctor`` asks the question and wants the number: an operator is told how many
@@ -295,10 +304,14 @@ class IngestStore(Protocol):
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        after: SelectionCursor | None = None,
     ) -> Sequence[Document]:
         """The selection ``reindex`` runs over. A query, never a scan.
+
+        ``unretained`` keeps only documents with no retained original (``original_ref`` unset).
 
         Args:
             source: Restrict to one connector.
@@ -334,6 +347,25 @@ class IngestStore(Protocol):
                 that never ends. Advancing this by the number of documents a pass *left
                 behind* is the one cursor that is right in both directions, and it is only
                 sound because the order is stable across calls.
+
+                **Cost grows with the offset**, because the store counts past every skipped
+                row on every page. A sweep over a large corpus that leaves most of it selected
+                should use ``after`` instead.
+            after: Return only the documents strictly after this position in the store's order,
+                from :meth:`selection_cursor`. A keyset cursor: the store seeks to the position
+                rather than counting up to it, so a page costs the same however far into the
+                selection it is, and it names a place rather than a count, so documents that
+                leave the selection behind it, or ahead of it, move nothing.
+        """
+        ...
+
+    async def selection_cursor(self, document_id: str) -> SelectionCursor | None:
+        """Where a document sits in :meth:`select_documents`' order, or ``None`` if it is gone.
+
+        Read from the store rather than derived from the :class:`Document`, which does not carry
+        the creation timestamp the order is made of. ``None`` means the row no longer exists
+        (hard-deleted since it was selected), which a caller treats as having no position to
+        resume from.
         """
         ...
 
