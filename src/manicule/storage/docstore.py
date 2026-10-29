@@ -18,7 +18,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, bindparam, delete, func, insert, select, update
+from sqlalchemy import (
+    String,
+    and_,
+    bindparam,
+    delete,
+    func,
+    insert,
+    literal,
+    select,
+    tuple_,
+    type_coerce,
+    update,
+)
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -1211,6 +1223,7 @@ class SqliteDocStore(
         relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
 
@@ -1245,6 +1258,11 @@ class SqliteDocStore(
         mean anything: ``created_at`` alone is not unique, so two documents written in the same
         millisecond could swap places between pages and one of them would never be returned.
         The id breaks the tie, so the order is total and stable across calls.
+
+        ``after`` is the same cursor without the counting: documents strictly past a
+        ``(created_at, id)`` position, found by seeking ``ix_documents_workspace_id_created_at_id``
+        rather than by reading and discarding ``offset`` rows. Use it for a sweep over a corpus
+        too large for the offset to be cheap, which :meth:`selection_cursor` supplies.
         """
         statement = (
             select(models.Document)
@@ -1274,6 +1292,15 @@ class SqliteDocStore(
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if relation_fp_other_than is not None:
             statement = statement.where(_relation_is_not(relation_fp_other_than))
+        if after is not None:
+            position_at, position_id = after
+            # A row value, not `created_at > x OR (created_at = x AND id > y)`: SQLite seeks the
+            # index for the first and only filters from the start of the workspace for the
+            # second, which is the scan this cursor exists to avoid.
+            statement = statement.where(
+                tuple_(models.Document.created_at, models.Document.id)
+                > tuple_(type_coerce(position_at, UtcDateTime()), literal(position_id, String()))
+            )
         if limit is not None:
             statement = statement.limit(limit)
         if offset:
@@ -1281,6 +1308,20 @@ class SqliteDocStore(
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
             return [to_document(row) for row in rows]
+
+    async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
+        """Where a document sits in :meth:`select_documents`' order, or ``None`` if it is gone.
+
+        Soft-deleted rows still have a position: it is the row, not its visibility, that the
+        order is made of.
+        """
+        statement = select(models.Document.created_at).where(
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.id == document_id,
+        )
+        async with self._sessions() as session:
+            created_at = (await session.execute(statement)).scalar_one_or_none()
+        return None if created_at is None else (created_at, document_id)
 
     # --- index state ------------------------------------------------------------------------
 

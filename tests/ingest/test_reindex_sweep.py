@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, override
 import pytest
 
 from manicule.core.anchors import LineAnchor
-from manicule.core.content import BlockKind, DocumentStatus, ParsedBlock, RawDocument
+from manicule.core.content import BlockKind, Document, DocumentStatus, ParsedBlock, RawDocument
 from manicule.core.ids import content_hash
 from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
 from manicule.ingest.reindex import plan_stale, re_parse_stale, select
@@ -25,10 +25,10 @@ from tests.ingest.test_pipeline import build, parse_versions
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection, Sequence
+    from datetime import datetime
 
     from pydantic import JsonValue
 
-    from manicule.core.content import Document
     from manicule.core.embedding import Vector
     from manicule.core.fingerprints import ParseFingerprint
     from manicule.core.sources import DocRef
@@ -90,6 +90,7 @@ class BoundedSelects(fakes.MemoryIngestStore):
         relation_fp_other_than: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         self.selects += 1
         if self.selects > self.ceiling:
@@ -109,6 +110,7 @@ class BoundedSelects(fakes.MemoryIngestStore):
             relation_fp_other_than=relation_fp_other_than,
             limit=limit,
             offset=offset,
+            after=after,
         )
 
 
@@ -381,6 +383,47 @@ async def test_a_document_no_installed_parser_versions_is_swept_once_and_stays_s
 
 
 # --- the dry run ------------------------------------------------------------------------------
+
+
+async def test_the_rows_a_sweep_reads_grow_with_the_corpus_and_not_with_its_square() -> None:
+    """A selection that stays selected must cost one read per document, not one per page-prefix.
+
+    Every document here is unrepairable, so none leaves the selection: the case where an offset
+    cursor counts past an ever longer prefix on each page. Doubling the corpus must double the
+    rows read, with room for the one empty page that ends the sweep.
+    """
+
+    async def rows_read(count: int) -> int:
+        store = fakes.MemoryIngestStore()
+        for number in range(count):
+            await store.upsert_document(
+                Document(
+                    id=f"doc-{number:05d}",
+                    source="s",
+                    source_id=f"id-{number}",
+                    uri=f"file:///{number}",
+                    content_hash="h",
+                    media_type=MEDIA_TYPE,
+                )
+            )
+        blobs = fakes.MemoryBlobs()
+        pipeline, _, _ = build(
+            store=store, blobs=blobs, parse_fingerprints=parse_versions(lines="2")
+        )
+        sweep = await re_parse_stale(
+            store=store,
+            pipeline=pipeline,
+            blobs=blobs,
+            parse_fingerprints=fingerprints("2"),
+            batch=100,
+        )
+        assert (sweep.selected, sweep.unrepairable) == (count, count)
+        return store.rows_read
+
+    small, large = await rows_read(1500), await rows_read(3000)
+
+    assert small == 1500
+    assert large == 3000
 
 
 async def test_a_dry_run_reports_the_same_selection_and_writes_nothing_anywhere() -> None:
