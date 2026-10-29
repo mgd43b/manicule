@@ -37,6 +37,8 @@ repair, and they are exactly the ones an operator needs named.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
@@ -65,6 +67,8 @@ if TYPE_CHECKING:
     from manicule.ingest.pipeline import BlobSink, DocumentOutcome, IngestPipeline
     from manicule.ingest.ports import GlossaryStore, IngestStore, SelectionCursor
 
+
+_LOG = logging.getLogger(__name__)
 
 NO_RETAINED_BYTES = "no retained bytes (original_ref is unset); only a forced re-sync can repair it"
 """Why a document cannot be re-parsed, worded once.
@@ -585,6 +589,9 @@ def _fold_outcome(report: ReindexReport, outcome: DocumentOutcome) -> None:
         report.chunks += outcome.chunks
 
 
+SWEEP_PROGRESS_INTERVAL_S: Final = 30.0
+"""How often a corpus-wide sweep logs where it has got to."""
+
 DEFAULT_SWEEP_BATCH = 25
 """How many documents one page of the sweep holds.
 
@@ -592,6 +599,10 @@ Small, because the page is not where the work is. A document costs a parse, a ch
 embedding pass, and those are serialized anyway — so a larger page buys nothing but a longer
 window in which an interrupted run has read rows it will not reach.
 """
+
+
+PLAN_NAMED_UNREPAIRABLE = 50
+"""How many unrepairable documents a dry run names; the rest are counted."""
 
 
 @dataclass
@@ -688,7 +699,6 @@ async def plan_stale(
     *,
     store: IngestStore,
     parse_fingerprints: Collection[ParseFingerprint],
-    batch: int = DEFAULT_SWEEP_BATCH,
 ) -> StaleSweep:
     """What :func:`re_parse_stale` would do. The selection, and nothing else.
 
@@ -706,27 +716,27 @@ async def plan_stale(
     Args:
         store: Where the selection is queried.
         parse_fingerprints: What every installed parser would produce now.
-        batch: Documents per page.
 
     Returns:
         A sweep marked ``dry_run``, carrying ``selected`` and the unrepairable documents.
     """
+    current = {fingerprint.canonical() for fingerprint in parse_fingerprints}
     sweep = StaleSweep(dry_run=True)
-    while True:
-        # The offset is the count, exactly: a plan repairs nothing, so every document it has
-        # seen is still in the selection and still in front of the next page.
-        page = await select(
-            store, parse_fingerprints=parse_fingerprints, limit=batch, offset=sweep.selected
+    # Two counts and one bounded listing, never a walk. This paged the whole selection with a
+    # growing OFFSET, which on a few hundred thousand documents is quadratic and did not
+    # finish in thirteen hours; the counts are the same predicates the run selects with.
+    sweep.selected = await store.count_documents(parse_fp_current=current)
+    sweep.unrepairable = await store.count_documents(parse_fp_current=current, unretained=True)
+    named = await store.select_documents(
+        parse_fp_current=current, unretained=True, limit=PLAN_NAMED_UNREPAIRABLE
+    )
+    for document in named:
+        sweep.unrepairable_documents.append(f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}")
+    if sweep.unrepairable > PLAN_NAMED_UNREPAIRABLE:
+        sweep.unrepairable_documents.append(
+            f"... and {sweep.unrepairable - PLAN_NAMED_UNREPAIRABLE} more with no retained bytes"
         )
-        if not page:
-            return sweep
-        for document in page:
-            sweep.selected += 1
-            if document.original_ref is None:
-                sweep.unrepairable += 1
-                sweep.unrepairable_documents.append(
-                    f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}"
-                )
+    return sweep
 
 
 async def re_parse_stale(
@@ -790,11 +800,26 @@ async def re_parse_stale(
     """
     sweep = StaleSweep()
     current = {fingerprint.canonical() for fingerprint in parse_fingerprints}
+    total = await store.count_documents(parse_fp_current=current)
+    last_logged = time.monotonic()
     cursor: SelectionCursor | None = None
     while True:
         page = await select(store, parse_fingerprints=parse_fingerprints, limit=batch, after=cursor)
         if not page:
             return sweep
+        # A long run is told apart from a stuck one by this line and nothing else: the report
+        # prints once, at the end, and a corpus-wide sweep can run for hours.
+        if time.monotonic() - last_logged >= SWEEP_PROGRESS_INTERVAL_S:
+            last_logged = time.monotonic()
+            _LOG.info(
+                "stale re-parse progress: %d of %d selected at the start, %d repaired, "
+                "%d failed, %d unrepairable",
+                sweep.selected,
+                total,
+                sweep.reparsed,
+                sweep.failed,
+                sweep.unrepairable,
+            )
         # Taken before any document of the page is touched, because a repair can replace a row
         # and a position can only be read from a row that exists. The last document that still
         # has one is the cursor; a page whose every row vanished since it was read keeps the old

@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI, Request
@@ -97,6 +98,7 @@ from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import PolicyError, RateLimitedError
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.serve import surface as mcp_surface
+from manicule.web.snapshots import SnapshotCache
 
 NOT_FOUND = 404
 
@@ -110,7 +112,7 @@ opposite of what the probe exists to prevent.
 """
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from starlette.responses import Response
 
@@ -339,6 +341,21 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
         json_response=True,
     )
 
+    snapshots = SnapshotCache()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        """The MCP lifespan, then the dashboard's background walks stopped before it returns.
+
+        A refresh can run for minutes; it must be canceled and awaited before the runtime
+        closes the database engine underneath it.
+        """
+        try:
+            async with mcp.lifespan(app):
+                yield
+        finally:
+            await snapshots.aclose()
+
     app = FastAPI(
         title=TITLE,
         version=CORE_VERSION,
@@ -348,10 +365,11 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
         redoc_url=None,
-        lifespan=mcp.lifespan,
+        lifespan=lifespan,
     )
     app.state.service = service
     app.state.proxy_policy = ProxyPolicy.of(settings)
+    app.state.dashboard_snapshots = snapshots
     app.state.route_groups = ROUTE_GROUPS
     # How a sign-in reaches an identity provider. `None` is the network; a suite replaces it
     # with a transport that plays the provider, so no test of the sign-in routes leaves this

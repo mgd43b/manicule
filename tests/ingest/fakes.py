@@ -483,17 +483,24 @@ class MemoryIngestStore:
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        parse_fp_current: Collection[str] | None = None,
+        unretained: bool = False,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
         relation_fp_other_than: str | None = None,
         relation_fp_unrecorded: bool = False,
     ) -> int:
+        before = self.rows_read
         found = await self.select_documents(
             source=source,
             statuses=statuses,
+            parse_fp_current=parse_fp_current,
+            unretained=unretained,
             glossary_fp_other_than=glossary_fp_other_than,
             relation_fp_other_than=relation_fp_other_than,
         )
+        # A count is one SQL aggregate, not rows delivered to the caller.
+        self.rows_read = before
         if glossary_fp_unrecorded:
             found = [d for d in found if d.id not in self.glossary_lineage_by_id]
         if relation_fp_unrecorded:
@@ -510,6 +517,7 @@ class MemoryIngestStore:
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
@@ -532,6 +540,8 @@ class MemoryIngestStore:
         if parse_fp_current is not None:
             current = set(parse_fp_current)
             chosen = [d for d in chosen if d.parse_fp is None or d.parse_fp not in current]
+        if unretained:
+            chosen = [d for d in chosen if d.original_ref is None]
         if glossary_fp_other_than is not None:
             # Unrecorded counts as different, which is the half of the predicate a fake is most
             # likely to get wrong: `.get(id) != x` happens to be right here only because the

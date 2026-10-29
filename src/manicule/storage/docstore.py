@@ -119,6 +119,16 @@ def _relation_is_not(fingerprint: str) -> ColumnElement[bool]:
     return (models.Document.relation_fp.is_(None)) | (models.Document.relation_fp != fingerprint)
 
 
+def _parse_is_not_current(current: Collection[str]) -> ColumnElement[bool]:
+    """Documents whose parse lineage is not one of ``current``, ``NULL`` included.
+
+    Shared by the selection and its count so a plan and the run it plans cannot disagree about
+    what stale means. An empty ``current`` selects everything, which is the ``notin_`` of an
+    empty list.
+    """
+    return (models.Document.parse_fp.is_(None)) | (models.Document.parse_fp.notin_(list(current)))
+
+
 LISTABLE_FILTER_FIELDS: Final = frozenset(
     {
         "workspace_ids",
@@ -1145,12 +1155,19 @@ class SqliteDocStore(
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        parse_fp_current: Collection[str] | None = None,
+        unretained: bool = False,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
         relation_fp_other_than: str | None = None,
         relation_fp_unrecorded: bool = False,
     ) -> int:
         """How many live documents match, counted in the database.
+
+        ``parse_fp_current`` and ``unretained`` are :meth:`select_documents`' predicates of the
+        same names, here so a plan of a corpus-wide re-parse is one count rather than a walk:
+        on a few hundred thousand documents paging the selection with a growing ``OFFSET`` is
+        quadratic, and a dry run that never finishes tells the operator nothing.
 
         ``glossary_fp_other_than`` answers ``doctor``'s question — how many documents hold
         entries the installed detector did not produce — over the indexed column alone, so the
@@ -1179,6 +1196,10 @@ class SqliteDocStore(
             statement = statement.where(models.Document.source == source)
         if statuses is not None:
             statement = statement.where(models.Document.status.in_(list(statuses)))
+        if parse_fp_current is not None:
+            statement = statement.where(_parse_is_not_current(parse_fp_current))
+        if unretained:
+            statement = statement.where(models.Document.original_ref.is_(None))
         if glossary_fp_other_than is not None:
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if glossary_fp_unrecorded:
@@ -1233,11 +1254,15 @@ class SqliteDocStore(
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
+
+        ``unretained`` keeps only documents with no retained original, the ones a re-parse
+        cannot reach.
 
         ``chunk_fp_other_than`` is what makes invalidation set-valued: "everything a different
         chunker built" is one indexed predicate, so a grammar upgrade repairs the documents in
@@ -1296,14 +1321,13 @@ class SqliteDocStore(
                 | (models.Document.chunk_fp != chunk_fp_other_than)
             )
         if parse_fp_current is not None:
-            statement = statement.where(
-                (models.Document.parse_fp.is_(None))
-                | (models.Document.parse_fp.notin_(list(parse_fp_current)))
-            )
+            statement = statement.where(_parse_is_not_current(parse_fp_current))
         if glossary_fp_other_than is not None:
             statement = statement.where(_glossary_is_not(glossary_fp_other_than))
         if relation_fp_other_than is not None:
             statement = statement.where(_relation_is_not(relation_fp_other_than))
+        if unretained:
+            statement = statement.where(models.Document.original_ref.is_(None))
         if after is not None:
             position_at, position_id = after
             # A row value, not `created_at > x OR (created_at = x AND id > y)`: SQLite seeks the

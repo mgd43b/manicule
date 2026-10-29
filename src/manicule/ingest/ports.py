@@ -269,12 +269,17 @@ class IngestStore(Protocol):
         *,
         source: str | None = None,
         statuses: Collection[DocumentStatus] | None = None,
+        parse_fp_current: Collection[str] | None = None,
+        unretained: bool = False,
         glossary_fp_other_than: str | None = None,
         glossary_fp_unrecorded: bool = False,
         relation_fp_other_than: str | None = None,
         relation_fp_unrecorded: bool = False,
     ) -> int:
         """How many documents match. A count, so a diagnostic need not page a corpus.
+
+        ``parse_fp_current`` and ``unretained`` are :meth:`select_documents`' predicates, so a
+        plan counts its selection instead of paging it.
 
         ``glossary_fp_other_than`` is here rather than only on :meth:`select_documents`
         because ``doctor`` asks the question and wants the number: an operator is told how many
@@ -299,11 +304,14 @@ class IngestStore(Protocol):
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
         after: SelectionCursor | None = None,
     ) -> Sequence[Document]:
         """The selection ``reindex`` runs over. A query, never a scan.
+
+        ``unretained`` keeps only documents with no retained original (``original_ref`` unset).
 
         Args:
             source: Restrict to one connector.

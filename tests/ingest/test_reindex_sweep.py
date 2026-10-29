@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, override
 
 import pytest
 
@@ -88,11 +88,15 @@ class BoundedSelects(fakes.MemoryIngestStore):
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
-        self.selects += 1
+        # Only pages count: the fake's `count_documents` is built on this method, and a count is
+        # not the loop the ceiling guards.
+        if limit is not None:
+            self.selects += 1
         if self.selects > self.ceiling:
             msg = (
                 f"the sweep asked for the selection {self.selects} times, past the ceiling of "
@@ -108,6 +112,7 @@ class BoundedSelects(fakes.MemoryIngestStore):
             parse_fp_current=parse_fp_current,
             glossary_fp_other_than=glossary_fp_other_than,
             relation_fp_other_than=relation_fp_other_than,
+            unretained=unretained,
             limit=limit,
             offset=offset,
             after=after,
@@ -448,7 +453,7 @@ async def test_a_dry_run_reports_the_same_selection_and_writes_nothing_anywhere(
     parse_lineage = dict(store.parse_lineage)
     embedder.batches.clear()
 
-    planned = await plan_stale(store=store, parse_fingerprints=current, batch=1)
+    planned = await plan_stale(store=store, parse_fingerprints=current)
 
     assert planned.dry_run is True
     assert (planned.reparsed, planned.changed, planned.unchanged) == (0, 0, 0), (
@@ -498,6 +503,24 @@ async def test_a_dry_run_names_the_documents_that_have_no_bytes_to_re_parse() ->
     assert stranded.id in planned.unrepairable_documents[0]
     assert "re-sync" in planned.unrepairable_documents[0], "the plan names the remedy too"
     assert embedder.batches == batches, "a plan runs no model"
+
+
+async def test_a_dry_run_counts_its_selection_rather_than_paging_it() -> None:
+    """The plan was a walk with a growing OFFSET: quadratic, and 12 h without finishing."""
+    store, _, _, _, _ = await corpus({"a": "alpha", "b": "beta", "c": "gamma"})
+    offsets: list[int] = []
+    original = store.select_documents
+
+    async def counting(**kwargs: Any) -> Any:
+        offsets.append(kwargs.get("offset", 0))
+        return await original(**kwargs)
+
+    store.select_documents = counting
+
+    planned = await plan_stale(store=store, parse_fingerprints=fingerprints("2"))
+
+    assert planned.selected == 3
+    assert set(offsets) == {0}, "no page past the first is ever read"
 
 
 # --- stopping and starting again ---------------------------------------------------------------
