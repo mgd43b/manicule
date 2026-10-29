@@ -3861,7 +3861,7 @@ class ApplicationService:
         if self._ready_probe is None or self._ready_probe.done():
             self._ready_probe = asyncio.create_task(self._probe_ready())
         # `wait`, not `wait_for`: a probe that outlives this caller is not canceled, because the
-        # next caller joins it, and cancelling it would throw away a connection that is nearly
+        # next caller joins it, and canceling it would throw away a connection that is nearly
         # open for the sake of one that has not asked yet.
         await asyncio.wait({self._ready_probe}, timeout=READY_PROBE_SECONDS)
         if self._ready_answer is not None and self._ready_answer[1] >= now:
@@ -4039,10 +4039,10 @@ class ApplicationService:
             if remaining <= 0:
                 work.close()
                 return self._unfinished(names, "the diagnosis ran out of time before reaching it")
-            # `wait`, not `wait_for`: cancelling a check that is opening a SQLite connection
+            # `wait`, not `wait_for`: canceling a check that is opening a SQLite connection
             # waits for the open to finish (the pool does not let a cancellation interrupt
             # one), so `wait_for` would hold the diagnosis past its own deadline. The late
-            # task is cancelled and left to finish on its own; nothing waits for it.
+            # task is canceled and left to finish on its own; nothing waits for it.
             task = asyncio.ensure_future(work)
             await asyncio.wait({task}, timeout=remaining)
             if not task.done():
