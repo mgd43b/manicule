@@ -240,6 +240,9 @@ class FakeStore:
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]:
         return self.chunks.get(document_id, [])
 
+    async def ping(self) -> None:
+        return None
+
     async def count_documents(
         self,
         *,

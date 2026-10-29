@@ -920,6 +920,7 @@ class Document(Base):
             unique=True,
             sqlite_where=text("deleted_at IS NULL"),
         ),
+        Index("ix_documents_workspace_id_created_at_id", "workspace_id", "created_at", "id"),
         Index("ix_documents_workspace_id_status", "workspace_id", "status"),
         Index("ix_documents_workspace_id_uri", "workspace_id", "uri"),
         Index("ix_documents_workspace_id_source", "workspace_id", "source"),

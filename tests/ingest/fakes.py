@@ -193,6 +193,8 @@ class MemoryIngestStore:
 
         self.originals: dict[str, tuple[str | None, str | None]] = {}
         self.seen: dict[str, int] = {}
+        self.rows_read = 0
+        self._positions: dict[str, int] = {}
         self.deleted_at: dict[str, datetime] = {}
         self.updated_at: dict[str, datetime] = {}
         self.watermarks: dict[str, Watermark] = {}
@@ -488,6 +490,7 @@ class MemoryIngestStore:
         relation_fp_other_than: str | None = None,
         relation_fp_unrecorded: bool = False,
     ) -> int:
+        before = self.rows_read
         found = await self.select_documents(
             source=source,
             statuses=statuses,
@@ -496,6 +499,8 @@ class MemoryIngestStore:
             glossary_fp_other_than=glossary_fp_other_than,
             relation_fp_other_than=relation_fp_other_than,
         )
+        # A count is one SQL aggregate, not rows delivered to the caller.
+        self.rows_read = before
         if glossary_fp_unrecorded:
             found = [d for d in found if d.id not in self.glossary_lineage_by_id]
         if relation_fp_unrecorded:
@@ -515,6 +520,7 @@ class MemoryIngestStore:
         unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         chosen = [
             self._with_lineage(d) for d in self.documents.values() if d.id not in self.deleted_at
@@ -552,10 +558,33 @@ class MemoryIngestStore:
             chosen = [
                 d for d in chosen if self.relation_lineage_by_id.get(d.id) != relation_fp_other_than
             ]
+        if after is not None:
+            # Insertion order stands in for `(created_at, id)`: a row the store re-creates is a
+            # new row at the end, exactly as a dict re-insertion after a pop is.
+            chosen = [d for d in chosen if (self._position(d.id), d.id) > after]
         # Sliced after every predicate, in that order, because the store applies `OFFSET` to the
         # filtered result and a fake that skipped first would page through a different set.
         chosen = chosen[offset:]
-        return chosen[:limit] if limit is not None else chosen
+        page = chosen[:limit] if limit is not None else chosen
+        # What a real store reads to answer this: it counts past `offset` rows to start, whereas
+        # `after` is a seek and reads only what it returns. The sweeps' cost is asserted on this.
+        self.rows_read += offset + len(page)
+        return page
+
+    def _position(self, document_id: str) -> datetime:
+        """A document's fixed place in the order, assigned when first seen and never moved.
+
+        Like a stored ``created_at``: deleting an earlier document must not shift a later one's
+        position, or a cursor taken before the delete would point at the wrong row.
+        """
+        for known in self.documents:
+            self._positions.setdefault(known, len(self._positions))
+        return datetime(2000, 1, 1, tzinfo=UTC) + timedelta(seconds=self._positions[document_id])
+
+    async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
+        if document_id not in self.documents:
+            return None
+        return (self._position(document_id), document_id)
 
     # sync state
 

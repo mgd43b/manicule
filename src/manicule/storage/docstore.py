@@ -18,7 +18,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, bindparam, delete, func, insert, select, update
+from sqlalchemy import (
+    String,
+    and_,
+    bindparam,
+    delete,
+    func,
+    insert,
+    literal,
+    select,
+    tuple_,
+    type_coerce,
+    update,
+)
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -1126,6 +1138,18 @@ class SqliteDocStore(
                 row.failed_stage = None
             return len(rows)
 
+    async def ping(self) -> None:
+        """Answer one constant query, to show the database opens and responds.
+
+        What a readiness probe asks instead of :meth:`count_documents`, which scans every live
+        document of the workspace: on a large index kept on network storage that is seconds
+        of I/O spent to learn nothing a ``SELECT 1`` does not. It still takes a pooled
+        connection, so a database that cannot be opened or read fails here exactly as it
+        would for a real request.
+        """
+        async with self._sessions() as session:
+            await session.execute(select(1))
+
     async def count_documents(
         self,
         *,
@@ -1233,6 +1257,7 @@ class SqliteDocStore(
         unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> Sequence[Document]:
         """The selection a repair verb runs over. A query, never a scan.
 
@@ -1270,6 +1295,11 @@ class SqliteDocStore(
         mean anything: ``created_at`` alone is not unique, so two documents written in the same
         millisecond could swap places between pages and one of them would never be returned.
         The id breaks the tie, so the order is total and stable across calls.
+
+        ``after`` is the same cursor without the counting: documents strictly past a
+        ``(created_at, id)`` position, found by seeking ``ix_documents_workspace_id_created_at_id``
+        rather than by reading and discarding ``offset`` rows. Use it for a sweep over a corpus
+        too large for the offset to be cheap, which :meth:`selection_cursor` supplies.
         """
         statement = (
             select(models.Document)
@@ -1298,6 +1328,15 @@ class SqliteDocStore(
             statement = statement.where(_relation_is_not(relation_fp_other_than))
         if unretained:
             statement = statement.where(models.Document.original_ref.is_(None))
+        if after is not None:
+            position_at, position_id = after
+            # A row value, not `created_at > x OR (created_at = x AND id > y)`: SQLite seeks the
+            # index for the first and only filters from the start of the workspace for the
+            # second, which is the scan this cursor exists to avoid.
+            statement = statement.where(
+                tuple_(models.Document.created_at, models.Document.id)
+                > tuple_(type_coerce(position_at, UtcDateTime()), literal(position_id, String()))
+            )
         if limit is not None:
             statement = statement.limit(limit)
         if offset:
@@ -1305,6 +1344,20 @@ class SqliteDocStore(
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
             return [to_document(row) for row in rows]
+
+    async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
+        """Where a document sits in :meth:`select_documents`' order, or ``None`` if it is gone.
+
+        Soft-deleted rows still have a position: it is the row, not its visibility, that the
+        order is made of.
+        """
+        statement = select(models.Document.created_at).where(
+            models.Document.workspace_id == self._workspace_id,
+            models.Document.id == document_id,
+        )
+        async with self._sessions() as session:
+            created_at = (await session.execute(statement)).scalar_one_or_none()
+        return None if created_at is None else (created_at, document_id)
 
     # --- index state ------------------------------------------------------------------------
 
