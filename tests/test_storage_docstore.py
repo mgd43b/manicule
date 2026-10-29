@@ -866,3 +866,41 @@ async def test_a_keyset_cursor_breaks_a_created_at_tie_on_the_id(
     after = [document.id for document in await store.select_documents(after=cursor)]
 
     assert after == tied[1:]
+
+
+async def test_a_keyset_page_seeks_the_created_at_index_rather_than_scanning_to_the_cursor(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    """The query plan, because the fake store cannot tell a seek from a scan.
+
+    ``created_at > x OR (created_at = x AND id > y)`` restricts the index to the workspace and
+    filters from its start, which is the quadratic cost the cursor exists to remove. The plan
+    must bound ``created_at`` as well as the workspace.
+    """
+    await store.upsert_document(make_document(source_id="plan"))
+    cursor = (datetime(2026, 1, 1, tzinfo=UTC), "x")
+    captured: list[tuple[str, object]] = []
+
+    def observe(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if "FROM documents" in statement and "ORDER BY" in statement:
+            captured.append((statement, parameters))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", observe)
+    try:
+        await store.select_documents(parse_fp_current=["p"], limit=10, after=cursor)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe)
+
+    statement, parameters = captured[-1]
+    async with engine.connect() as connection:
+        plan = await connection.exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)  # type: ignore[arg-type]
+        details = " ".join(str(row[3]) for row in plan)
+    assert "ix_documents_workspace_id_created_at_id" in details
+    assert "created_at,id)>" in details, details

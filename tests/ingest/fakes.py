@@ -194,6 +194,7 @@ class MemoryIngestStore:
         self.originals: dict[str, tuple[str | None, str | None]] = {}
         self.seen: dict[str, int] = {}
         self.rows_read = 0
+        self._positions: dict[str, int] = {}
         self.deleted_at: dict[str, datetime] = {}
         self.updated_at: dict[str, datetime] = {}
         self.watermarks: dict[str, Watermark] = {}
@@ -550,8 +551,7 @@ class MemoryIngestStore:
         if after is not None:
             # Insertion order stands in for `(created_at, id)`: a row the store re-creates is a
             # new row at the end, exactly as a dict re-insertion after a pop is.
-            placed = {d.id: n for n, d in enumerate(self.documents.values())}
-            chosen = [d for d in chosen if (self._position(placed[d.id]), d.id) > after]
+            chosen = [d for d in chosen if (self._position(d.id), d.id) > after]
         # Sliced after every predicate, in that order, because the store applies `OFFSET` to the
         # filtered result and a fake that skipped first would page through a different set.
         chosen = chosen[offset:]
@@ -561,15 +561,20 @@ class MemoryIngestStore:
         self.rows_read += offset + len(page)
         return page
 
-    @staticmethod
-    def _position(index: int) -> datetime:
-        return datetime(2000, 1, 1, tzinfo=UTC) + timedelta(seconds=index)
+    def _position(self, document_id: str) -> datetime:
+        """A document's fixed place in the order, assigned when first seen and never moved.
+
+        Like a stored ``created_at``: deleting an earlier document must not shift a later one's
+        position, or a cursor taken before the delete would point at the wrong row.
+        """
+        for known in self.documents:
+            self._positions.setdefault(known, len(self._positions))
+        return datetime(2000, 1, 1, tzinfo=UTC) + timedelta(seconds=self._positions[document_id])
 
     async def selection_cursor(self, document_id: str) -> tuple[datetime, str] | None:
-        for index, known in enumerate(self.documents):
-            if known == document_id:
-                return (self._position(index), document_id)
-        return None
+        if document_id not in self.documents:
+            return None
+        return (self._position(document_id), document_id)
 
     # sync state
 
