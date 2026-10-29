@@ -18,6 +18,7 @@ from manicule.connectors.crawler_transport import (
     CrawlerHttpClient,
     CrawlerHttpConfig,
     DialResponse,
+    _parse_robots,  # pyright: ignore[reportPrivateUsage]
 )
 from manicule.connectors.errors import (
     CrawlerChallengeError,
@@ -197,6 +198,19 @@ async def test_robots_allow_precedence_cache_and_crawl_delay() -> None:
     ]
     assert [started for _, _, started in dialer.requests] == [0.0, 3.0, 6.0]
     assert clock.waits == [3.0, 3.0]
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        "Disallow: /docs/public\nAllow: /docs/public\n",
+        "Allow: /docs/public\nDisallow: /docs/public\n",
+    ],
+)
+def test_an_allow_beats_a_disallow_of_the_same_length_in_either_order(rules: str) -> None:
+    parsed = _parse_robots(f"User-agent: *\n{rules}".encode())
+
+    assert parsed.allows("ManiculeCrawler", page("public"))
 
 
 async def test_a_missing_robots_file_explicitly_allows_pages() -> None:
