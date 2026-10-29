@@ -50,7 +50,7 @@ async def test_concurrent_requests_share_one_computation() -> None:
     assert results[0] is not None
 
 
-async def test_a_cancelled_waiter_does_not_cancel_the_walk() -> None:
+async def test_a_canceled_waiter_does_not_cancel_the_walk() -> None:
     cache = SnapshotCache()
     walk = Computation()
 

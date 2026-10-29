@@ -347,7 +347,7 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         """The MCP lifespan, then the dashboard's background walks stopped before it returns.
 
-        A refresh can run for minutes; it must be cancelled and awaited before the runtime
+        A refresh can run for minutes; it must be canceled and awaited before the runtime
         closes the database engine underneath it.
         """
         try:
