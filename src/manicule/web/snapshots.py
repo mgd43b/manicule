@@ -10,10 +10,10 @@ envelopes :func:`~manicule.web.rendering.panels` builds, produced by the same op
 - **Coalesced.** Concurrent requests for a workspace await one computation.
 - **Served stale, refreshed behind.** Once a result exists it is returned immediately, with the
   moment it was taken, and an expired one starts a single background refresh.
-- **A failure is never called fresh.** A page with a failed panel is stored already expired when
-  it replaces an earlier snapshot (so an outage is shown, not hidden behind a stale healthy
-  page), and is not stored at all when there is nothing to replace. Either way the next request
-  recomputes, so an outage is not displayed for a TTL after it has ended.
+- **A failure is never called fresh.** A page with a failed panel is stored already expired, so
+  an outage is shown rather than hidden behind an older healthy page, and the next request
+  recomputes. A computation that raises outright is remembered and re-raised to the next
+  request until a refresh succeeds.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ class SnapshotCache:
 
     ttl_s: float = DEFAULT_TTL_S
     _snapshots: dict[str, Snapshot] = field(default_factory=dict[str, Snapshot])
+    _errors: dict[str, Exception] = field(default_factory=dict[str, Exception])
     _inflight: dict[str, asyncio.Task[Snapshot]] = field(
         default_factory=dict[str, asyncio.Task[Snapshot]]
     )
@@ -70,10 +71,14 @@ class SnapshotCache:
                 snapshot = Snapshot(
                     panels=computed, taken_at=datetime.now(UTC), monotonic=time.monotonic()
                 )
-                if snapshot.complete:
-                    self._snapshots[key] = snapshot
-                elif key in self._snapshots:
-                    self._snapshots[key] = replace(snapshot, monotonic=-math.inf)
+                self._snapshots[key] = (
+                    snapshot if snapshot.complete else replace(snapshot, monotonic=-math.inf)
+                )
+                self._errors.pop(key, None)
+            except Exception as error:
+                self._errors[key] = error
+                raise
+            else:
                 return snapshot
             finally:
                 self._inflight.pop(key, None)
@@ -99,6 +104,11 @@ class SnapshotCache:
         caller renders a page that says the counts are still being computed.
         """
         held = self._snapshots.get(key)
+        if (error := self._errors.get(key)) is not None:
+            # The last refresh raised, so the held page is no longer the truth. Say so, and
+            # try again; the refresh below clears this if it succeeds.
+            self._start(key, compute)
+            raise error
         if held is not None:
             if time.monotonic() - held.monotonic >= self.ttl_s:
                 self._start(key, compute)
@@ -110,3 +120,16 @@ class SnapshotCache:
                 return await asyncio.shield(self._start(key, compute))
         except TimeoutError:
             return None
+
+    @property
+    def running(self) -> int:
+        """How many computations are in flight."""
+        return len(self._inflight)
+
+    async def aclose(self) -> None:
+        """Cancel the walks still running and wait for them, before shared resources close."""
+        running = list(self._inflight.values())
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        self._inflight.clear()

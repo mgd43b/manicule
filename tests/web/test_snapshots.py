@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from manicule.app.results import Envelope, ErrorInfo
 from manicule.web.rendering import Panel
 from manicule.web.snapshots import SnapshotCache
@@ -81,16 +83,49 @@ async def test_an_expired_snapshot_is_served_at_once_and_refreshed_behind() -> N
     walk.release.set()
 
 
-async def test_a_failed_first_page_is_not_kept() -> None:
+async def test_a_failed_first_page_is_shown_expired_and_retried() -> None:
     cache = SnapshotCache()
     walk = Computation()
     walk.ok = False
     walk.release.set()
 
-    await cache.get("w", walk)
-    await cache.get("w", walk)
+    first = await cache.get("w", walk)
+    again = await cache.get("w", walk)
+    await asyncio.sleep(0.01)
 
-    assert walk.starts == 2
+    assert first is not None
+    assert not first.complete
+    assert again is not None
+    assert again.panels == first.panels, "a failed first walk is shown to the next request"
+    assert walk.starts == 2, "and it is retried"
+
+
+async def test_a_computation_that_raises_is_surfaced_not_hidden() -> None:
+    cache = SnapshotCache(ttl_s=0)
+    good = Computation()
+    good.release.set()
+    await cache.get("w", good)
+
+    async def broken() -> dict[str, Panel]:
+        msg = "database is locked"
+        raise RuntimeError(msg)
+
+    await cache.get("w", broken)  # stale served, refresh raises behind
+    await asyncio.sleep(0.01)
+    with pytest.raises(RuntimeError, match="locked"):
+        await cache.get("w", broken)
+
+
+async def test_closing_cancels_the_walks_still_running() -> None:
+    cache = SnapshotCache()
+    walk = Computation()
+    waiting = asyncio.create_task(cache.get("w", walk))
+    await asyncio.sleep(0)
+
+    await cache.aclose()
+
+    assert cache.running == 0
+    waiting.cancel()
 
 
 async def test_a_failed_refresh_replaces_the_healthy_snapshot_and_is_retried() -> None:
