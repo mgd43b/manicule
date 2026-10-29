@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.21](https://github.com/mgd43b/manicule/compare/v0.2.20...v0.2.21) (2026-10-29)
+
+
+### Bug Fixes
+
+* **api:** keep /readyz and doctor answering when the process is busy ([#520](https://github.com/mgd43b/manicule/issues/520)) ([e985548](https://github.com/mgd43b/manicule/commit/e9855487ea7ea4e6469d37c47554882dbc47b254))
+* **connectors:** decide robots rules by longest match on every Python 3.14 ([#526](https://github.com/mgd43b/manicule/issues/526)) ([e4b5707](https://github.com/mgd43b/manicule/commit/e4b570752b13d09c0181837549e1f21826c74690))
+* **web:** dashboard from a shared snapshot; reindex --stale --dry-run as a count ([#519](https://github.com/mgd43b/manicule/issues/519)) ([09dbc1e](https://github.com/mgd43b/manicule/commit/09dbc1e57da50220e3c9a08878ee74efd011fafa))
+
+
+### Performance Improvements
+
+* **ingest:** page the stale re-parse sweep by keyset, not offset ([#523](https://github.com/mgd43b/manicule/issues/523)) ([b617691](https://github.com/mgd43b/manicule/commit/b617691ebd0b6fe94fbd65e3ce211cc63bd36baf))
+
 ## [0.2.20](https://github.com/mgd43b/manicule/compare/v0.2.19...v0.2.20) (2026-10-28)
 
 
