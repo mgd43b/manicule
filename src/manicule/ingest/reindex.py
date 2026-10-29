@@ -37,6 +37,8 @@ repair, and they are exactly the ones an operator needs named.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
@@ -65,6 +67,8 @@ if TYPE_CHECKING:
     from manicule.ingest.pipeline import BlobSink, DocumentOutcome, IngestPipeline
     from manicule.ingest.ports import GlossaryStore, IngestStore
 
+
+_LOG = logging.getLogger(__name__)
 
 NO_RETAINED_BYTES = "no retained bytes (original_ref is unset); only a forced re-sync can repair it"
 """Why a document cannot be re-parsed, worded once.
@@ -581,6 +585,9 @@ def _fold_outcome(report: ReindexReport, outcome: DocumentOutcome) -> None:
         report.chunks += outcome.chunks
 
 
+SWEEP_PROGRESS_INTERVAL_S: Final = 30.0
+"""How often a corpus-wide sweep logs where it has got to."""
+
 DEFAULT_SWEEP_BATCH = 25
 """How many documents one page of the sweep holds.
 
@@ -781,12 +788,27 @@ async def re_parse_stale(
     sweep = StaleSweep()
     current = {fingerprint.canonical() for fingerprint in parse_fingerprints}
     left_behind = 0
+    total = await store.count_documents(parse_fp_current=current)
+    last_logged = time.monotonic()
     while True:
         page = await select(
             store, parse_fingerprints=parse_fingerprints, limit=batch, offset=left_behind
         )
         if not page:
             return sweep
+        # A long run is told apart from a stuck one by this line and nothing else: the report
+        # prints once, at the end, and a corpus-wide sweep can run for hours.
+        if time.monotonic() - last_logged >= SWEEP_PROGRESS_INTERVAL_S:
+            last_logged = time.monotonic()
+            _LOG.info(
+                "stale re-parse progress: %d of %d selected at the start, %d repaired, "
+                "%d failed, %d unrepairable",
+                sweep.selected,
+                total,
+                sweep.reparsed,
+                sweep.failed,
+                sweep.unrepairable,
+            )
         for document in page:
             sweep.selected += 1
             # Unconditional, and it is the loop's termination argument rather than a detail: a

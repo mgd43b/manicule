@@ -88,10 +88,14 @@ class BoundedSelects(fakes.MemoryIngestStore):
         parse_fp_current: Collection[str] | None = None,
         glossary_fp_other_than: str | None = None,
         relation_fp_other_than: str | None = None,
+        unretained: bool = False,
         limit: int | None = None,
         offset: int = 0,
     ) -> Sequence[Document]:
-        self.selects += 1
+        # Only pages count: the fake's `count_documents` is built on this method, and a count is
+        # not the loop the ceiling guards.
+        if limit is not None:
+            self.selects += 1
         if self.selects > self.ceiling:
             msg = (
                 f"the sweep asked for the selection {self.selects} times, past the ceiling of "
@@ -107,6 +111,7 @@ class BoundedSelects(fakes.MemoryIngestStore):
             parse_fp_current=parse_fp_current,
             glossary_fp_other_than=glossary_fp_other_than,
             relation_fp_other_than=relation_fp_other_than,
+            unretained=unretained,
             limit=limit,
             offset=offset,
         )
