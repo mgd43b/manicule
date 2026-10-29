@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, update
 
 from manicule.core.acquisition import AcquisitionFence
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
@@ -823,3 +823,44 @@ async def test_paging_the_selection_returns_each_document_once_and_in_one_order(
     assert len(every) == 5
     assert paged == every, "two pages disagreed about which documents lie between them"
     assert await store.select_documents(offset=5) == []
+
+
+async def test_keyset_pages_partition_the_selection_exactly_as_offset_pages_do(
+    store: SqliteDocStore,
+) -> None:
+    """``after`` walks the same order ``offset`` does, one page at a time, with nothing between.
+
+    The cursor is read from the store for the last document of each page and handed back, which
+    is the sweep's own loop; the concatenation must equal the unpaged answer.
+    """
+    for index in range(5):
+        await store.upsert_document(make_document(source_id=f"keyset-{index}"))
+    every = [document.id for document in await store.select_documents()]
+
+    paged: list[str] = []
+    cursor = None
+    while page := await store.select_documents(limit=2, after=cursor):
+        paged.extend(document.id for document in page)
+        cursor = await store.selection_cursor(page[-1].id)
+
+    assert paged == every
+    assert await store.selection_cursor("no-such-document") is None
+
+
+async def test_a_keyset_cursor_breaks_a_created_at_tie_on_the_id(store: SqliteDocStore) -> None:
+    """Two rows stamped the same instant are told apart by id, not skipped or repeated."""
+    for index in range(3):
+        await store.upsert_document(make_document(source_id=f"tie-{index}"))
+    ids = [document.id for document in await store.select_documents()]
+    async with store._sessions() as session, session.begin():
+        await session.execute(
+            update(models.Document).values(created_at=datetime(2026, 1, 1, tzinfo=UTC))
+        )
+
+    tied = [document.id for document in await store.select_documents()]
+    assert sorted(ids) == tied, "a tie is ordered by id"
+    cursor = await store.selection_cursor(tied[0])
+    assert cursor is not None
+    after = [document.id for document in await store.select_documents(after=cursor)]
+
+    assert after == tied[1:]

@@ -18,7 +18,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
-from sqlalchemy import and_, bindparam, delete, func, insert, select, update
+from sqlalchemy import (
+    String,
+    and_,
+    bindparam,
+    delete,
+    func,
+    insert,
+    literal,
+    select,
+    tuple_,
+    type_coerce,
+    update,
+)
 from sqlalchemy import text as sql
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -1282,9 +1294,12 @@ class SqliteDocStore(
             statement = statement.where(_relation_is_not(relation_fp_other_than))
         if after is not None:
             position_at, position_id = after
+            # A row value, not `created_at > x OR (created_at = x AND id > y)`: SQLite seeks the
+            # index for the first and only filters from the start of the workspace for the
+            # second, which is the scan this cursor exists to avoid.
             statement = statement.where(
-                (models.Document.created_at > position_at)
-                | ((models.Document.created_at == position_at) & (models.Document.id > position_id))
+                tuple_(models.Document.created_at, models.Document.id)
+                > tuple_(type_coerce(position_at, UtcDateTime()), literal(position_id, String()))
             )
         if limit is not None:
             statement = statement.limit(limit)
