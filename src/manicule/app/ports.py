@@ -112,6 +112,14 @@ class DocumentSurface(Protocol):
 
     async def document_chunks(self, document_id: str) -> Sequence[Chunk]: ...
 
+    async def ping(self) -> None:
+        """Return if the store opens and answers a constant query; raise if it does not.
+
+        Constant on purpose: the readiness probe asks it, and a probe must not cost a scan of
+        the index.
+        """
+        ...
+
     async def count_documents(
         self,
         *,

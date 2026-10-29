@@ -117,7 +117,14 @@ from manicule.storage.config import VECTOR_STORE_NAME
 from manicule.storage.history import RESTORED_AFTER_PURGE_DETAIL
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+    from collections.abc import (
+        AsyncIterator,
+        Callable,
+        Coroutine,
+        Iterable,
+        Mapping,
+        Sequence,
+    )
 
     import httpx
     from pydantic import SecretStr
@@ -877,6 +884,9 @@ class ApplicationService:
 
     def __init__(self, backend: Backend, *, serving_unauthenticated: bool = False) -> None:
         self._backend = backend
+        self._ready_probe: asyncio.Task[None] | None = None
+        self._ready_answer: tuple[bool, float] | None = None
+        self._ready_last_ok: float | None = None
         self._serving_unauthenticated = serving_unauthenticated
         """Whether this process is serving without authentication, deliberately.
 
@@ -3837,13 +3847,46 @@ class ApplicationService:
 
         It reports nothing about the corpus. A probe is reachable by whatever can reach the
         port, and "412 documents" is a corpus fingerprint.
+
+        **It answers in bounded time however busy the process is.** The question is one
+        constant query (:meth:`~manicule.app.ports.DocumentSurface.ping`), not a count of the
+        index; concurrent probes share one query; and an answer is reused for a second. If the
+        store has not replied within :data:`READY_PROBE_SECONDS` the answer is the last one it
+        gave, for up to :data:`READY_STALE_GRACE_SECONDS` — slow is not the same as down, and
+        a store that errors, or has been silent for the whole grace, is reported unready.
         """
+        now = time.monotonic()
+        if self._ready_answer is not None and now - self._ready_answer[1] < READY_REUSE_SECONDS:
+            return self._ready_answer[0]
+        if self._ready_probe is None or self._ready_probe.done():
+            self._ready_probe = asyncio.create_task(self._probe_ready())
+        # `wait`, not `wait_for`: a probe that outlives this caller is not canceled, because the
+        # next caller joins it, and canceling it would throw away a connection that is nearly
+        # open for the sake of one that has not asked yet.
+        await asyncio.wait({self._ready_probe}, timeout=READY_PROBE_SECONDS)
+        if self._ready_answer is not None and self._ready_answer[1] >= now:
+            return self._ready_answer[0]
+        # No answer in time. A busy server is not a broken one, so a store that answered
+        # recently still counts; one that has said nothing for the whole grace, or never has,
+        # does not.
+        last_ok = self._ready_last_ok
+        return last_ok is not None and time.monotonic() - last_ok < READY_STALE_GRACE_SECONDS
+
+    async def _probe_ready(self) -> None:
+        """Ask the store one constant question and remember the answer, whoever is waiting."""
         try:
             store = await self._backend.documents()
-            await store.count_documents()
-        except (ManiculeError, ValueError, OSError):
-            return False
-        return True
+            await store.ping()
+        except Exception:  # noqa: BLE001 - any failure to open the store means not ready
+            # Broad because this runs as a task nobody awaits: an exception outside the usual
+            # few would be dropped, leave the last yes standing, and report a broken store ready.
+            _log.debug("readiness probe failed", exc_info=True)
+            self._ready_answer = (False, time.monotonic())
+            self._ready_last_ok = None
+            return
+        now = time.monotonic()
+        self._ready_answer = (True, now)
+        self._ready_last_ok = now
 
     async def stats(self) -> r.Stats:
         """Counts, grouped the three ways anybody asks for."""
@@ -3878,55 +3921,151 @@ class ApplicationService:
                 thing an operator asks for rather than something a health page does on their
                 behalf. ``tests/app/test_surface_parity.py`` holds that line.
         """
-        checks: list[r.Check] = [
-            self._configuration_check(),
-            await self._transport_check(),
-            self._sign_in_check(),
-            self._plugin_check(),
-        ]
-        checks.append(await self._storage_check())
+        deadline = time.monotonic() + DOCTOR_BUDGET_SECONDS
+        checks: list[r.Check] = [self._configuration_check()]
+        checks.extend(await self._bounded(("transport",), self._transport_check(), deadline))
+        checks.extend([self._sign_in_check(), self._plugin_check()])
+        checks.extend(await self._bounded(("storage",), self._storage_check(), deadline))
         # After the storage check, which is what creates the data directory on a fresh
         # install. Asking about the modes of a directory that does not exist yet would report
         # "not created" on every first run, which reads as a fault and is not one.
-        checks.append(await self._permissions_check())
-        checks.append(await self._index_check())
+        checks.extend(await self._bounded(("permissions",), self._permissions_check(), deadline))
+        checks.extend(await self._bounded(("index",), self._index_check(), deadline))
         # After the index check, which is what reports the fingerprints these vectors were
         # made with. Numerical integrity is the next question down: not whether the right
         # model produced them, but whether what it produced is still on disk unchanged.
-        checks.append(await self._vector_integrity_check())
+        checks.extend(
+            await self._bounded(("vector_integrity",), self._vector_integrity_check(), deadline)
+        )
         # After it, and for a different axis again: not whether the numbers are intact but
         # whether the pointer naming them means anything to the backend now configured.
-        checks.append(await self._vector_backend_check())
-        checks.append(await self._glossary_check())
-        checks.append(await self._connectors_check())
+        checks.extend(
+            await self._bounded(("vector_backend",), self._vector_backend_check(), deadline)
+        )
+        checks.extend(await self._bounded(("glossary",), self._glossary_check(), deadline))
+        checks.extend(await self._bounded(("connectors",), self._connectors_check(), deadline))
         # Adjacent, and after it, because both are about what a connector's documents are doing
         # now rather than what they are filed under: whether deletion detection is keeping up,
         # and whether it is waiting on a person.
-        checks.extend(await self._reconciliation_checks())
-        checks.append(await self._authoring_check())
-        checks.append(await self._collection_membership_check())
-        checks.append(await self._sessions_check())
-        checks.append(await self._gmail_credential_check())
-        checks.append(await self._security_alerts_check())
-        checks.append(await self._document_identity_check())
-        checks.append(await self._document_content_check())
+        checks.extend(
+            await self._bounded(
+                ("reconciliation-overdue", "reconciliation-proposals"),
+                self._reconciliation_checks(),
+                deadline,
+            )
+        )
+        checks.extend(await self._bounded(("authoring",), self._authoring_check(), deadline))
+        checks.extend(
+            await self._bounded(
+                ("collection-membership",), self._collection_membership_check(), deadline
+            )
+        )
+        checks.extend(await self._bounded(("sessions",), self._sessions_check(), deadline))
+        checks.extend(
+            await self._bounded(("gmail-credential",), self._gmail_credential_check(), deadline)
+        )
+        checks.extend(
+            await self._bounded(("security_alerts",), self._security_alerts_check(), deadline)
+        )
+        checks.extend(
+            await self._bounded(("document-identity",), self._document_identity_check(), deadline)
+        )
+        checks.extend(
+            await self._bounded(("document-content",), self._document_content_check(), deadline)
+        )
         # After the two content checks and for the same reason they are adjacent: this one is
         # also about what is *in* a document rather than about whether the machinery works.
-        checks.append(await self._extractable_text_check())
-        checks.append(await self._wiki_provenance_check())
-        checks.append(await self._grammar_check(fix=fix))
-        checks.append(await self._vocabulary_check(fix=fix))
+        checks.extend(
+            await self._bounded(("extractable-text",), self._extractable_text_check(), deadline)
+        )
+        checks.extend(
+            await self._bounded(("wiki-provenance",), self._wiki_provenance_check(), deadline)
+        )
+        # The two that repair are not bounded when asked to: a download that is being waited
+        # for on purpose is not a stall.
+        checks.extend(
+            await self._bounded(
+                ("grammars",), self._grammar_check(fix=fix), deadline, unbounded=fix
+            )
+        )
+        checks.extend(
+            await self._bounded(
+                ("vocabularies",), self._vocabulary_check(fix=fix), deadline, unbounded=fix
+            )
+        )
         # No `fix`. The other two repairs move megabytes and finish while somebody is looking
         # at the command; this one would move over a gigabyte, and `doctor --fix` is what a
         # person runs to un-break a machine, not what they run to spend ten minutes. It
         # reports, and names the command that fetches.
-        checks.append(await self._model_check())
-        checks.extend(await self._backend.component_checks())
+        checks.extend(await self._bounded(("models",), self._model_check(), deadline))
+        checks.extend(
+            await self._bounded(("component",), self._backend.component_checks(), deadline)
+        )
         worst: r.CheckState = "ok"
         for check in checks:
             if _severity(check.state) > _severity(worst):
                 worst = check.state
         return r.Diagnosis(state=worst, checks=tuple(checks))
+
+    async def _bounded(
+        self,
+        names: tuple[str, ...],
+        work: Coroutine[Any, Any, r.Check | Sequence[r.Check]],
+        deadline: float,
+        *,
+        unbounded: bool = False,
+    ) -> list[r.Check]:
+        """Run one check, or say it did not finish, so ``doctor`` never hangs on one.
+
+        Most checks read the store, and a store busy with a long ingest on slow storage can
+        take minutes to answer a query that is instant otherwise. A diagnosis that waits for
+        that is no use to the probe or the person asking, so a check that outlasts
+        :data:`DOCTOR_CHECK_SECONDS`, or that starts after :data:`DOCTOR_BUDGET_SECONDS` of
+        the whole diagnosis is spent, is reported ``unknown`` with a sentence saying so and the
+        rest are still answered. ``unknown`` is not ``ok``: the check is not claimed to have
+        passed.
+
+        Args:
+            names: What the check reports under, so the stand-in has the stable name a
+                monitor selects on. Several for a helper that reports several.
+            work: The check, not yet awaited.
+            deadline: ``time.monotonic()`` by which the whole diagnosis should be finished.
+            unbounded: Wait as long as it takes, for a repair someone is waiting on.
+        """
+        if unbounded:
+            outcome = await work
+        else:
+            remaining = min(DOCTOR_CHECK_SECONDS, deadline - time.monotonic())
+            if remaining <= 0:
+                work.close()
+                return self._unfinished(names, "the diagnosis ran out of time before reaching it")
+            # `wait`, not `wait_for`: canceling a check that is opening a SQLite connection
+            # waits for the open to finish (the pool does not let a cancellation interrupt
+            # one), so `wait_for` would hold the diagnosis past its own deadline. The late
+            # task is canceled and left to finish on its own; nothing waits for it.
+            task = asyncio.ensure_future(work)
+            await asyncio.wait({task}, timeout=remaining)
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_discard_outcome)
+                return self._unfinished(
+                    names, f"it did not finish within {remaining:.0f}s; the system may be busy"
+                )
+            outcome = task.result()
+        return [outcome] if isinstance(outcome, r.Check) else list(outcome)
+
+    @staticmethod
+    def _unfinished(names: tuple[str, ...], reason: str) -> list[r.Check]:
+        return [
+            r.Check(
+                name=name,
+                state="unknown",
+                detail=f"not measured: {reason}",
+                facts={"measured": False},
+                remedy="manicule doctor",
+            )
+            for name in names
+        ]
 
     def _configuration_check(self) -> r.Check:
         problems = self.settings.policy_problems()
@@ -9425,9 +9564,30 @@ def _millis(started: float) -> int:
     return max(int((time.monotonic() - started) * 1000), 0)
 
 
+def _discard_outcome(task: asyncio.Future[Any]) -> None:
+    """Collect a late check's result or error so the loop does not warn about it."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _severity(state: r.CheckState) -> int:
     return {"ok": 0, "degraded": 1, "failing": 2, "unknown": 1}.get(state, 1)
 
+
+READY_PROBE_SECONDS = 2.0
+"""How long ``/readyz`` waits for the store before answering from the last answer it has."""
+
+READY_REUSE_SECONDS = 1.0
+"""How long a readiness answer, either way, is reused instead of asking the store again."""
+
+READY_STALE_GRACE_SECONDS = 120.0
+"""How long a store that has stopped answering is still reported ready, after its last yes."""
+
+DOCTOR_CHECK_SECONDS = 20.0
+"""How long one ``doctor`` check may run when serving, before it is reported ``unknown``."""
+
+DOCTOR_BUDGET_SECONDS = 60.0
+"""How long a whole served ``doctor`` may run; checks after it is spent are reported unmeasured."""
 
 GMAIL_PROBE_TTL_SECONDS = 30.0
 """How long a Gmail source's probe result is reused.

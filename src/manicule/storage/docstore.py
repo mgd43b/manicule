@@ -1128,6 +1128,18 @@ class SqliteDocStore(
                 row.failed_stage = None
             return len(rows)
 
+    async def ping(self) -> None:
+        """Answer one constant query, to show the database opens and responds.
+
+        What a readiness probe asks instead of :meth:`count_documents`, which scans every live
+        document of the workspace: on a large index kept on network storage that is seconds
+        of I/O spent to learn nothing a ``SELECT 1`` does not. It still takes a pooled
+        connection, so a database that cannot be opened or read fails here exactly as it
+        would for a real request.
+        """
+        async with self._sessions() as session:
+            await session.execute(select(1))
+
     async def count_documents(
         self,
         *,
