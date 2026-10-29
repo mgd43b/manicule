@@ -873,7 +873,8 @@ answers included. Roles decide what a person may do, not what they may read.
   `gmail` connector type is registered as *sensitive* (`sensitive=True` beside its
   `config_model`; `ComponentRegistry.sensitive_names`). An installation refuses to serve with
   `security.auth.mode = "none"` when either holds:
-  - an enabled connector instance is of a sensitive type; or
+  - an enabled connector instance is of a sensitive type (`gmail` and, since
+    [`mbox.md`](mbox.md), `mbox`); or
   - **the data directory holds any document, in any state, from a source a sensitive connector
     has synced.** The first sync of a sensitive source records that durably, in
     `connectors.sensitive_synced_at` on the source's row, beside its stored sync state — before
@@ -881,7 +882,9 @@ answers included. Roles decide what a person may do, not what they may read.
     clears it. The check asks whether any `documents` row, in any workspace of the data
     directory, still carries a marked source's name, with no filter on status or `deleted_at`:
     soft-deleted rows count, and so do purged ones, which keep their title — for mail, the
-    subject (§7).
+    subject (§7); or
+  - the data directory holds a document whose media type is `message/rfc822` or
+    `application/vnd.ms-outlook`, whichever connector indexed it ([`mbox.md`](mbox.md) §7).
 
   The refusal applies in the two places that make a listener, `resolve_bind` (the MCP and HTTP
   socket servers) and `build_app` (an application started by something other than

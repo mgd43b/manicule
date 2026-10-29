@@ -20,12 +20,14 @@ from manicule.connectors.config import (
     FILESYSTEM_CONNECTOR_NAME,
     GIT_SITE_CONNECTOR_NAME,
     GMAIL_CONNECTOR_NAME,
+    MBOX_CONNECTOR_NAME,
     SNAPSHOT_CONNECTOR_NAME,
     ConfluenceConfig,
     ConfluenceSnapshotConfig,
     FilesystemConfig,
     GitSiteConfig,
     GmailConfig,
+    MboxConfig,
     resolve_credentials,
     resolve_gmail_credentials,
 )
@@ -44,6 +46,7 @@ __all__ = [
     "build_filesystem",
     "build_git_site",
     "build_gmail",
+    "build_mbox",
 ]
 
 
@@ -266,6 +269,52 @@ def build_gmail(context: BuildContext) -> Connector:
     )
 
 
+def build_mbox(context: BuildContext) -> Connector:
+    """Construct the mbox-archive connector from validated configuration.
+
+    The document store is resolved here so that ``skip_known_message_ids`` can ask which
+    ``Message-ID`` values the other mail sources hold (``docs/connectors/mbox.md`` §6); nothing is
+    read until a walk needs it. The other mail sources are the configured instances of type
+    ``gmail`` or ``mbox`` other than this one, enabled or not, since a disabled source's documents
+    stay in the index.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, or names no root.
+    """
+    from manicule.connectors.mbox import MboxConnector  # noqa: PLC0415
+
+    settings = context.config
+    if not isinstance(settings, MboxConfig):
+        msg = (
+            f"connector {MBOX_CONNECTOR_NAME!r} was built with {type(settings).__name__} where "
+            f"it declares MboxConfig."
+        )
+        raise ConfigError(msg)
+    if not settings.root:
+        raise ConfigError(
+            _no_root(
+                context,
+                MBOX_CONNECTOR_NAME,
+                describe="mbox file or directory of them",
+                example="mail",
+            )
+        )
+    name = _source_name(context, MBOX_CONNECTOR_NAME)
+    mail_types = {GMAIL_CONNECTOR_NAME, MBOX_CONNECTOR_NAME}
+    others = sorted(
+        other
+        for other, configured in context.settings.connectors.items()
+        if configured.type in mail_types and other != name
+    )
+    return MboxConnector(
+        settings,
+        name=name,
+        store=context.components.get(keys.DOC_STORE),
+        other_sources=others,
+        cache_dir=context.cache_dir / "mbox",
+    )
+
+
 class ConnectorsPlugin:
     """The plugin object the ``connectors`` entry point resolves to."""
 
@@ -273,7 +322,7 @@ class ConnectorsPlugin:
         name="connectors",
         version="0.1.0",
         core_version=">=0.1,<0.3",
-        summary="Sources manicule ingests from: files, pinned Git sites, Confluence and Gmail.",
+        summary="Sources manicule ingests from: files, Git sites, Confluence, Gmail, mbox.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -309,6 +358,16 @@ class ConnectorsPlugin:
             "scoped by label id, with deletions removed by complete reconciliation.",
             # The index is not permission-aware, so an installation holding mail must never be
             # served without authentication (`docs/connectors/gmail.md` §10).
+            sensitive=True,
+        )
+        registry.add(
+            keys.CONNECTOR.named(MBOX_CONNECTOR_NAME),
+            build_mbox,
+            config_model=MboxConfig,
+            summary="Old mail archives: every message in the unix mbox files under a root, "
+            "identified by a digest of its bytes, with messages another mail source holds skipped.",
+            # The same refusal as `gmail`: the index is not permission-aware
+            # (`docs/connectors/mbox.md` §7).
             sensitive=True,
         )
 
