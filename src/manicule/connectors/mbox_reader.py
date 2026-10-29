@@ -441,17 +441,15 @@ def read(path: Path, offset: int, length: int, digest: str) -> bytes:
 
 
 def is_mbox(path: Path) -> bool:
-    """Whether a file starts like an mbox (``mbox.md`` §2).
+    """Whether a file starts like an mbox (``mbox.md`` §2). Raises :class:`OSError` if it cannot be
+    opened: an unreadable file is not a file that is not mail, and the walk decides what it means.
 
     A ``From `` line that carries a time of day, as every writer's envelope line does, then a
     header field. The time is what keeps a text file that starts ``From the desk of…`` and happens
     to have a line like ``Thanks:`` next from being read as mail.
     """
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(_SNIFF_BYTES)
-    except OSError:
-        return False
+    with path.open("rb") as handle:
+        head = handle.read(_SNIFF_BYTES)
     if not head.startswith(b"From "):
         return False
     first, newline, rest = head.partition(b"\n")

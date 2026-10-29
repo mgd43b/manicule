@@ -312,6 +312,7 @@ def build_mbox(context: BuildContext) -> Connector:
         store=context.components.get(keys.DOC_STORE),
         other_sources=others,
         cache_dir=context.cache_dir / "mbox",
+        max_message_bytes=context.settings.ingest.max_fetch_bytes,
     )
 
 

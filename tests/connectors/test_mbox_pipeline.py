@@ -9,6 +9,7 @@ real document store, blob store and vector store. ``docs/connectors/mbox.md`` §
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,7 @@ import pytest
 import pytest_asyncio
 
 from manicule.connectors.config import MboxConfig
-from manicule.connectors.errors import NotFoundError
+from manicule.connectors.errors import ConnectorError, NotFoundError
 from manicule.connectors.mbox import MboxConnector
 from manicule.core.acquisition import MAX_DISCOVERY_BATCH
 from manicule.core.content import DocumentStatus, RawDocument
@@ -66,6 +67,7 @@ class Harness:
             store=self.store,
             other_sources=others,
             cache_dir=self.data_dir / "cache",
+            settle_seconds=0,
         )
 
     async def sync(
@@ -202,7 +204,7 @@ async def test_discovery_batches_never_exceed_the_journal_limit() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         write_mbox(Path(directory) / "Huge", messages(3_000))
-        connector = MboxConnector(MboxConfig(root=directory), name=NAME)
+        connector = MboxConnector(MboxConfig(root=directory), name=NAME, settle_seconds=0)
         sizes = [len(batch) async for batch in connector.discover_batches(None)]
     assert sum(sizes) == 3_000
     assert max(sizes) == MAX_DISCOVERY_BATCH
@@ -283,7 +285,13 @@ class Counting(MboxConnector):
 def counting(harness: Harness, **options: object) -> Counting:
     config = MboxConfig.model_validate({"root": str(harness.root), **options})
     Counting.fetched = 0
-    return Counting(config, name=NAME, store=harness.store, cache_dir=harness.data_dir / "cache")
+    return Counting(
+        config,
+        name=NAME,
+        store=harness.store,
+        cache_dir=harness.data_dir / "cache",
+        settle_seconds=0,
+    )
 
 
 async def test_an_unchanged_archive_costs_no_fetches_and_an_append_costs_only_the_new_messages(
@@ -315,20 +323,70 @@ async def test_changing_an_option_reads_every_file_again(harness: Harness) -> No
     assert sum(len(batch) for batch in batches) == 4
 
 
-async def test_a_file_that_cannot_be_read_is_tried_again_and_does_not_stop_the_run(
+async def test_a_full_walk_that_cannot_read_a_file_fails_and_an_incremental_one_carries_on(
     harness: Harness,
 ) -> None:
+    """§5.1: a full walk is recorded as the whole inventory, so it may not complete over a gap."""
     write_mbox(harness.root / "Good", messages(2))
     bad = write_mbox(harness.root / "Bad", messages(2, start=10))
     bad.chmod(0)
     try:
-        report = await harness.sync()
-        assert report.error == ""
-        assert len(await harness.live()) == 2
+        report = await harness.pipeline().run(harness.connector())
+        assert report.error, "the first walk is a full one"
+        assert "Bad" not in report.error
+        assert len(await harness.live()) == 0
     finally:
         bad.chmod(0o644)
     await harness.sync(harness.connector())
     assert len(await harness.live()) == 4
+
+    write_mbox(harness.root / "New", messages(1, start=30))
+    bad.chmod(0)
+    try:
+        report = await harness.sync(harness.connector())
+        assert len(await harness.live()) == 5, "an incremental walk reads what it can"
+    finally:
+        bad.chmod(0o644)
+
+
+async def test_a_file_still_being_written_is_left_for_the_next_sync(harness: Harness) -> None:
+    """§5.1: a half-appended message must not be indexed under the identity of its prefix."""
+    now = [1_000_000.0]
+
+    def connector() -> MboxConnector:
+        return MboxConnector(
+            MboxConfig(root=str(harness.root)),
+            name=NAME,
+            store=harness.store,
+            cache_dir=harness.data_dir / "cache",
+            clock=lambda: now[0],
+        )
+
+    path = write_mbox(harness.root / "Inbox", messages(2))
+    os.utime(path, (now[0] - 5, now[0] - 5))
+    await harness.sync(connector())
+    assert await harness.live() == {}, "modified five seconds ago"
+
+    now[0] += 120
+    await harness.sync(connector())
+    assert len(await harness.live()) == 2
+
+
+async def test_a_message_over_the_fetch_limit_is_refused_before_it_is_read(
+    harness: Harness,
+) -> None:
+    path = write_mbox(harness.root / "Big", [archives.padded(1, 50_000)])
+    connector = MboxConnector(
+        MboxConfig(root=str(harness.root)),
+        name=NAME,
+        cache_dir=harness.data_dir / "cache",
+        max_message_bytes=10_000,
+        settle_seconds=0,
+    )
+    (found,) = [d async for batch in connector.discover_batches(None) for d in batch]
+    with pytest.raises(ConnectorError, match="was not read"):
+        await connector.fetch(found.ref)
+    assert path.stat().st_size > 10_000
 
 
 async def test_a_missing_root_is_an_error_and_not_an_empty_archive(harness: Harness) -> None:

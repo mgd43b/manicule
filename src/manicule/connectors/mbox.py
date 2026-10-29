@@ -24,7 +24,8 @@ import json
 import logging
 import sqlite3
 import tempfile
-from collections.abc import AsyncIterator, Generator, Iterator, Sequence
+import time
+from collections.abc import AsyncIterator, Callable, Generator, Iterator, Sequence
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -68,6 +69,9 @@ _PATH: Final = "path"
 _OFFSET: Final = "offset"
 _LENGTH: Final = "length"
 _THUMBPRINT_BYTES: Final = 16
+
+SETTLE_SECONDS: Final = 60.0
+"""How long a file must be quiet before discovery reads it (``mbox.md`` §5.1)."""
 
 _SIDE_FILES: Final = frozenset({".msf"})
 """Thunderbird's summary files, skipped by name so they are not opened (``mbox.md`` §2)."""
@@ -142,6 +146,9 @@ class MboxConnector:
         store: DocStore | None = None,
         other_sources: Sequence[str] = (),
         cache_dir: Path | None = None,
+        max_message_bytes: int | None = None,
+        settle_seconds: float = SETTLE_SECONDS,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         """Args:
         config: The validated settings; ``root`` must be set.
@@ -152,6 +159,12 @@ class MboxConnector:
         other_sources: The names of the other configured mail sources (type ``gmail`` or
             ``mbox``). Empty means nothing can be known elsewhere.
         cache_dir: Where a walk keeps its temporary key sets.
+        max_message_bytes: ``ingest.max_fetch_bytes``. The pipeline checks a fetched message
+            against it only after the fetch returns, so ``fetch`` refuses a longer span before
+            reading it (§5.2). ``None`` means no limit.
+        settle_seconds: How long a file must have been unmodified before discovery reads it
+            (§5.1), so a message still being appended is never indexed half-written.
+        clock: Wall time, for ``settle_seconds``.
         """
         self.name = name
         self._config = config
@@ -159,6 +172,9 @@ class MboxConnector:
         self._store = store
         self._others = tuple(other_sources)
         self._cache_dir = cache_dir
+        self._max_message_bytes = max_message_bytes
+        self._settle = settle_seconds
+        self._clock = clock
         self._next: str | None = None
         self._enumerated = False
         self._walked_full = False
@@ -264,6 +280,7 @@ class MboxConnector:
         previous: dict[str, list[int]] | None,
         current: dict[str, list[int]] | None,
         strict: bool,
+        settle: float = 0.0,
     ) -> Generator[_Candidate]:
         """Each message not yet seen in this walk, from every file that needs reading.
 
@@ -279,6 +296,8 @@ class MboxConnector:
                 if previous is not None and previous.get(key) == token:
                     if current is not None:
                         current[key] = token
+                    continue
+                if settle and self._clock() - status.st_mtime < settle:
                     continue
                 if not mbox_reader.is_mbox(path):
                     continue
@@ -317,12 +336,27 @@ class MboxConnector:
         seen = _KeySet(self._cache_dir)
         known: _KeySet | None = None
         skipped = 0
-        stream = self._messages(seen, previous=previous, current=current, strict=False)
+        stream = self._messages(
+            seen,
+            previous=previous,
+            current=current,
+            strict=previous is None,
+            settle=self._settle,
+        )
         try:
             while True:
-                batch = await asyncio.to_thread(
-                    lambda: list(itertools.islice(stream, MAX_DISCOVERY_BATCH))
-                )
+                try:
+                    batch = await asyncio.to_thread(
+                        lambda: list(itertools.islice(stream, MAX_DISCOVERY_BATCH))
+                    )
+                except OSError:
+                    # A full walk is recorded as the whole inventory, so one that could not read
+                    # part of the archive must not complete (§5.1). No path in the message.
+                    msg = (
+                        "a file or directory under the root could not be read, so this walk "
+                        "cannot stand for the whole archive. Fix its permissions or exclude it"
+                    )
+                    raise ConnectorError(msg) from None
                 if not batch:
                     break
                 if known is None and self._can_skip():
@@ -418,6 +452,12 @@ class MboxConnector:
         if not isinstance(offset, int) or not isinstance(length, int) or not self._contains(path):
             msg = "the message is not in a file this source serves"
             raise NotFoundError(msg)
+        if self._max_message_bytes is not None and length > self._max_message_bytes:
+            msg = (
+                f"a message of {length} bytes is above the {self._max_message_bytes}-byte fetch "
+                f"cap and was not read. Raise ingest.max_fetch_bytes to index it"
+            )
+            raise ConnectorError(msg)
         try:
             content = await asyncio.to_thread(mbox_reader.read, path, offset, length, ref.source_id)
         except (OSError, mbox_reader.MessageChangedError) as exc:
