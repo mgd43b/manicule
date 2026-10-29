@@ -847,13 +847,15 @@ async def test_keyset_pages_partition_the_selection_exactly_as_offset_pages_do(
     assert await store.selection_cursor("no-such-document") is None
 
 
-async def test_a_keyset_cursor_breaks_a_created_at_tie_on_the_id(store: SqliteDocStore) -> None:
+async def test_a_keyset_cursor_breaks_a_created_at_tie_on_the_id(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
     """Two rows stamped the same instant are told apart by id, not skipped or repeated."""
     for index in range(3):
         await store.upsert_document(make_document(source_id=f"tie-{index}"))
     ids = [document.id for document in await store.select_documents()]
-    async with store._sessions() as session, session.begin():
-        await session.execute(
+    async with engine.begin() as connection:
+        await connection.execute(
             update(models.Document).values(created_at=datetime(2026, 1, 1, tzinfo=UTC))
         )
 
