@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, override
 
 import pytest
 
@@ -455,6 +455,24 @@ async def test_a_dry_run_names_the_documents_that_have_no_bytes_to_re_parse() ->
     assert stranded.id in planned.unrepairable_documents[0]
     assert "re-sync" in planned.unrepairable_documents[0], "the plan names the remedy too"
     assert embedder.batches == batches, "a plan runs no model"
+
+
+async def test_a_dry_run_counts_its_selection_rather_than_paging_it() -> None:
+    """The plan was a walk with a growing OFFSET: quadratic, and 12 h without finishing."""
+    store, _, _, _, _ = await corpus({"a": "alpha", "b": "beta", "c": "gamma"})
+    offsets: list[int] = []
+    original = store.select_documents
+
+    async def counting(**kwargs: Any) -> Any:
+        offsets.append(kwargs.get("offset", 0))
+        return await original(**kwargs)
+
+    store.select_documents = counting  # type: ignore[method-assign]
+
+    planned = await plan_stale(store=store, parse_fingerprints=fingerprints("2"), batch=1)
+
+    assert planned.selected == 3
+    assert set(offsets) == {0}, "no page past the first is ever read"
 
 
 # --- stopping and starting again ---------------------------------------------------------------

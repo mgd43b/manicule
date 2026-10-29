@@ -590,6 +590,10 @@ window in which an interrupted run has read rows it will not reach.
 """
 
 
+PLAN_NAMED_UNREPAIRABLE = 50
+"""How many unrepairable documents a dry run names; the rest are counted."""
+
+
 @dataclass
 class StaleSweep:
     """What one corpus-wide re-parse pass did, in counts an operator can act on.
@@ -702,27 +706,28 @@ async def plan_stale(
     Args:
         store: Where the selection is queried.
         parse_fingerprints: What every installed parser would produce now.
-        batch: Documents per page.
+        batch: Unused; kept so the plan and the run take the same arguments.
 
     Returns:
         A sweep marked ``dry_run``, carrying ``selected`` and the unrepairable documents.
     """
+    current = {fingerprint.canonical() for fingerprint in parse_fingerprints}
     sweep = StaleSweep(dry_run=True)
-    while True:
-        # The offset is the count, exactly: a plan repairs nothing, so every document it has
-        # seen is still in the selection and still in front of the next page.
-        page = await select(
-            store, parse_fingerprints=parse_fingerprints, limit=batch, offset=sweep.selected
+    # Two counts and one bounded listing, never a walk. This paged the whole selection with a
+    # growing OFFSET, which on a few hundred thousand documents is quadratic and did not
+    # finish in thirteen hours; the counts are the same predicates the run selects with.
+    sweep.selected = await store.count_documents(parse_fp_current=current)
+    sweep.unrepairable = await store.count_documents(parse_fp_current=current, unretained=True)
+    named = await store.select_documents(
+        parse_fp_current=current, unretained=True, limit=PLAN_NAMED_UNREPAIRABLE
+    )
+    for document in named:
+        sweep.unrepairable_documents.append(f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}")
+    if sweep.unrepairable > PLAN_NAMED_UNREPAIRABLE:
+        sweep.unrepairable_documents.append(
+            f"... and {sweep.unrepairable - PLAN_NAMED_UNREPAIRABLE} more with no retained bytes"
         )
-        if not page:
-            return sweep
-        for document in page:
-            sweep.selected += 1
-            if document.original_ref is None:
-                sweep.unrepairable += 1
-                sweep.unrepairable_documents.append(
-                    f"{document.id} ({document.uri}): {NO_RETAINED_BYTES}"
-                )
+    return sweep
 
 
 async def re_parse_stale(

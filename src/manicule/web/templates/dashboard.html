@@ -40,6 +40,8 @@
   {% else %}{{ m.failed(panels.doctor) }}{% endif %}
 </section>
 
+<p class="muted">Counts and checks as of {{ as_of }}; they refresh in the background.</p>
+
 <p class="muted">
   Documents arrive through <code>manicule index &lt;path&gt;</code> or a configured connector.
   There is no upload here, and that is deliberate — see Settings.
