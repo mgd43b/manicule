@@ -10,15 +10,18 @@ envelopes :func:`~manicule.web.rendering.panels` builds, produced by the same op
 - **Coalesced.** Concurrent requests for a workspace await one computation.
 - **Served stale, refreshed behind.** Once a result exists it is returned immediately, with the
   moment it was taken, and an expired one starts a single background refresh.
-- **A failure is never kept.** A page with a failed panel is recomputed by the next request, so
-  an outage is not displayed for a TTL after it has ended.
+- **A failure is never called fresh.** A page with a failed panel is stored already expired when
+  it replaces an earlier snapshot (so an outage is shown, not hidden behind a stale healthy
+  page), and is not stored at all when there is nothing to replace. Either way the next request
+  recomputes, so an outage is not displayed for a TTL after it has ended.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -69,6 +72,8 @@ class SnapshotCache:
                 )
                 if snapshot.complete:
                     self._snapshots[key] = snapshot
+                elif key in self._snapshots:
+                    self._snapshots[key] = replace(snapshot, monotonic=-math.inf)
                 return snapshot
             finally:
                 self._inflight.pop(key, None)
@@ -81,9 +86,18 @@ class SnapshotCache:
         return task
 
     async def get(
-        self, key: str, compute: Callable[[], Awaitable[Mapping[str, Panel]]]
-    ) -> Snapshot:
-        """The snapshot for ``key``: cached if there is one, else the shared computation."""
+        self,
+        key: str,
+        compute: Callable[[], Awaitable[Mapping[str, Panel]]],
+        *,
+        wait_s: float | None = None,
+    ) -> Snapshot | None:
+        """The snapshot for ``key``: cached if there is one, else the shared computation.
+
+        ``wait_s`` bounds how long a cold request waits for the first computation, which keeps
+        running either way. ``None`` waits for it; on a timeout the answer is ``None`` and the
+        caller renders a page that says the counts are still being computed.
+        """
         held = self._snapshots.get(key)
         if held is not None:
             if time.monotonic() - held.monotonic >= self.ttl_s:
@@ -91,4 +105,8 @@ class SnapshotCache:
             return held
         # Shielded: one impatient client closing its connection must not cancel the walk the
         # others are waiting on.
-        return await asyncio.shield(self._start(key, compute))
+        try:
+            async with asyncio.timeout(wait_s):
+                return await asyncio.shield(self._start(key, compute))
+        except TimeoutError:
+            return None

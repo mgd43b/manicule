@@ -688,7 +688,6 @@ async def plan_stale(
     *,
     store: IngestStore,
     parse_fingerprints: Collection[ParseFingerprint],
-    batch: int = DEFAULT_SWEEP_BATCH,
 ) -> StaleSweep:
     """What :func:`re_parse_stale` would do. The selection, and nothing else.
 
@@ -706,7 +705,6 @@ async def plan_stale(
     Args:
         store: Where the selection is queried.
         parse_fingerprints: What every installed parser would produce now.
-        batch: Unused; kept so the plan and the run take the same arguments.
 
     Returns:
         A sweep marked ``dry_run``, carrying ``selected`` and the unrepairable documents.

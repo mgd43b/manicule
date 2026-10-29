@@ -7,13 +7,11 @@ another walk behind the one still running.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, cast
 
+from manicule.app.results import Envelope, ErrorInfo
+from manicule.web.rendering import Panel
 from manicule.web.snapshots import SnapshotCache
 from tests.web.support import backend_with_a_document, client_for
-
-if TYPE_CHECKING:
-    from manicule.web.rendering import Panel
 
 
 class Computation:
@@ -27,7 +25,13 @@ class Computation:
     async def __call__(self) -> dict[str, Panel]:
         self.starts += 1
         await self.release.wait()
-        return {"x": cast("Panel", type("P", (), {"ok": self.ok})())}
+        if self.ok:
+            envelope = Envelope(op="x", ok=True, workspace="w", data={})
+        else:
+            envelope = Envelope(
+                op="x", ok=False, workspace="w", error=ErrorInfo(type="E", message="down")
+            )
+        return {"x": Panel(envelope=envelope)}
 
 
 async def test_concurrent_requests_share_one_computation() -> None:
@@ -41,6 +45,7 @@ async def test_concurrent_requests_share_one_computation() -> None:
 
     assert walk.starts == 1
     assert len({id(result) for result in results}) == 1
+    assert results[0] is not None
 
 
 async def test_a_cancelled_waiter_does_not_cancel_the_walk() -> None:
@@ -53,7 +58,9 @@ async def test_a_cancelled_waiter_does_not_cancel_the_walk() -> None:
     impatient.cancel()
     walk.release.set()
 
-    assert (await patient).complete
+    patient_result = await patient
+    assert patient_result is not None
+    assert patient_result.complete
     assert walk.starts == 1
 
 
@@ -74,7 +81,7 @@ async def test_an_expired_snapshot_is_served_at_once_and_refreshed_behind() -> N
     walk.release.set()
 
 
-async def test_a_failed_page_is_not_kept() -> None:
+async def test_a_failed_first_page_is_not_kept() -> None:
     cache = SnapshotCache()
     walk = Computation()
     walk.ok = False
@@ -84,6 +91,36 @@ async def test_a_failed_page_is_not_kept() -> None:
     await cache.get("w", walk)
 
     assert walk.starts == 2
+
+
+async def test_a_failed_refresh_replaces_the_healthy_snapshot_and_is_retried() -> None:
+    cache = SnapshotCache(ttl_s=0)
+    walk = Computation()
+    walk.release.set()
+    healthy = await cache.get("w", walk)
+    assert healthy is not None
+
+    walk.ok = False
+    await cache.get("w", walk)  # serves stale, refreshes behind
+    await asyncio.sleep(0.01)
+    shown = await cache.get("w", walk)
+
+    assert shown is not None
+    assert not shown.complete, "an outage is shown rather than hidden behind the old page"
+    await asyncio.sleep(0.01)
+    assert walk.starts >= 3, "and it is retried on the next request"
+
+
+async def test_a_cold_request_gives_up_waiting_but_the_walk_continues() -> None:
+    cache = SnapshotCache()
+    walk = Computation()
+
+    assert await cache.get("w", walk, wait_s=0.01) is None
+
+    walk.release.set()
+    later = await cache.get("w", walk, wait_s=1)
+    assert later is not None
+    assert walk.starts == 1
 
 
 def test_the_dashboard_says_when_its_counts_were_taken() -> None:

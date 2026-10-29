@@ -50,10 +50,10 @@ from manicule.config.settings import Role
 from manicule.web.areas import AREAS, NAVIGATION
 from manicule.web.rendering import SCRIPT, STYLESHEET, PanelCall, panel, panels, render
 from manicule.web.security import Guest, Operator, Reader
-from manicule.web.snapshots import SnapshotCache
 
 if TYPE_CHECKING:
     from manicule.app.results import Payload
+    from manicule.web.snapshots import SnapshotCache
 
 router = APIRouter(prefix="/ui", tags=["web"])
 
@@ -98,6 +98,10 @@ async def script() -> PlainTextResponse:
 # --- dashboard --------------------------------------------------------------------------------
 
 
+COLD_DASHBOARD_WAIT_S = 3.0
+"""How long the first dashboard request waits before saying the counts are still being computed."""
+
+
 @router.get("", name="ui_dashboard", summary="What this installation holds, at a glance.")
 async def dashboard(request: Request, service: Service, caller: Reader) -> HTMLResponse:
     """Counts, the diagnosis, and the workspaces — the three a viewer may read.
@@ -110,10 +114,7 @@ async def dashboard(request: Request, service: Service, caller: Reader) -> HTMLR
     snapshot was taken. None of the three is the reader's own — they are the workspace's — so
     one snapshot per workspace serves every reader.
     """
-    cache: SnapshotCache | None = getattr(request.app.state, "dashboard_snapshots", None)
-    if cache is None:
-        cache = SnapshotCache()
-        request.app.state.dashboard_snapshots = cache
+    cache: SnapshotCache = request.app.state.dashboard_snapshots
     snapshot = await cache.get(
         service.workspace,
         lambda: panels(
@@ -124,6 +125,7 @@ async def dashboard(request: Request, service: Service, caller: Reader) -> HTMLR
                 "workspaces": ("workspace_list", service.workspace_list),
             },
         ),
+        wait_s=COLD_DASHBOARD_WAIT_S,
     )
     return render(
         "dashboard.html",
@@ -131,8 +133,11 @@ async def dashboard(request: Request, service: Service, caller: Reader) -> HTMLR
         title="Dashboard",
         service=service,
         caller=caller,
-        panels=snapshot.panels,
-        extra={"as_of": snapshot.taken_at.strftime("%Y-%m-%d %H:%M:%S UTC")},
+        panels=snapshot.panels if snapshot else {},
+        extra={
+            "pending": snapshot is None,
+            "as_of": snapshot.taken_at.strftime("%Y-%m-%d %H:%M:%S UTC") if snapshot else "",
+        },
     )
 
 

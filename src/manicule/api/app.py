@@ -97,6 +97,7 @@ from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import PolicyError, RateLimitedError
 from manicule.core.version import CORE_VERSION
 from manicule.mcp.serve import surface as mcp_surface
+from manicule.web.snapshots import SnapshotCache
 
 NOT_FOUND = 404
 
@@ -352,6 +353,7 @@ def build_app(  # noqa: PLR0915 - assembling every route group, middleware and r
     )
     app.state.service = service
     app.state.proxy_policy = ProxyPolicy.of(settings)
+    app.state.dashboard_snapshots = SnapshotCache()
     app.state.route_groups = ROUTE_GROUPS
     # How a sign-in reaches an identity provider. `None` is the network; a suite replaces it
     # with a transport that plays the provider, so no test of the sign-in routes leaves this

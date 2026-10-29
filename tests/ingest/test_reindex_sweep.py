@@ -405,7 +405,7 @@ async def test_a_dry_run_reports_the_same_selection_and_writes_nothing_anywhere(
     parse_lineage = dict(store.parse_lineage)
     embedder.batches.clear()
 
-    planned = await plan_stale(store=store, parse_fingerprints=current, batch=1)
+    planned = await plan_stale(store=store, parse_fingerprints=current)
 
     assert planned.dry_run is True
     assert (planned.reparsed, planned.changed, planned.unchanged) == (0, 0, 0), (
@@ -469,7 +469,7 @@ async def test_a_dry_run_counts_its_selection_rather_than_paging_it() -> None:
 
     store.select_documents = counting  # type: ignore[method-assign]
 
-    planned = await plan_stale(store=store, parse_fingerprints=fingerprints("2"), batch=1)
+    planned = await plan_stale(store=store, parse_fingerprints=fingerprints("2"))
 
     assert planned.selected == 3
     assert set(offsets) == {0}, "no page past the first is ever read"
