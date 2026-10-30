@@ -316,12 +316,14 @@ async def test_a_first_sign_in_that_loses_the_race_to_create_the_person_still_su
     real = store._admit_once  # pyright: ignore[reportPrivateUsage] - the seam the race is at
     attempts: list[str] = []
 
-    async def losing_once(self: Any, profile: Profile, *, role: str) -> UserSummary:
+    async def losing_once(
+        self: Any, profile: Profile, *, role: str, must_be_new: bool
+    ) -> UserSummary:
         attempts.append(profile.subject)
         if len(attempts) == 1:
-            await real(self, profile, role=role)
+            await real(self, profile, role=role, must_be_new=must_be_new)
             raise IntegrityError("INSERT INTO users", {}, Exception("UNIQUE constraint failed"))
-        return await real(self, profile, role=role)
+        return await real(self, profile, role=role, must_be_new=must_be_new)
 
     monkeypatch.setattr(store, "_admit_once", losing_once)
     member = await users.admit(_profile(), role="member")

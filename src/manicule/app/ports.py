@@ -883,12 +883,20 @@ class Users(Protocol):
         """This workspace's membership for one provider account, or ``None`` if it has none."""
         ...
 
-    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+    async def admit(self, profile: Profile, *, role: str, must_be_new: bool = False) -> UserSummary:
         """Record a sign-in: create or refresh the person, and make them a member if they are not.
 
         ``role`` is used only when the membership is created. After that a person's role is
         whatever an administrator has made it, and a sign-in never overwrites it — otherwise
         every demotion would last until the demoted person next signed in.
+
+        Args:
+            must_be_new: Refuse, rather than refresh, a person who is already a member here.
+                The check and the insert are one operation, so two concurrent creations of the
+                same person cannot both succeed.
+
+        Raises:
+            NameInUseError: ``must_be_new`` and the person is already a member here.
         """
         ...
 

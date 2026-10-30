@@ -32,8 +32,15 @@
   <p class="secret" data-user-secret hidden></p>
   <p class="muted">
     A person holds API keys, not a password: this mints their first key, shown once, for you to
-    hand over. They sign in to this browser surface by presenting it, and a program sends it in a
-    header. More keys are minted for them on the API keys page.
+    hand over.
+    {% if panels.providers.ok and panels.providers.data.key_login_path %}
+    They sign in to this browser surface by presenting it, and a program sends it in a header.
+    {% else %}
+    A program sends it in a header; this installation does not offer a browser sign-in with a
+    key (that needs <code>security.auth.mode = "api_key"</code> and a
+    <code>security.auth.session_secret</code>).
+    {% endif %}
+    More keys are minted for them on the API keys page.
   </p>
   <p class="muted" data-user-status role="status" aria-live="polite"></p>
 

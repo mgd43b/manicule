@@ -8,6 +8,7 @@ role lower — with the identity-provider session as the control that none of it
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,7 @@ from sqlalchemy import update
 
 from manicule.app.people import LOCAL, Profile
 from manicule.app.runtime import Runtime
+from manicule.core.errors import NameInUseError
 from manicule.storage import models
 from manicule.storage.engine import session_factory
 from manicule.storage.types import utcnow
@@ -149,3 +151,19 @@ async def test_a_local_person_cannot_be_created_twice(runtime: Runtime) -> None:
 
 
 _ONE_SECOND = timedelta(seconds=1)
+
+
+async def test_two_simultaneous_creations_of_one_person_yield_exactly_one(
+    runtime: Runtime,
+) -> None:
+    """The create-only check and the insert are one operation, so a race has one winner."""
+    users = await runtime.users()
+
+    async def create() -> object:
+        return await users.admit(
+            Profile(provider=LOCAL, subject="alice", name="alice"), role="member", must_be_new=True
+        )
+
+    outcomes = await asyncio.gather(create(), create(), create(), return_exceptions=True)
+    assert sum(not isinstance(o, BaseException) for o in outcomes) == 1
+    assert all(isinstance(o, NameInUseError) for o in outcomes if isinstance(o, BaseException))

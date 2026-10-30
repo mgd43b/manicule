@@ -1777,3 +1777,50 @@ async def test_enumeration_progress_upgrades_a_database_that_predates_it(
         assert await current(engine) == head_revision()
     finally:
         await engine.dispose()
+
+
+async def test_downgrading_ends_every_session_a_key_started_and_removes_local_people(
+    data_dir: Path,
+) -> None:
+    """``c9a4e7d21b30`` downgraded must not widen a browser's access.
+
+    A session a key started is held to the key's role and revocation by its ``key_id``. Without
+    the column those restrictions vanish, so the session of a provider-backed person would
+    become a full membership session for an installation that returns to ``oauth``. The
+    provider-started session beside it must survive, or the delete is simply indiscriminate.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine)
+        stamp = {"t": "2026-01-01T00:00:00+00:00", "later": "2099-01-01T00:00:00+00:00"}
+        async with engine.begin() as connection:
+            statements = [
+                "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                "VALUES ('w', 'w', 'team', '{}', :t)",
+                "INSERT INTO users (id, provider, subject, created_at) VALUES "
+                "('g', 'google', 'g1', :t), ('l', 'local', 'alice', :t)",
+                "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) "
+                "VALUES ('w', 'g', 'admin', :t), ('w', 'l', 'member', :t)",
+                "INSERT INTO api_keys (id, name, key_hash, key_prefix, workspace_id, user_id, "
+                "role, allowed_ips, created_at) VALUES "
+                "('k', 'k', 'h1', 'mnk_a', 'w', 'g', 'viewer', '[]', :t), "
+                "('k2', 'k2', 'h2', 'mnk_b', 'w', 'l', 'member', '[]', :t)",
+                "INSERT INTO auth_sessions (id, token_hash, user_id, workspace_id, created_at, "
+                "expires_at, key_id) VALUES "
+                "('s-key', 't1', 'g', 'w', :t, :later, 'k'), "
+                "('s-idp', 't2', 'g', 'w', :t, :later, NULL)",
+            ]
+            for statement in statements:
+                await connection.execute(text(statement), stamp)
+
+        await downgrade(engine, "b6d1f3a7c408")
+
+        async with engine.connect() as connection:
+            sessions = (await connection.execute(text("SELECT id FROM auth_sessions"))).scalars()
+            users = (await connection.execute(text("SELECT id FROM users"))).scalars()
+            keys = (await connection.execute(text("SELECT id FROM api_keys"))).scalars()
+            assert list(sessions) == ["s-idp"]
+            assert list(users) == ["g"]
+            assert list(keys) == ["k"]
+    finally:
+        await engine.dispose()

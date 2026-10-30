@@ -49,6 +49,7 @@ from manicule.core.errors import (
     ConfigError,
     FingerprintMismatchError,
     ManiculeError,
+    NameInUseError,
     PolicyError,
     UnknownEntityError,
     VectorMigrationError,
@@ -2974,7 +2975,7 @@ class _Users:
             ).first()
         return None if row is None else _user_summary(row[0], row[1])
 
-    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+    async def admit(self, profile: Profile, *, role: str, must_be_new: bool = False) -> UserSummary:
         """Create or refresh the person, and make them a member of this workspace if needed.
 
         **Twice at most.** Two first sign-ins of one account at the same moment — two tabs, a
@@ -2986,11 +2987,11 @@ class _Users:
         from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
 
         try:
-            return await self._admit_once(profile, role=role)
+            return await self._admit_once(profile, role=role, must_be_new=must_be_new)
         except IntegrityError:
-            return await self._admit_once(profile, role=role)
+            return await self._admit_once(profile, role=role, must_be_new=must_be_new)
 
-    async def _admit_once(self, profile: Profile, *, role: str) -> UserSummary:
+    async def _admit_once(self, profile: Profile, *, role: str, must_be_new: bool) -> UserSummary:
         from sqlalchemy import select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
@@ -3031,6 +3032,12 @@ class _Users:
                     )
                 )
             ).scalar_one_or_none()
+            if membership is not None and must_be_new:
+                msg = (
+                    f"{profile.subject!r} is already a member of workspace "
+                    f"{self._runtime.workspace!r}"
+                )
+                raise NameInUseError(msg)
             if membership is None:
                 # The provider's role, on the first sign-in only. After this it is whatever an
                 # administrator has made it, and nothing on this path writes it again.

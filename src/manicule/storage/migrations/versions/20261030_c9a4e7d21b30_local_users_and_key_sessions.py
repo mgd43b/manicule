@@ -127,6 +127,10 @@ def downgrade() -> None:
     # A local person cannot exist where the constraint does not allow one, so they go, and
     # everything that names them goes with them. The migrator runs with foreign keys off, so
     # the cascades the schema declares are done here by hand.
+    # Every session a key started goes, whoever owns it. Without its column nothing would
+    # remember the key's role cap or revocation, and the cookie would become a full
+    # membership session for a returning ``oauth`` installation.
+    op.execute(sa.text("DELETE FROM auth_sessions WHERE key_id IS NOT NULL"))
     op.execute(
         sa.text(
             "DELETE FROM auth_sessions "

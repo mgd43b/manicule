@@ -8486,7 +8486,7 @@ class ApplicationService:
             msg = f"{name!r} is already a member of workspace {self.workspace!r}"
             raise NameInUseError(msg)
         member = await users.admit(
-            Profile(provider=LOCAL, subject=name, name=name), role=chosen.value
+            Profile(provider=LOCAL, subject=name, name=name), role=chosen.value, must_be_new=True
         )
         self._require_member_here(member)
         await self._audit(

@@ -1745,8 +1745,11 @@ class FakeUsers:
             return None
         return self._summary(user_id, self.workspace)
 
-    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+    async def admit(self, profile: Profile, *, role: str, must_be_new: bool = False) -> UserSummary:
         user_id = self._by_subject(profile.provider, profile.subject)
+        if must_be_new and user_id is not None and (self.workspace, user_id) in self.memberships:
+            msg = f"{profile.subject!r} is already a member of workspace {self.workspace!r}"
+            raise NameInUseError(msg)
         now = datetime.now(UTC).isoformat()
         if user_id is None:
             user_id = f"user-{len(self.people)}"
