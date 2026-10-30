@@ -268,3 +268,16 @@ def unclosed_connections() -> Callable[[], list[str]]:
         return [stack for token, (_, stack) in _OPEN_CONNECTIONS.items() if token not in before]
 
     return unclosed
+
+
+@pytest.fixture(autouse=True)
+def cheap_password_hashing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hash passwords at a token cost, so signing people in does not cost the suite 90 ms a time.
+
+    The stored form names its own cost, so a hash made here verifies the same way a production
+    one does; ``tests/app/test_passwords.py`` puts the real cost back to test the real thing.
+    """
+    from manicule.app import passwords  # noqa: PLC0415
+
+    monkeypatch.setattr(passwords, "N", 2**4)
+    passwords.decoy.cache_clear()

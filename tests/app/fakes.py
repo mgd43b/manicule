@@ -1719,6 +1719,7 @@ class FakeUsers:
             disabled=bool(membership.get("disabled")),
             created_at=str(membership.get("created_at", "")),
             last_login_at=str(person.get("last_login_at", "")),
+            has_password=person.get("password_hash") is not None,
             sessions=self._live(user_id, workspace),
         )
 
@@ -1859,6 +1860,24 @@ class FakeUsers:
                 ended += 1
         return ended
 
+    async def password_hash_for(self, user_id: str) -> str | None:
+        person = self.people.get(user_id)
+        membership = self.memberships.get((self.workspace, user_id))
+        if person is None or membership is None or membership.get("disabled"):
+            return None
+        if person.get("provider") != "local":
+            return None
+        stored = person.get("password_hash")
+        return str(stored) if stored is not None else None
+
+    async def set_password(self, user_id: str, password_hash: str | None) -> bool:
+        person = self.people.get(user_id)
+        if person is None or person.get("provider") != "local":
+            return False
+        person["password_hash"] = password_hash
+        await self.end_sessions(user_id)
+        return True
+
     async def list_members(self) -> Sequence[UserSummary]:
         return [
             self._summary(user_id, workspace)
@@ -1921,6 +1940,8 @@ class FakeUsers:
         sessions_revoked = keys_revoked = 0
         if new_disabled and not previously_disabled:
             sessions_revoked = await self.end_sessions(user_id)
+            if self.people[user_id].get("provider") == "local":
+                self.people[user_id]["password_hash"] = None
             if isinstance(self.keys, FakeKeys):
                 for summary in self.keys.issued:
                     owned = summary.user_id == user_id

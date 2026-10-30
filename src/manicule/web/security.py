@@ -128,7 +128,7 @@ def refused_page(request: Request, exc: Exception) -> HTMLResponse:
             "A browser cannot attach a header to a page load, and this installation has no "
             "browser sign-in: a key is presented on every request instead. Use the HTTP API "
             "or the command line, or set security.auth.session_secret so that a person can "
-            "sign in here with one of their keys."
+            "sign in here with a password or one of their keys."
         )
     else:
         hint = "Your role does not reach this page; an administrator of this workspace decides it."

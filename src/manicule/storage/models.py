@@ -184,8 +184,8 @@ class User(Base):
     provider promises is the same account next time.
 
     **``local`` is the one provider that is not a provider**: a person an administrator created
-    in this installation, whose ``subject`` is the handle they were given. They hold API keys
-    and no password, and sign in to a browser by presenting one of those keys.
+    in this installation, whose ``subject`` is the handle they were given. They hold API keys,
+    may have a password, and sign in to a browser with either.
     """
 
     __tablename__ = "users"
@@ -199,6 +199,12 @@ class User(Base):
     name: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    password_hash: Mapped[str | None] = mapped_column(Text)
+    """``scrypt$n$r$p$salt$hash`` for a local person who has a password, else ``NULL``.
+
+    Never serialized: it is read by the one query that checks a password and by nothing that
+    builds a result. See :mod:`manicule.app.passwords`.
+    """
 
     __table_args__ = (
         UniqueConstraint("provider", "subject"),

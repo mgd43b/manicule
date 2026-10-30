@@ -178,6 +178,17 @@ class KeyedLimiter:
                 return RateDecision(allowed=True)
             return RateDecision(allowed=False, retry_after_s=bucket.retry_after(now, cost=cost))
 
+    def peek(self, key: str) -> RateDecision:
+        """Whether ``key`` could afford one request now, creating no bucket for a new key."""
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                return RateDecision(allowed=True)
+            now = self._clock()
+            if bucket.available(now):
+                return RateDecision(allowed=True)
+            return RateDecision(allowed=False, retry_after_s=bucket.retry_after(now))
+
     def available(
         self,
         key: str,
@@ -265,6 +276,25 @@ class RateLimiter:
         if not self._enabled:
             return RateDecision(allowed=True)
         return self._failed_auth.take(_address_key(address))
+
+    def failed_auth_allowed(self, address: str) -> RateDecision:
+        """Whether ``address`` could still afford a failed authentication, charging nothing.
+
+        **Asked before a password is hashed, and the one place a correct credential can be
+        refused by this bucket.** A key is 256 random bits, so refusing a correct one buys no
+        protection and costs a shared address its access; a password is chosen by a person and
+        can be guessed, and an address that has spent its allowance of failures would otherwise
+        keep guessing at the speed the hash allows, every correct guess still succeeding. So a
+        password is refused up front, with ``Retry-After``, until the bucket refills. The cost
+        is that people behind one address share a budget for typing passwords wrongly; their
+        keys are unaffected.
+
+        Reads without inserting: an address that has never failed holds no bucket, so probing
+        from many addresses cannot grow the tracked set.
+        """
+        if not self._enabled:
+            return RateDecision(allowed=True)
+        return self._failed_auth.peek(_address_key(address))
 
     def charge_caller(self, key: str, *, rate_limit: int | None = None) -> RateDecision:
         """Charge ``key`` — see :func:`caller_key` — for one ordinary request.

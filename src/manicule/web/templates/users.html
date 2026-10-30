@@ -27,20 +27,22 @@
       <option value="member" selected>member</option>
       <option value="admin">admin</option>
     </select>
+    <label for="user-password">Password</label>
+    <input id="user-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="256">
     <button type="submit">Add</button>
   </form>
   <p class="secret" data-user-secret hidden></p>
   <p class="muted">
-    A person holds API keys, not a password: this mints their first key, shown once, for you to
-    hand over.
+    Give them a password (at least 12 characters) and they sign in with their handle and make
+    their own API keys; leave it empty and this mints their first key instead, shown once, for
+    you to hand over.
     {% if panels.providers.ok and panels.providers.data.key_login_path %}
-    They sign in to this browser surface by presenting it, and a program sends it in a header.
+    Either way they sign in to this browser surface, and a program sends a key in a header.
     {% else %}
-    A program sends it in a header; this installation does not offer a browser sign-in with a
-    key (that needs <code>security.auth.mode = "api_key"</code> and a
-    <code>security.auth.session_secret</code>).
+    This installation does not offer a browser sign-in (that needs
+    <code>security.auth.mode = "api_key"</code> and a <code>security.auth.session_secret</code>),
+    so a key sent in a header is the only way in.
     {% endif %}
-    More keys are minted for them on the API keys page.
   </p>
   <p class="muted" data-user-status role="status" aria-live="polite"></p>
 
@@ -48,7 +50,7 @@
     {% if panels.users.data.users %}
     <p>{{ panels.users.data.count }} member(s), {{ panels.users.data.admins }} enabled administrator(s).</p>
     <table>
-      <thead><tr><th>Person</th><th>Provider</th><th>Role</th><th>Standing</th><th>Sessions</th><th>Last sign-in</th><th></th></tr></thead>
+      <thead><tr><th>Person</th><th>Provider</th><th>Role</th><th>Password</th><th>Standing</th><th>Sessions</th><th>Last sign-in</th><th></th></tr></thead>
       <tbody>
         {% for user in panels.users.data.users %}
         <tr>
@@ -66,6 +68,7 @@
               {% endfor %}
             </select>
           </td>
+          <td>{% if user.provider == 'local' %}{{ 'set' if user.has_password else 'none' }}{% else %}<span class="muted">their provider's</span>{% endif %}</td>
           <td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
           <td>{{ user.sessions if user.sessions is not none else '—' }}</td>
           <td>{{ user.last_login_at or 'never' }}</td>
@@ -73,6 +76,11 @@
             {% if user.disabled %}
             <button type="button" class="ghost" data-user-enable="{{ user.id }}">Enable</button>
             {% else %}
+            {% if user.provider == 'local' %}
+            <label class="offscreen" for="password-{{ user.id }}">New password for {{ user.name }}</label>
+            <input id="password-{{ user.id }}" type="password" autocomplete="new-password" minlength="12" maxlength="256" placeholder="New password" data-user-password-input="{{ user.id }}">
+            <button type="button" class="ghost" data-user-password="{{ user.id }}">Set password</button>
+            {% endif %}
             <button type="button" class="ghost danger" data-user-disable="{{ user.id }}">Disable</button>
             <button type="button" class="ghost" data-user-sign-out="{{ user.id }}">Sign out everywhere</button>
             {% endif %}
@@ -82,8 +90,11 @@
       </tbody>
     </table>
     <p class="muted">
-      Disabling a member ends every session they hold here and revokes every API key they
-      minted, at once; enabling them again restores the membership and not those credentials.
+      Setting a password ends every session that person holds, and is also how a forgotten one
+      is recovered: nothing is emailed, so you choose a new one and hand it over, and they can
+      change it from the API keys page. Disabling a member ends every session they hold here, revokes every API key they
+      minted and clears their password, at once; enabling them again restores the membership and
+      not those credentials.
       A workspace that has an enabled administrator always keeps one.
     </p>
     {% else %}{{ m.empty('Nobody is a member of this workspace yet.') }}{% endif %}

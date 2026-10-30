@@ -283,7 +283,10 @@ BINDERS: Mapping[str, Binder] = {
         user=args.optional_text("user"),
     ),
     "auth_add_user": lambda service, args, report: service.user_create(
-        args.text("handle"), role=args.text("role")
+        args.text("handle"), role=args.text("role"), password=args.optional_text("password")
+    ),
+    "auth_set_password": lambda service, args, report: service.user_set_password(
+        args.text("user"), args.text("password")
     ),
     # `role` is `text` rather than `optional_text` deliberately: the command line declares a
     # default of "member", so it always sends a string, and a reader that accepted nothing

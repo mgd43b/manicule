@@ -765,6 +765,17 @@ created, `subject` their lower-case handle, no email), and `auth_sessions` gains
 key, so it ends when the key does and is held to the key's role and `allowed_ips`; one an OAuth
 sign-in started has a null `key_id`.
 
+The next revision (`d2f5b8e31a64`, after `c9a4e7d21b30`) gives a local person a password, again
+without a new table, so the 46 in §4 does not move: `users` gains a nullable `password_hash TEXT`,
+the last column. It holds `scrypt$n$r$p$salt$hash` (`manicule.app.passwords`), a string that names
+its own cost so the cost can be raised without a migration. It is `NULL` for every person that
+existed before the revision, for everyone an identity provider vouches for, and for any local
+person who has not been given one. It sits on `users` rather than on a membership because a person
+is installation-wide and so is the password that proves they are the same one. Only the query
+that checks a password reads it; no result carries it, and a person is reported with a
+`has_password` flag. The downgrade drops the column, and with it every password. Setting a
+password revokes that person's `auth_sessions` rows in the same transaction.
+
 Every read and write of a membership or a session carries the workspace as a predicate; a person
 is read without one, because a person is the same person everywhere.
 

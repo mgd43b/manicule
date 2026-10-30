@@ -747,6 +747,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "completion": r.CompletionScript,
     "auth_create_key": r.ApiKeyIssued,
     "auth_add_user": r.UserCreated,
+    "auth_set_password": r.PasswordSet,
     "auth_list_keys": r.ApiKeyList,
     "auth_revoke_key": r.ApiKeyRevoked,
     "auth_users": r.UserList,
@@ -810,6 +811,36 @@ def read_secret(prompt: str) -> str:
     if not text:
         msg = "nothing was pasted, so there is no session to store"
         raise ConfigError(msg)
+    return text
+
+
+NEW_PASSWORD_PROMPT = "New password: "  # noqa: S105 - a prompt, not a password
+
+
+def read_password(prompt: str, *, confirm: bool = False) -> str:
+    """A password from the terminal without echoing it, or one line from a pipe.
+
+    Unlike :func:`read_secret` nothing is stripped but the line ending: a space is a character
+    a person may have chosen, and the service applies the one normalization there is. At a
+    terminal ``confirm`` asks twice, since a mistyped password nobody can see is a person locked
+    out; a pipe is read once.
+
+    Never an argument, for the reason :func:`read_secret` gives.
+
+    Raises:
+        typer.BadParameter: Nothing was given, or the two entries differ.
+    """
+    import getpass  # noqa: PLC0415 - only this function needs it
+
+    interactive = sys.stdin.isatty()
+    given = getpass.getpass(prompt) if interactive else sys.stdin.readline()
+    text = given.rstrip("\r\n")
+    if not text:
+        msg = "no password was given"
+        raise typer.BadParameter(msg)
+    if confirm and interactive and getpass.getpass("Again: ").rstrip("\r\n") != text:
+        msg = "the two entries differ, so nothing was changed"
+        raise typer.BadParameter(msg)
     return text
 
 
@@ -2247,9 +2278,31 @@ def auth_add_user(
         str, typer.Argument(help="What the person is called: lower-case letters, digits, . _ -")
     ],
     role: Annotated[str, typer.Option(help="admin, member or viewer.")] = "member",
+    password: Annotated[
+        bool,
+        typer.Option(
+            "--password",
+            help="Prompt for a password (no echo; or read one line from a pipe) and sign them "
+            "in with it, instead of minting a first key.",
+        ),
+    ] = False,
 ) -> None:
-    """Create a person and mint the first API key they sign in with. The key is shown once."""
-    submit(Command("auth_add_user", {"handle": handle, "role": role}))
+    """Create a person, with a password they sign in with or with a first API key shown once."""
+    arguments: dict[str, str] = {"handle": handle, "role": role}
+    if password:
+        arguments["password"] = read_password(NEW_PASSWORD_PROMPT, confirm=True)
+    submit(Command("auth_add_user", arguments))
+
+
+@auth_app.command("set-password")
+def auth_set_password(user: _USER) -> None:
+    """Set a person's password, ending their browser sessions. Prompts; never an argument."""
+    submit(
+        Command(
+            "auth_set_password",
+            {"user": user, "password": read_password(NEW_PASSWORD_PROMPT, confirm=True)},
+        )
+    )
 
 
 @auth_app.command("list-keys")

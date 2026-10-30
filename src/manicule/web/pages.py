@@ -674,6 +674,9 @@ async def auth(service: Service, caller: Reader) -> HTMLResponse:
             "key_id": caller.identity.key_id,
             "key_name": caller.identity.key_name,
             "is_admin": caller.identity.role == "admin" or caller.identity.mode == "none",
+            # A password is changed from a browser a password could have signed in: not from a
+            # key's session, which the service would refuse, and not from a header.
+            "can_change_password": caller.identity.via == "session" and not caller.identity.key_id,
             "credential": {"key": "an API key", "session": "a signed-in browser"}.get(
                 caller.identity.via, ""
             ),

@@ -780,6 +780,32 @@
       return json("DELETE", "/api/v1/auth/keys/" + encodeURIComponent(element.getAttribute("data-revoke")))
     });
 
+    /* Changing your own password. The current one is asked for again and the three fields are
+     * cleared whatever happens, so a password never sits in the page. A success renews the
+     * session cookie, because every other browser this person held has just ended. */
+    var passwordForm = document.querySelector("[data-change-password]");
+    if (passwordForm) {
+      passwordForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var fields = passwordForm.elements;
+        var status = document.querySelector("[data-password-status]");
+        var submit = passwordForm.querySelector('[type="submit"]');
+        if (fields.new_password.value !== fields.confirm_password.value) {
+          actionState(status, "error", "The new password and its confirmation are different.");
+          return;
+        }
+        var body = { current_password: fields.current_password.value, new_password: fields.new_password.value };
+        fields.current_password.value = "";
+        fields.new_password.value = "";
+        fields.confirm_password.value = "";
+        runAction(submit, status, "Changing…", function () {
+          return json("POST", "/api/v1/auth/password", body);
+        }, function (result, node) {
+          actionState(node, "success", "Password changed. Your other browsers have been signed out.");
+        });
+      });
+    }
+
     /* People. Every control names the member by id, never by address, and every rule — the last
      * administrator, nobody disabling themselves — is the server's: a refusal arrives in the
      * status line in its words, and the select is put back by the reload that follows. */
@@ -791,9 +817,15 @@
         event.preventDefault();
         var submit = userForm.querySelector('[type="submit"]');
         var body = { handle: userForm.elements.handle.value, role: userForm.elements.role.value };
+        if (userForm.elements.password.value) { body.password = userForm.elements.password.value; }
         runAction(submit, userStatus, "Adding…", function () {
           return json("POST", "/api/v1/auth/users", body);
         }, function (result, node) {
+          userForm.elements.password.value = "";
+          if (!result.envelope.data.secret) {
+            reloadAfterChange(result, node, "Added. They sign in with their handle and password.");
+            return;
+          }
           /* The first key's only copy, written here and nowhere else, as on the keys page. */
           userSecret.hidden = false;
           say(userSecret, result.envelope.data.secret);
@@ -816,6 +848,13 @@
           if (select.value !== chosen) { select.value = chosen; }
         });
       });
+    });
+    act("[data-user-password]", userStatus, "Setting…", "Password set; their sessions ended.", function (element) {
+      var id = element.getAttribute("data-user-password");
+      var field = document.querySelector('[data-user-password-input="' + id + '"]');
+      var chosen = field ? field.value : "";
+      if (field) { field.value = ""; }
+      return json("PUT", "/api/v1/auth/users/" + encodeURIComponent(id) + "/password", { password: chosen });
     });
     act("[data-user-disable]", userStatus, "Disabling…", "Disabled.", function (element) {
       return json("PATCH", "/api/v1/auth/users/" + encodeURIComponent(element.getAttribute("data-user-disable")),

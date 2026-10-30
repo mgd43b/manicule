@@ -1480,6 +1480,13 @@ def render_api_key_issued(out: Console, payload: r.ApiKeyIssued) -> None:
 
 
 def render_user_created(out: Console, payload: r.UserCreated) -> None:
+    if payload.key is None:
+        out.print(
+            f"{_person(payload.user)} added to {escape(payload.user.workspace)} as "
+            f"[bold]{escape(payload.user.role)}[/bold], with the password you gave; they sign "
+            "in with their handle and make their own keys"
+        )
+        return
     out.print(
         f"{_person(payload.user)} added to {escape(payload.user.workspace)} as "
         f"[bold]{escape(payload.user.role)}[/bold]; first key "
@@ -1487,6 +1494,13 @@ def render_user_created(out: Console, payload: r.UserCreated) -> None:
     )
     out.print(Panel(payload.secret, title="shown once", border_style="yellow"))
     out.print("[dim]only its digest is stored; a lost key is revoked and replaced[/dim]")
+
+
+def render_password_set(out: Console, payload: r.PasswordSet) -> None:
+    out.print(
+        f"password set for {_person(payload.user)}; every browser they were signed in with "
+        "has ended"
+    )
 
 
 def render_api_keys(out: Console, payload: r.ApiKeyList) -> None:
@@ -1893,6 +1907,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.UserCreated: lambda out, p: render_user_created(out, _as(r.UserCreated, p)),
     r.UserList: lambda out, p: render_users(out, _as(r.UserList, p)),
     r.UserUpdated: lambda out, p: render_user_updated(out, _as(r.UserUpdated, p)),
+    r.PasswordSet: lambda out, p: render_password_set(out, _as(r.PasswordSet, p)),
     r.UserSignedOut: lambda out, p: render_user_signed_out(out, _as(r.UserSignedOut, p)),
     r.SecurityAlertList: lambda out, p: render_security_alerts(out, _as(r.SecurityAlertList, p)),
     r.SecurityAlertAcknowledged: lambda out, p: render_security_alert_acknowledged(

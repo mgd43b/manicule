@@ -392,10 +392,14 @@ with `security.auth.mode = "none"` is refused wherever a socket is made, loopbac
 back to (`docs/surfaces.md` §6, "Team mode takes the way out away"). A program still authenticates
 with `security.auth.mode = "api_key"`. A person at a browser needs either
 `security.auth.mode = "oauth"`, or `"api_key"` with a `security.auth.session_secret`, where they
-sign in by presenting a key of their own (`manicule auth add-user` creates the person and the
-key; `docs/surfaces.md` §9.2.1). The second needs no provider, no `redirect_uri` and no
-allowlist; the secret is set as `MANICULE_SECURITY__AUTH__SESSION_SECRET`, and without it
-nothing breaks, sign-in is simply not offered.
+sign in with a handle and password, or by presenting a key of their own (`manicule auth add-user`
+creates the person with a password, or with a first key; `docs/surfaces.md` §9.2.1). The second
+needs no provider, no `redirect_uri` and no allowlist; the secret is set as
+`MANICULE_SECURITY__AUTH__SESSION_SECRET`, and without it nothing breaks, sign-in is simply not
+offered. `manicule doctor`'s `sign_in` check reports both sign-ins as available or not, on that one
+condition (`api_key` and a secret of at least 32 characters). Manicule sends no mail, so a person
+who forgets a password asks an administrator, who sets a new one with `manicule auth set-password`
+or on the People page.
 
 **Sign-in configuration** is one `[security.auth]` block plus one `[[security.auth.providers]]`
 table per identity provider — the exact shape, with `example.org` in place of a real domain, is
@@ -429,8 +433,9 @@ need to be right:
   in front of manicule at all.
 
 **Bootstrapping the first administrator** is a one-time step, not a setting. Under `api_key`
-it is `manicule auth add-user NAME --role admin` at the machine, which prints that person's
-first key once; they sign in with it at `/ui/login`. Under `oauth`, give one provider
+it is `manicule auth add-user NAME --role admin --password` at the machine, which prompts for
+the password that person signs in with at `/ui/login`. Without `--password` it prints their first
+key once instead, and they sign in with that. Under `oauth`, give one provider
 `role = "admin"` with an `allowed_emails`/`allowed_domains` entry naming only that person, sign
 in once, then narrow the provider back to `role = "member"` for everyone who signs in after —
 or let people sign in as members from the start and promote one from the command line, which
@@ -1211,7 +1216,12 @@ the traffic actually expected: `per_minute` and `burst` per caller, `failed_auth
 address for failed authentications, and `max_tracked` bounding memory. `docs/surfaces.md` §9.10
 is the reference; the one thing worth planning for at deployment time is that the buckets are
 **per process**, not shared across replicas — a caller spread across two served processes behind
-a load balancer gets two independent buckets, effectively doubling its ceiling. A single-process
+a load balancer gets two independent buckets, effectively doubling its ceiling. That matters most
+for passwords, which are the one credential the failed-authentication bucket refuses up front,
+before the password is checked, because a person can guess one. Guessing spread across many
+addresses is bounded only by that bucket in each process and by the cost of scrypt, so a public
+deployment should set `trusted_proxies` correctly (§4.1) and keep passwords long. People behind
+one shared address also share the budget for mistyped passwords, which a key does not. A single-process
 deployment (the only kind manicule serves today; there is no shared bucket store) does not have
 this problem.
 

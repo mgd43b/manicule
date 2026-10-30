@@ -938,6 +938,22 @@ class Users(Protocol):
         """Revoke every live session one person holds in this workspace. Returns how many."""
         ...
 
+    async def password_hash_for(self, user_id: str) -> str | None:
+        """The stored password hash of a local person who is an enabled member here, else ``None``.
+
+        ``None`` is deliberately every reason at once — no such person, an identity-provider
+        person, no password set, a disabled or foreign membership — so the caller cannot tell
+        them apart and neither can anyone it answers to.
+        """
+        ...
+
+    async def set_password(self, user_id: str, password_hash: str | None) -> bool:
+        """Set, or with ``None`` clear, a local person's password hash. ``False`` when none.
+
+        Ends every live session the person holds, in the same transaction.
+        """
+        ...
+
     async def list_members(self) -> Sequence[UserSummary]:
         """Every member of this workspace, with a count of live sessions each."""
         ...
