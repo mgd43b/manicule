@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.22](https://github.com/mgd43b/manicule/compare/v0.2.21...v0.2.22) (2026-10-30)
+
+
+### Features
+
+* **auth:** local users and browser sign-in with an API key ([#528](https://github.com/mgd43b/manicule/issues/528)) ([4340fb8](https://github.com/mgd43b/manicule/commit/4340fb866c8a95033fc2e65e7ed26b4d96a56d0e))
+
 ## [0.2.21](https://github.com/mgd43b/manicule/compare/v0.2.20...v0.2.21) (2026-10-29)
 
 
