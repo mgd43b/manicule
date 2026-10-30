@@ -746,6 +746,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "upgrade": r.UpgradeReport,
     "completion": r.CompletionScript,
     "auth_create_key": r.ApiKeyIssued,
+    "auth_add_user": r.UserCreated,
     "auth_list_keys": r.ApiKeyList,
     "auth_revoke_key": r.ApiKeyRevoked,
     "auth_users": r.UserList,
@@ -2199,7 +2200,7 @@ def workspace_switch(
 
 
 @auth_app.command("create-key")
-def auth_create_key(
+def auth_create_key(  # noqa: PLR0917 - each setting is intentionally a first-class CLI option
     name: Annotated[str, typer.Argument(help="A label for the key.")],
     role: Annotated[str, typer.Option(help="admin, member or viewer.")] = "member",
     expires_days: Annotated[int | None, typer.Option(help="Days until it expires.")] = None,
@@ -2211,8 +2212,16 @@ def auth_create_key(
         int | None,
         typer.Option(help="Requests per minute for this key, replacing the installation default."),
     ] = None,
+    user: Annotated[
+        str | None,
+        typer.Option(help="Mint it for this member (id, address or handle) rather than unowned."),
+    ] = None,
 ) -> None:
-    """Mint an API key for this workspace. The secret is shown once and never stored."""
+    """Mint an API key for this workspace. The secret is shown once and never stored.
+
+    A key with no --user belongs to the installation and cannot sign a browser in; a person's
+    key can, and carries their role at most.
+    """
     # Cast rather than annotated, on `collection_add`'s own reasoning: `list` is invariant, so
     # `list[str]` is never a `list[JsonValue]` however it is spelled, and every list of strings
     # is a list of JSON values.
@@ -2226,9 +2235,21 @@ def auth_create_key(
                 "expires_days": expires_days,
                 "allowed_ips": allowed_ips,
                 "rate_limit": rate_limit,
+                "user": user,
             },
         )
     )
+
+
+@auth_app.command("add-user")
+def auth_add_user(
+    handle: Annotated[
+        str, typer.Argument(help="What the person is called: lower-case letters, digits, . _ -")
+    ],
+    role: Annotated[str, typer.Option(help="admin, member or viewer.")] = "member",
+) -> None:
+    """Create a person and mint the first API key they sign in with. The key is shown once."""
+    submit(Command("auth_add_user", {"handle": handle, "role": role}))
 
 
 @auth_app.command("list-keys")
@@ -2247,7 +2268,9 @@ def auth_revoke_key(
 
 _USER = Annotated[
     str,
-    typer.Argument(help="The member's user id, or an address that names exactly one member."),
+    typer.Argument(
+        help="The member's user id, their handle, or an address that names exactly one member."
+    ),
 ]
 
 

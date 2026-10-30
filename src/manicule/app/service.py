@@ -48,19 +48,26 @@ from manicule.app.alerts import AlertMonitor
 from manicule.app.bind import is_loopback
 from manicule.app.caller import RANK, current
 from manicule.app.people import (
+    HANDLE,
+    KEY_SIGN_IN_PATH,
     LAST_ADMIN,
+    LOCAL,
     LOGIN_PATH,
+    MIN_SESSION_SECRET,
     REFUSALS,
+    Profile,
     Refusal,
     admission,
     applicable_providers,
+    honors_sessions,
+    key_sign_in_enabled,
     provider_for,
     serving_problems,
 )
 from manicule.app.ports import RetrievingAcross, SpansWorkspaces
 from manicule.app.sensitive import UnreadableDatabaseError, sensitive_exposure
 from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
-from manicule.app.throttle import RateLimiter
+from manicule.app.throttle import RateDecision, RateLimiter
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
 from manicule.config.settings import (
@@ -81,7 +88,9 @@ from manicule.core.errors import (
     AmbiguousHandleError,
     ConfigError,
     ManiculeError,
+    NameInUseError,
     PolicyError,
+    RateLimitedError,
     SignInRefusedError,
     UnknownComponentError,
     UnknownEntityError,
@@ -131,7 +140,6 @@ if TYPE_CHECKING:
 
     from manicule.app.alerts import AlertEvent
     from manicule.app.caller import Caller
-    from manicule.app.people import Profile
     from manicule.app.ports import Backend, Conversing, DocumentSurface, OpenedWorkspace
     from manicule.config.settings import OAuthProvider
     from manicule.connectors.browser import BrowserSessionProvider
@@ -4249,11 +4257,28 @@ class ApplicationService:
 
         The same conditions ``build_app`` refuses to serve with, from the same function, so an
         operator can learn them without starting a server that will not start. ``ok`` when
-        sign-in is not the configured mode: there is then nothing to be wrong.
+        sign-in is not the configured mode: there is then nothing to be wrong. Under
+        ``api_key`` it says whether a browser can sign in with a key, and how to let it.
         """
         mode = self.settings.security.auth.mode
         applicable = [provider.type for provider in applicable_providers(self.settings)]
         facts: dict[str, JsonValue] = {"auth_mode": mode.value, "providers": list(applicable)}
+        if mode is AuthMode.API_KEY:
+            enabled = key_sign_in_enabled(self.settings)
+            facts["key_sign_in"] = enabled
+            return r.Check(
+                name="sign_in",
+                state="ok",
+                detail=(
+                    "a browser signs in by presenting one of a person's API keys"
+                    if enabled
+                    else f"security.auth.mode is 'api_key'; no browser sign-in is offered. Set "
+                    f"security.auth.session_secret (at least {MIN_SESSION_SECRET} characters, "
+                    f"via MANICULE_SECURITY__AUTH__SESSION_SECRET) to let people sign in "
+                    f"with their keys"
+                ),
+                facts=facts,
+            )
         if mode is not AuthMode.OAUTH:
             return r.Check(
                 name="sign_in",
@@ -6811,8 +6836,14 @@ class ApplicationService:
         expires_days: int | None = None,
         allowed_ips: Sequence[str] = (),
         rate_limit: int | None = None,
+        user: str | None = None,
     ) -> r.ApiKeyIssued:
         """Mint an API key for this workspace.
+
+        **For somebody else only with** ``user``, **and only by an administrator or the local
+        operator.** ``user`` names a member by id, address or handle; the key is theirs, capped
+        at their role like any owned key, and it is how a person gets a second key, or the first
+        one the operator's unowned keys never gave them. Everyone else mints for themselves.
 
         **Ownership and the role cap, decided from** :func:`~manicule.app.caller.current`.
         **A person's key is theirs**, whatever their role: ``user_id`` is the minter, so their
@@ -6843,7 +6874,21 @@ class ApplicationService:
             msg = f"rate_limit must be at least 1 request per minute, got {rate_limit}"
             raise ConfigError(msg)
         cidrs = _validated_cidrs(allowed_ips)
-        owner = _key_owner_for(current(), chosen)
+        caller = current()
+        if user is None:
+            owner = _key_owner_for(caller, chosen)
+        else:
+            if not (caller.is_local or caller.holds(Role.ADMIN)):
+                msg = "only an administrator or the local operator may mint a key for somebody else"
+                raise PolicyError(msg)
+            member = await self._member(user)
+            if member.disabled:
+                msg = (
+                    f"{member.id} is disabled, and a key minted for a disabled person would "
+                    f"never work. Enable them first."
+                )
+                raise PolicyError(msg)
+            owner = member.id
         keys = await self._backend.keys()
         summary, secret = await keys.issue(
             label,
@@ -8045,6 +8090,17 @@ class ApplicationService:
             rate_limit=summary.rate_limit,
         )
 
+    async def charge_failed_authentication(self, address: str) -> RateDecision:
+        """Charge one wrong credential to ``address`` and count it toward a brute-force alert.
+
+        The one place a guess is accounted for, whether the credential arrived in a header (the
+        HTTP middleware) or in a sign-in request's body (:meth:`sign_in_with_key`). Returns the
+        failed-authentication decision: ``allowed`` while the address is within budget.
+        """
+        decision = self.rate_limiter.charge_failed_auth(address)
+        await self.record_security_alert(self.alert_monitor.record_failed_auth(address))
+        return decision
+
     async def record_failed_authentication(self, *, credential_kind: str) -> None:
         """Audit a presented credential that did not authenticate.
 
@@ -8063,12 +8119,24 @@ class ApplicationService:
         """
         auth = self.settings.security.auth
         if auth.mode is not AuthMode.OAUTH:
+            if key_sign_in_enabled(self.settings):
+                return r.AuthProviders(
+                    mode=auth.mode.value,
+                    count=0,
+                    key_login_path=KEY_SIGN_IN_PATH,
+                    detail=(
+                        "a browser signs in by presenting one of a person's API keys at "
+                        f"POST {KEY_SIGN_IN_PATH}; a program presents the key in a header."
+                    ),
+                )
             return r.AuthProviders(
                 mode=auth.mode.value,
                 count=0,
                 detail=(
                     f"security.auth.mode is {auth.mode.value!r}, so no interactive login is "
-                    f"offered. Authenticate with an API key, or configure OAuth."
+                    f"offered. Authenticate with an API key, set "
+                    f"security.auth.session_secret to let a browser sign in with one, or "
+                    f"configure OAuth."
                 ),
             )
         # Only the providers that apply to *this* workspace. One configured for another
@@ -8158,7 +8226,84 @@ class ApplicationService:
         )
         return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
 
-    async def authenticate_session(self, token: str) -> r.Identity:
+    async def sign_in_with_key(self, secret: str) -> r.SignedIn:
+        """Exchange an API key a person owns for a browser session.
+
+        **The key stays the credential; the session is how a browser holds it.** A browser cannot
+        attach a header to a page load, so a person presents one of their keys once and is handed
+        a cookie from then on. The session is bound to the key: its role is the key's (capped by
+        the person's, as the key's own would be), it is refused from addresses the key is, and
+        it ends when the key is revoked or expires.
+
+        The refusal for a key that does not work is one sentence for every way that can happen —
+        unknown, revoked, expired, disabled owner, wrong address — for the reason
+        :meth:`~manicule.app.ports.Keys.verify` gives. A key that works but belongs to nobody
+        gets its own, because by then the caller has proved they hold it and the fix is theirs
+        to ask for.
+
+        Raises:
+            UnknownEntityError: Signing in with a key is not available here: the mode is not
+                ``api_key``, or no ``session_secret`` exists to sign the cookie.
+            SignInRefusedError: The key is not usable, or is not a person's.
+        """
+        if not key_sign_in_enabled(self.settings):
+            msg = (
+                "signing in to a browser with an API key is not available here. It needs "
+                "security.auth.mode = 'api_key' and security.auth.session_secret set to at "
+                f"least {MIN_SESSION_SECRET} characters; run `manicule doctor` to see which."
+            )
+            raise UnknownEntityError(msg)
+        identity = await self.authenticate(secret, address=current().address)
+        if not identity.authenticated:
+            # A wrong key here is a guess, exactly as a wrong header is, and is charged to the
+            # same per-address bucket and counted toward the same brute-force alert. The
+            # middleware does this for headers; a key in a request body is only seen here.
+            guessing = await self.charge_failed_authentication(current().address)
+            if not guessing.allowed:
+                msg = (
+                    f"too many failed authentications from this address; retry in "
+                    f"{guessing.retry_after_s:.0f}s"
+                )
+                raise RateLimitedError(msg, retry_after_s=guessing.retry_after_s)
+            await self._audit(
+                "auth.login_refused", details={"provider": "key", "reason": "key_not_usable"}
+            )
+            msg = (
+                "that key was not accepted. It may be mistyped, revoked, expired, or limited to "
+                "other addresses. Ask an administrator for a new one."
+            )
+            raise SignInRefusedError(msg, reason="key_not_usable")
+        if not identity.user_id:
+            await self._audit(
+                "auth.login_refused", details={"provider": "key", "reason": "key_has_no_owner"}
+            )
+            msg = (
+                "that key belongs to the installation rather than to a person, so it cannot "
+                "start a browser session. Ask an administrator for your own: `manicule auth "
+                "add-user <handle>` creates a person with a first key, and `manicule auth "
+                "create-key <name> --user <handle>` mints another for one who exists."
+            )
+            raise SignInRefusedError(msg, reason="key_has_no_owner")
+        member = await self._member(identity.user_id)
+        users = await self._backend.users()
+        session_id, expires_at, token = await users.begin_session(
+            member.id,
+            max_age_s=self.settings.security.auth.session_max_age_s,
+            key_id=identity.key_id,
+        )
+        await self._audit(
+            "auth.login",
+            details={
+                "user_id": member.id,
+                "provider": "key",
+                "key_id": identity.key_id,
+                "session_id": session_id,
+            },
+            actor=member.id,
+        )
+        return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
+
+    async def authenticate_session(self, token: str, *, address: str = "") -> r.Identity:
         """Turn a browser's session token into an identity, or say plainly that it is not one.
 
         The session counterpart of :meth:`authenticate`, and deliberately the same shape: every
@@ -8167,18 +8312,22 @@ class ApplicationService:
         here. The role is the membership's as it stands now, read in the same statement, so a
         demotion takes effect on the demoted person's very next request.
 
-        Only when ``security.auth.mode`` is ``oauth``. Under any other mode there is no
-        sign-in, so a session cookie — left over from before a configuration change — is not a
-        credential this installation accepts.
+        Only where a browser can sign in at all — see :func:`~manicule.app.people.honors_sessions`.
+        Under any other configuration there is no sign-in, so a session cookie left over from
+        before a configuration change is not a credential this installation accepts.
+
+        Args:
+            address: The presenting client's address. Held against ``allowed_ips`` for a session
+                a key started, which is only as usable as the key was.
         """
         mode = self.settings.security.auth.mode
         unauthenticated = r.Identity(
             authenticated=False, mode=mode.value, role="", workspace=self.workspace
         )
-        if mode is not AuthMode.OAUTH or not token:
+        if not honors_sessions(self.settings) or not token:
             return unauthenticated
         users = await self._backend.users()
-        member = await users.resolve_session(token)
+        member = await users.resolve_session(token, address=address)
         # The store's predicate is what refuses another workspace's session. This is the check
         # on the way out, against the row in hand, and it fails closed: a member from anywhere
         # else is an unauthenticated caller, not an error the caller could learn from.
@@ -8190,9 +8339,14 @@ class ApplicationService:
             role=member.role,
             workspace=member.workspace,
             via="session",
+            # The key a session started from, when one did: the request is charged to that
+            # key's bucket at that key's own limit, so exchanging a capped key for a browser
+            # does not lift the cap.
+            key_id=member.session_key_id,
             user_id=member.id,
             user_email=member.email,
             user_name=member.name,
+            rate_limit=member.session_rate_limit,
         )
 
     async def sign_out(self, token: str) -> r.SignedOut:
@@ -8300,6 +8454,46 @@ class ApplicationService:
             sessions_revoked=change.sessions_revoked,
             keys_revoked=change.keys_revoked,
         )
+
+    async def user_create(self, handle: str, *, role: str = "member") -> r.UserCreated:
+        """Create a person in this workspace, and mint the first key they will sign in with.
+
+        One step, because a person with no key can do nothing and a key with no person cannot
+        sign a browser in. The secret is returned once, here, for the administrator to hand over.
+        The handle is folded to lower case and is how the person is named from then on, at the
+        command line and in ``PATCH /api/v1/auth/users/{user}``, in place of an address.
+
+        There is no password. A person holds API keys and presents one to sign a browser in;
+        further keys are minted with :meth:`api_key_create`, and a lost one is revoked and
+        replaced. Creating a handle an identity provider cannot collide with is what the
+        ``local`` provider is for.
+
+        Raises:
+            ConfigError: The handle is empty or not made of lower-case letters, digits, ``.``,
+                ``_`` and ``-``, or the role is not one manicule has.
+            NameInUseError: A person with this handle is already a member here.
+        """
+        name = handle.strip().lower()
+        if not HANDLE.fullmatch(name):
+            msg = (
+                f"{handle!r} is not a usable handle: use 1 to 64 lower-case letters, digits, "
+                f"'.', '_' or '-', starting with a letter or digit"
+            )
+            raise ConfigError(msg)
+        chosen = _role(role)
+        users = await self._backend.users()
+        if await users.member_by_subject(LOCAL, name) is not None:
+            msg = f"{name!r} is already a member of workspace {self.workspace!r}"
+            raise NameInUseError(msg)
+        member = await users.admit(
+            Profile(provider=LOCAL, subject=name, name=name), role=chosen.value
+        )
+        self._require_member_here(member)
+        await self._audit(
+            "user.created", details={"user_id": member.id, "provider": LOCAL, "role": member.role}
+        )
+        issued = await self.api_key_create(f"{name}-key", role=member.role, user=member.id)
+        return r.UserCreated(user=member, key=issued.key, secret=issued.secret)
 
     async def user_set_role(self, user: str, role: str) -> r.UserUpdated:
         """Change one member's role. See :meth:`user_update` for the rules it is held to."""

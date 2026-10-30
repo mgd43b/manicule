@@ -291,7 +291,9 @@ What the browser surface does on a published port depends on how the installatio
 authenticates. A browser cannot attach a header to a page load, so with `security.auth.mode =
 api_key` a page load carries no credential and is refused — with a page saying so — and
 publishing a port gets you the API and the widget while the pages refuse, which is the safe
-direction for the surface that renders the corpus. With `security.auth.mode = oauth` people sign
+direction for the surface that renders the corpus. Setting `security.auth.session_secret`
+(at least 32 characters) under `api_key` lets a person sign in at `/ui/login` with one of their
+own keys instead, with no identity provider. With `security.auth.mode = oauth` people sign
 in through Google or GitHub at `/ui/login` and the pages work for them; that needs
 `security.auth.session_secret`, a provider whose `redirect_uri` is this deployment's own
 `https://<host>/auth/callback/<type>`, and an allowlist, and `manicule serve` refuses to start
@@ -388,8 +390,12 @@ installation, and it is stricter than the personal-mode binding rule above: a te
 with `security.auth.mode = "none"` is refused wherever a socket is made, loopback included, and
 `--no-authentication` is refused rather than honored — there is no anonymous operator to fall
 back to (`docs/surfaces.md` §6, "Team mode takes the way out away"). A program still authenticates
-with `security.auth.mode = "api_key"`; a person at a browser needs
-`security.auth.mode = "oauth"`.
+with `security.auth.mode = "api_key"`. A person at a browser needs either
+`security.auth.mode = "oauth"`, or `"api_key"` with a `security.auth.session_secret`, where they
+sign in by presenting a key of their own (`manicule auth add-user` creates the person and the
+key; `docs/surfaces.md` §9.2.1). The second needs no provider, no `redirect_uri` and no
+allowlist; the secret is set as `MANICULE_SECURITY__AUTH__SESSION_SECRET`, and without it
+nothing breaks, sign-in is simply not offered.
 
 **Sign-in configuration** is one `[security.auth]` block plus one `[[security.auth.providers]]`
 table per identity provider — the exact shape, with `example.org` in place of a real domain, is
@@ -422,7 +428,9 @@ need to be right:
   entry (`docs/surfaces.md` §9.3). An empty list, the default, is correct only when nothing sits
   in front of manicule at all.
 
-**Bootstrapping the first administrator** is a one-time step, not a setting: give one provider
+**Bootstrapping the first administrator** is a one-time step, not a setting. Under `api_key`
+it is `manicule auth add-user NAME --role admin` at the machine, which prints that person's
+first key once; they sign in with it at `/ui/login`. Under `oauth`, give one provider
 `role = "admin"` with an `allowed_emails`/`allowed_domains` entry naming only that person, sign
 in once, then narrow the provider back to `role = "member"` for everyone who signs in after —
 or let people sign in as members from the start and promote one from the command line, which

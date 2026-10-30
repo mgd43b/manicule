@@ -44,6 +44,7 @@ from manicule.api.security import (
     anonymous,
     require,
 )
+from manicule.app.people import key_sign_in_enabled
 from manicule.config.settings import AuthMode, Role
 from manicule.core.errors import ManiculeError
 
@@ -119,15 +120,15 @@ def refused_page(request: Request, exc: Exception) -> HTMLResponse:
     mode = _mode(request)
     hint = ""
     sign_in = ""
-    if unauthenticated and mode == AuthMode.OAUTH.value:
+    if unauthenticated and (mode == AuthMode.OAUTH.value or _key_sign_in_offered(request)):
         hint = "This installation lets people sign in. Sign in to continue."
         sign_in = LOGIN_PAGE
     elif unauthenticated:
         hint = (
-            "A browser cannot attach a header to a page load, and with API keys there is no "
-            "session cookie — a key is presented on every request instead. Use the HTTP API "
-            "or the command line; the browser surface serves an installation with no "
-            "authentication, or one where people sign in."
+            "A browser cannot attach a header to a page load, and this installation has no "
+            "browser sign-in: a key is presented on every request instead. Use the HTTP API "
+            "or the command line, or set security.auth.session_secret so that a person can "
+            "sign in here with one of their keys."
         )
     else:
         hint = "Your role does not reach this page; an administrator of this workspace decides it."
@@ -203,6 +204,16 @@ def signed_in_page(request: Request, signed_in: Mapping[str, JsonValue]) -> HTML
         }
     )
     return html_response(body, status=OK)
+
+
+def _key_sign_in_offered(request: Request) -> bool:
+    """Whether this installation lets a browser sign in with an API key.
+
+    Read off the application's own settings rather than the principal, which says only how a
+    request authenticated: a refusal is rendered for a request that did not.
+    """
+    service = getattr(request.app.state, "service", None)
+    return service is not None and key_sign_in_enabled(service.settings)
 
 
 def _mode(request: Request) -> str:

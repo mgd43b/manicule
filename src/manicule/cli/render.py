@@ -1479,13 +1479,24 @@ def render_api_key_issued(out: Console, payload: r.ApiKeyIssued) -> None:
     out.print("[dim]only its digest is stored; a lost key is reissued, never recovered[/dim]")
 
 
+def render_user_created(out: Console, payload: r.UserCreated) -> None:
+    out.print(
+        f"{_person(payload.user)} added to {escape(payload.user.workspace)} as "
+        f"[bold]{escape(payload.user.role)}[/bold]; first key "
+        f"[bold]{escape(payload.key.name)}[/bold]"
+    )
+    out.print(Panel(payload.secret, title="shown once", border_style="yellow"))
+    out.print("[dim]only its digest is stored; a lost key is revoked and replaced[/dim]")
+
+
 def render_api_keys(out: Console, payload: r.ApiKeyList) -> None:
-    table = Table("name", "prefix", "role", "expires", "revoked", box=None, pad_edge=False)
+    table = Table("name", "prefix", "role", "owner", "expires", "revoked", box=None, pad_edge=False)
     for key in payload.keys:
         table.add_row(
             escape(key.name),
             escape(key.prefix),
             escape(key.role),
+            escape(key.user_id or "installation"),
             escape(key.expires_at or "never"),
             "yes" if key.revoked else "no",
         )
@@ -1504,7 +1515,7 @@ def _person(user: r.UserSummary) -> str:
 
 def render_users(out: Console, payload: r.UserList) -> None:
     if not payload.users:
-        out.print("[dim]nobody has signed in to this workspace[/dim]")
+        out.print("[dim]nobody is a member of this workspace[/dim]")
         return
     table = Table(
         "id",
@@ -1879,6 +1890,7 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.ApiKeyIssued: lambda out, p: render_api_key_issued(out, _as(r.ApiKeyIssued, p)),
     r.ApiKeyList: lambda out, p: render_api_keys(out, _as(r.ApiKeyList, p)),
     r.ApiKeyRevoked: lambda out, p: render_api_key_revoked(out, _as(r.ApiKeyRevoked, p)),
+    r.UserCreated: lambda out, p: render_user_created(out, _as(r.UserCreated, p)),
     r.UserList: lambda out, p: render_users(out, _as(r.UserList, p)),
     r.UserUpdated: lambda out, p: render_user_updated(out, _as(r.UserUpdated, p)),
     r.UserSignedOut: lambda out, p: render_user_signed_out(out, _as(r.UserSignedOut, p)),

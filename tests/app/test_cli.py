@@ -1195,6 +1195,7 @@ def test_a_fingerprint_is_never_truncated(
 
 CLI_ONLY_OPS: frozenset[str] = frozenset(
     {
+        "auth_add_user",
         "auth_create_key",
         "auth_disable_user",
         "auth_enable_user",
@@ -2662,6 +2663,7 @@ def test_connector_sidecar_reports_which_profiles_ran(
 
 
 MINIMAL: dict[str, list[str]] = {
+    "auth_add_user": ["auth", "add-user", "alice"],
     "auth_create_key": ["auth", "create-key", "ci"],
     "auth_disable_user": ["auth", "disable-user", "user-1"],
     "auth_enable_user": ["auth", "enable-user", "user-1"],

@@ -182,6 +182,10 @@ class User(Base):
     Identified by ``(provider, subject)`` — the provider's own stable, opaque account id — and
     never by email. An address can be changed, recycled or unverified; the subject is what the
     provider promises is the same account next time.
+
+    **``local`` is the one provider that is not a provider**: a person an administrator created
+    in this installation, whose ``subject`` is the handle they were given. They hold API keys
+    and no password, and sign in to a browser by presenting one of those keys.
     """
 
     __tablename__ = "users"
@@ -198,7 +202,7 @@ class User(Base):
 
     __table_args__ = (
         UniqueConstraint("provider", "subject"),
-        CheckConstraint("provider IN ('google', 'github')", name="provider_is_known"),
+        CheckConstraint("provider IN ('google', 'github', 'local')", name="provider_is_known"),
     )
 
 
@@ -255,6 +259,13 @@ class AuthSession(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    key_id: Mapped[str | None] = mapped_column(ForeignKey("api_keys.id", ondelete="CASCADE"))
+    """The API key a browser exchanged for this session; ``NULL`` for an identity-provider sign-in.
+
+    What binds the session to the key rather than only to the person. A session minted from a
+    viewer key is a viewer's however senior its owner is, and it ends when the key is revoked or
+    expires — a key lost and revoked must not leave a browser signed in behind it.
+    """
 
     __table_args__ = (
         Index("ix_auth_sessions_workspace_id", "workspace_id"),

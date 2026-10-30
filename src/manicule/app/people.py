@@ -27,6 +27,7 @@ an unauthenticated wide bind is.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -50,6 +51,20 @@ MIN_SESSION_SECRET = 32
 A signing key an attacker can enumerate is a cookie an attacker can forge — and the session
 cookie is the credential. Thirty-two characters is well past guessing and well within what
 ``secrets.token_urlsafe(32)`` prints.
+"""
+
+
+KEY_SIGN_IN_PATH = "/auth/key"
+"""Where a browser presents an API key and receives a session for it."""
+
+LOCAL = "local"
+"""The ``provider`` of a person an administrator created here, not one a provider vouched for."""
+
+HANDLE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+"""What a local person may be called: lower-case letters, digits, ``.``, ``_`` and ``-``.
+
+No ``@``, so a handle can never be mistaken for an address when an administrator names a person
+by either, and nothing that would need quoting in a command line or a URL.
 """
 
 
@@ -179,6 +194,30 @@ def admission(provider: OAuthProvider, profile: Profile) -> Refusal | None:
     return Refusal.NOT_ADMITTED
 
 
+def key_sign_in_enabled(settings: Settings) -> bool:
+    """Whether a browser may exchange an API key for a session under this configuration.
+
+    Only under ``api_key``, and only with a ``session_secret`` long enough to sign the cookie.
+    **No secret is not a serving problem**: an installation that has run on keys alone since
+    before browsers could sign in must keep starting, so the browser sign-in is simply not
+    offered until the secret exists, and ``doctor`` says so.
+    """
+    auth = settings.security.auth
+    if auth.mode is not AuthMode.API_KEY or auth.session_secret is None:
+        return False
+    return len(auth.session_secret.get_secret_value()) >= MIN_SESSION_SECRET
+
+
+def honors_sessions(settings: Settings) -> bool:
+    """Whether a ``manicule_session`` cookie is a credential this installation accepts.
+
+    Under ``oauth`` always (its serving problems guarantee a secret); under ``api_key`` only
+    once a browser can sign in with a key; under ``none`` never — a cookie left over from before
+    a configuration change is not a credential.
+    """
+    return settings.security.auth.mode is AuthMode.OAUTH or key_sign_in_enabled(settings)
+
+
 def serving_problems(settings: Settings) -> list[str]:
     """What stops a served installation from completing a sign-in. Empty when nothing does.
 
@@ -264,7 +303,10 @@ def _redirect_problems(provider: OAuthProvider, label: str, *, enforce_https: bo
 
 __all__ = [
     "CALLBACK_PATH",
+    "HANDLE",
+    "KEY_SIGN_IN_PATH",
     "LAST_ADMIN",
+    "LOCAL",
     "LOGIN_PATH",
     "MIN_SESSION_SECRET",
     "REFUSALS",
@@ -272,6 +314,8 @@ __all__ = [
     "Refusal",
     "admission",
     "applicable_providers",
+    "honors_sessions",
+    "key_sign_in_enabled",
     "provider_for",
     "serving_problems",
 ]

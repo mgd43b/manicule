@@ -414,7 +414,10 @@ sign-out`, `docs/surfaces.md` §9.2.1) — after which `mode = "team"` refuses t
 authentication, anonymous administrator included (§6, "Team mode takes the way out away"). And
 cross-workspace search (§16) is the per-query isolation across more than one tenant this
 section's goal list named. PII redaction (`security.data_policy.auto_redact`) predates this
-slice and is unrelated to it. What is left is delivery, not the record: `security.audit`
+slice and is unrelated to it. A person can also be created locally (`manicule auth add-user`,
+provider `local`, no password) and sign a browser in with a key of their own at `POST /auth/key`
+under `api_key` with a `session_secret`; the session is bound to that key (§9.2.1). No passwords,
+no hard delete of a person and no generic OIDC provider exist. What is left is delivery, not the record: `security.audit`
 accepts a `syslog` or `webhook` destination and only `local` is wired to anything
 (`docs/deployment.md` §6.6, [#14](https://github.com/mgd43b/manicule/issues/14)).
 
@@ -515,7 +518,7 @@ Issue numbers match these steps exactly — step 4 is [#4](https://github.com/mg
 | 10 | [Document management](https://github.com/mgd43b/manicule/issues/10) | Reach | |
 | 11 | [HTTP API](https://github.com/mgd43b/manicule/issues/11) | Interfaces | Eleven route groups over the same service the CLI and MCP use |
 | 12 | [Web UI](https://github.com/mgd43b/manicule/issues/12) | Interfaces | |
-| 13 | [Team mode & security](https://github.com/mgd43b/manicule/issues/13) | Production | |
+| 13 | [Team mode & security](https://github.com/mgd43b/manicule/issues/13) | Production | Shipped in v0.2.9; keys and OAuth sign-in, plus local people and browser sign-in with a key |
 | 14 | [Operations](https://github.com/mgd43b/manicule/issues/14) | Production | |
 
 **Not an ordering constraint — a runtime guardrail.** Vector dimensionality comes from the

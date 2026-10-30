@@ -3044,7 +3044,9 @@ class _Users:
                 await session.flush()
             return _user_summary(user, membership)
 
-    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+    async def begin_session(
+        self, user_id: str, *, max_age_s: int, key_id: str | None = None
+    ) -> tuple[str, str, str]:
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
         from manicule.storage.types import utcnow  # noqa: PLC0415
@@ -3062,13 +3064,14 @@ class _Users:
             workspace_id=self._runtime.workspace,
             created_at=created,
             expires_at=expires,
+            key_id=key_id,
         )
         sessions = session_factory(self._runtime.require_engine())
         async with sessions.begin() as session:
             session.add(row)
         return row.id, expires.isoformat(), token
 
-    async def resolve_session(self, token: str) -> UserSummary | None:
+    async def resolve_session(self, token: str, *, address: str = "") -> UserSummary | None:
         """Resolve a presented session token to its member, or ``None``.
 
         Six predicates, all in the one statement: the digest matches, the session is **this**
@@ -3078,10 +3081,17 @@ class _Users:
         :meth:`_Keys.verify` gives, and the comparison is over a digest, so nothing here can be
         timed a byte at a time.
 
+        **A session a key started is only as good as the key.** Its ``key_id`` is joined, and a
+        key that has been revoked or has expired ends the browser it signed in the moment it
+        does; the key's ``allowed_ips`` are held against ``address`` exactly as
+        :meth:`_Keys.verify` holds them; and the role returned is the key's, capped by the
+        membership's, so a browser signed in with a viewer key is a viewer however senior its
+        owner is. A session an identity provider started has no key and none of this applies.
+
         The membership is joined rather than trusted from the session row, so a role changed by
         an administrator is the role the very next request carries.
         """
-        from sqlalchemy import and_, select  # noqa: PLC0415
+        from sqlalchemy import and_, or_, select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
@@ -3095,7 +3105,7 @@ class _Users:
         async with sessions() as session:
             row = (
                 await session.execute(
-                    select(models.User, models.WorkspaceMember)
+                    select(models.User, models.WorkspaceMember, models.ApiKey)
                     .select_from(models.AuthSession)
                     .join(models.User, models.User.id == models.AuthSession.user_id)
                     .join(
@@ -3105,16 +3115,41 @@ class _Users:
                             models.WorkspaceMember.workspace_id == models.AuthSession.workspace_id,
                         ),
                     )
+                    .outerjoin(models.ApiKey, models.ApiKey.id == models.AuthSession.key_id)
                     .where(
                         models.AuthSession.token_hash == _digest(token),
                         models.AuthSession.workspace_id == workspace,
                         models.AuthSession.revoked_at.is_(None),
                         models.AuthSession.expires_at > now,
                         models.WorkspaceMember.disabled_at.is_(None),
+                        or_(
+                            models.AuthSession.key_id.is_(None),
+                            and_(
+                                models.ApiKey.revoked_at.is_(None),
+                                or_(
+                                    models.ApiKey.expires_at.is_(None),
+                                    models.ApiKey.expires_at > now,
+                                ),
+                            ),
+                        ),
                     )
                 )
             ).first()
-        return None if row is None else _user_summary(row[0], row[1])
+        if row is None:
+            return None
+        user, membership, key = row
+        summary = _user_summary(user, membership)
+        if key is None:
+            return summary
+        if not _address_permitted(address, key.allowed_ips):
+            return None
+        return summary.model_copy(
+            update={
+                "role": _capped_role(key.role, membership.role),
+                "session_key_id": key.id,
+                "session_rate_limit": key.rate_limit,
+            }
+        )
 
     async def end_session(self, token: str) -> bool:
         from sqlalchemy import update  # noqa: PLC0415
@@ -3169,7 +3204,7 @@ class _Users:
         return [_user_summary(row[0], row[1], sessions=live.get(row[0].id, 0)) for row in rows]
 
     async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
-        from sqlalchemy import func, or_, select  # noqa: PLC0415
+        from sqlalchemy import and_, func, or_, select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
@@ -3190,6 +3225,12 @@ class _Users:
                         or_(
                             models.User.id == wanted,
                             func.lower(models.User.email) == wanted.lower(),
+                            # A local person is known by the handle they were given, which
+                            # they have in place of an address.
+                            and_(
+                                models.User.provider == "local",
+                                models.User.subject == wanted.lower(),
+                            ),
                         ),
                     )
                     .order_by(models.User.id)

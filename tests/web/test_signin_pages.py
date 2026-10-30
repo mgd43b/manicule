@@ -125,10 +125,10 @@ def test_a_member_is_refused_the_people_page_as_a_page() -> None:
     assert "data-user-role" not in page.text
 
 
-def test_the_people_page_says_nobody_signs_in_where_nobody_does() -> None:
+def test_the_people_page_offers_to_add_a_person_whatever_the_mode() -> None:
     backend, _ = backend_with_a_document(security={"auth": {"mode": "none"}})
     with client_for(backend) as client:
         page = client.get("/ui/users")
     assert page.status_code == OK
-    assert "nobody signs in here" in page.text
-    assert "Nobody has signed in to this workspace yet." in page.text
+    assert "data-create-user" in page.text, "an administrator cannot add a person"
+    assert "Nobody is a member of this workspace yet." in page.text

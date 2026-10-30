@@ -74,10 +74,12 @@ OPERATIONS: frozenset[str] = frozenset(TOOL_NAMES) | {
     # Both halves of a browser sign-in are one operation: the login route starts it and the
     # callback completes it, and a refusal of either is a refusal of signing in.
     "sign_in",
+    "sign_in_with_key",
     "sign_out",
     "tag_create",
     "tag_delete",
     "tag_list",
+    "user_create",
     "user_list",
     "user_sign_out",
     "user_update",

@@ -673,6 +673,7 @@ async def auth(service: Service, caller: Reader) -> HTMLResponse:
         extra={
             "key_id": caller.identity.key_id,
             "key_name": caller.identity.key_name,
+            "is_admin": caller.identity.role == "admin" or caller.identity.mode == "none",
             "credential": {"key": "an API key", "session": "a signed-in browser"}.get(
                 caller.identity.via, ""
             ),
