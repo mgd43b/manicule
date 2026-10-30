@@ -93,7 +93,12 @@ def refusal(password: str) -> Refusal | None:
     candidate = normalize(password)
     if len(candidate) < MIN_LENGTH:
         return Refusal(f"A password must be at least {MIN_LENGTH} characters.")
-    if len(candidate.encode()) > MAX_BYTES:
+    try:
+        size = len(candidate.encode())
+    except UnicodeEncodeError:
+        # A JSON body can carry a lone surrogate, which is not text and cannot be hashed.
+        return Refusal("A password must be valid text.")
+    if size > MAX_BYTES:
         return Refusal(f"A password may be at most {MAX_BYTES} bytes.")
     if not candidate.strip():
         return Refusal("A password cannot be only whitespace.")
@@ -180,9 +185,14 @@ async def verify(password: str, stored: str | None) -> bool:
     :func:`decoy` and always answers ``False``.
     """
     candidate = normalize(password)
-    target = stored if stored is not None else decoy()
+
+    def work() -> bool:
+        # The decoy is built here, in the worker, so its first construction does not stall
+        # the event loop.
+        return _check(candidate, stored if stored is not None else decoy())
+
     async with _gate():
-        matched = await asyncio.to_thread(_check, candidate, target)
+        matched = await asyncio.to_thread(work)
     return matched and stored is not None
 
 

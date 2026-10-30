@@ -365,3 +365,22 @@ def test_only_a_password_session_is_offered_the_change_password_form() -> None:
     assert "data-change-password" in offered.text
     assert 'autocomplete="current-password"' in offered.text
     assert "data-change-password" not in withheld.text
+
+
+def test_a_lone_surrogate_in_a_password_is_a_refusal_not_a_crash() -> None:
+    backend = _backend()
+    admin = asyncio.run(_admin(backend))
+    body = b'{"handle": "bob", "password": "\\ud800 not text but long enough"}'
+    with client_for(backend) as client:
+        created = client.post(
+            "/api/v1/auth/users",
+            content=body,
+            headers={"content-type": "application/json", "X-API-Key": admin},
+        )
+        signed = client.post(
+            "/auth/password",
+            content=body.replace(b'"bob"', b'"alice"'),
+            headers={"content-type": "application/json"},
+        )
+    assert created.status_code == BAD_REQUEST
+    assert signed.status_code == FORBIDDEN

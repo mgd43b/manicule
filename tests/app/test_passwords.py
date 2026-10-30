@@ -97,3 +97,12 @@ async def test_the_production_cost_is_what_the_module_says_it_is(
 async def test_the_decoy_is_a_real_hash_nobody_can_match() -> None:
     assert passwords.decoy().startswith("scrypt$")
     assert not await passwords.verify(GOOD, None)
+
+
+async def test_a_lone_surrogate_is_refused_and_never_matches() -> None:
+    broken = "\ud800 is not text, however long this is"
+    problem = passwords.refusal(broken)
+    assert problem is not None
+    assert "valid text" in problem.message
+    stored = await passwords.hash_password(GOOD)
+    assert not await passwords.verify(broken, stored)
