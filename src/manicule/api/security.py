@@ -20,7 +20,8 @@ non-loopback bind with no auth is refused twice: by
 :func:`~manicule.api.app.build_app` before an application exists.
 
 **A browser that signed in presents a session cookie instead of a header.** Under
-``security.auth.mode = 'oauth'`` a request carrying no header credential is resolved from the
+``security.auth.mode = 'oauth'``, or ``'api_key'`` with a ``session_secret`` long enough to sign
+it, a request carrying no header credential is resolved from the
 ``manicule_session`` cookie, if it has one — its signature first, then
 :meth:`~manicule.app.service.ApplicationService.authenticate_session`. A header always wins: a
 request presenting a key is that key, valid or not, whatever cookie the browser also sent. And
@@ -57,6 +58,7 @@ from manicule.api.cookies import SESSION_COOKIE, session_token
 from manicule.api.proxy import FORWARDED_FOR
 from manicule.app.caller import RANK, Caller, acting_as
 from manicule.app.frontdoor import MCP
+from manicule.app.people import honors_sessions
 from manicule.app.results import Identity
 from manicule.app.throttle import RateDecision
 from manicule.config.settings import AuthMode, Role
@@ -234,9 +236,8 @@ async def account_for_credential(
     address = principal.address
     guessed = failed_credential(principal, request)
     if guessed:
-        guessing = service.rate_limiter.charge_failed_auth(address)
         with acting_as(principal.caller):
-            await service.record_security_alert(service.alert_monitor.record_failed_auth(address))
+            guessing = await service.charge_failed_authentication(address)
             if guessing.allowed:
                 await service.record_failed_authentication(credential_kind=guessed)
         return guessing
@@ -273,7 +274,8 @@ async def identify(
 
     The order is the rule. A header credential is always the answer when one is presented, so
     a program's key is never overridden by a browser's ambient cookie. Only with no header,
-    under ``oauth``, and outside the MCP mount is the cookie consulted, and its signature is
+    where a browser can sign in (``oauth``, or ``api_key`` with a ``session_secret``), and
+    outside the MCP mount is the cookie consulted, and its signature is
     checked before the service is asked anything: a forged or expired cookie is refused for the
     cost of a hash.
 
@@ -289,12 +291,12 @@ async def identify(
     settings = service.settings
     if (
         not header
-        and settings.security.auth.mode is AuthMode.OAUTH
+        and honors_sessions(settings)
         and SESSION_COOKIE in request.cookies
         and not beneath_mcp(request.url.path)
     ):
         return await service.authenticate_session(
-            session_token(settings, request.cookies.get(SESSION_COOKIE))
+            session_token(settings, request.cookies.get(SESSION_COOKIE)), address=address
         )
     return await service.authenticate(header, address=address)
 

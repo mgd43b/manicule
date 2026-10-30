@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### People without an identity provider: local users, and a browser signs in with a key
+
+Under `security.auth.mode = "api_key"` an administrator can now create a person:
+`manicule auth add-user HANDLE [--role admin|member|viewer]`, `POST /api/v1/auth/users`, or the
+**Add a person** form on `/ui/users`. The person has no password and no email; they get a first
+key named `<handle>-key`, shown once. `manicule auth create-key NAME --user HANDLE` (and `user` on
+`POST /api/v1/auth/keys`) mints more.
+
+With `security.auth.session_secret` set (at least 32 characters, usually through
+`MANICULE_SECURITY__AUTH__SESSION_SECRET`), `/ui/login` shows a key form and a person can sign a
+browser in with one of their own keys. The session is bound to that key: it carries the lesser of
+the key's role and the person's, honors the key's `allowed_ips` on every request, and ends when
+the key is revoked or expires or the person is disabled. A key no person owns cannot sign a
+browser in. Without a `session_secret` nothing changes and sign-in is simply not offered; `manicule
+doctor` says how to turn it on. Upgrading runs one migration (`c9a4e7d21b30`). To give an existing
+operator key a browser identity, mint a personal key with `auth create-key NAME --user HANDLE` and
+revoke the old one. See `surfaces.md` §9.2.1.
+
 ### Old mail archives: the `mbox` source, and mail is now sensitive wherever it came from
 
 A `type = "mbox"` source indexes the unix mbox files under a root, one document per message,

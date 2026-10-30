@@ -883,26 +883,50 @@ class Users(Protocol):
         """This workspace's membership for one provider account, or ``None`` if it has none."""
         ...
 
-    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+    async def admit(self, profile: Profile, *, role: str, must_be_new: bool = False) -> UserSummary:
         """Record a sign-in: create or refresh the person, and make them a member if they are not.
 
         ``role`` is used only when the membership is created. After that a person's role is
         whatever an administrator has made it, and a sign-in never overwrites it — otherwise
         every demotion would last until the demoted person next signed in.
+
+        Args:
+            must_be_new: Refuse, rather than refresh, a person who is already a member here.
+                The check and the insert are one operation, so two concurrent creations of the
+                same person cannot both succeed.
+
+        Raises:
+            NameInUseError: ``must_be_new`` and the person is already a member here.
         """
         ...
 
-    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
-        """Start a browser session. Returns its id, its expiry, and the only copy of its token."""
+    async def begin_session(
+        self, user_id: str, *, max_age_s: int, key_id: str | None = None
+    ) -> tuple[str, str, str]:
+        """Start a browser session. Returns its id, its expiry, and the only copy of its token.
+
+        Args:
+            key_id: The API key the browser exchanged for this session, or ``None`` for an
+                identity-provider sign-in. A session a key started ends when the key is revoked
+                or expires, and is capped at the key's role.
+        """
         ...
 
-    async def resolve_session(self, token: str) -> UserSummary | None:
+    async def resolve_session(self, token: str, *, address: str = "") -> UserSummary | None:
         """Which member this session token is, or ``None`` if it is not a usable one.
 
         ``None`` covers unknown, revoked, expired, another workspace's, and a disabled or
         removed membership, and deliberately does not say which — the reasoning
         :meth:`Keys.verify` gives. Every one of those is a predicate of one statement over a
         digest of the token, so there is no branch here to time.
+
+        For a session a key started, ``None`` also covers that key being revoked, expired or
+        presented from outside its ``allowed_ips``, and the returned ``role`` is the key's
+        capped by the membership's — see :meth:`Keys.verify`, whose rule this is.
+
+        Args:
+            address: The presenting client's address, held against the starting key's
+                ``allowed_ips`` when it has any.
         """
         ...
 
@@ -919,7 +943,8 @@ class Users(Protocol):
         ...
 
     async def find_members(self, user_or_email: str) -> Sequence[UserSummary]:
-        """Members whose id is ``user_or_email``, or whose address is, ignoring case.
+        """Members whose id is ``user_or_email``, whose address is, or — for a local person —
+        whose handle is, ignoring case.
 
         A sequence rather than one, because two accounts at two providers can report the same
         address, and the caller — not this store — decides that two matches is a refusal.

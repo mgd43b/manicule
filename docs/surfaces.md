@@ -336,7 +336,8 @@ server and the built command tree.
 | `upgrade` | — | `upgrade` | current, target, and the command to run |
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |
 | `completion` | — | `completion` | a shell script |
-| `auth_create_key` / `auth_list_keys` / `auth_revoke_key` | — | `auth …` | API keys |
+| `auth_create_key` / `auth_list_keys` / `auth_revoke_key` | — | `auth …` (`create-key --user HANDLE` mints for a member) | API keys |
+| `auth_add_user` | — | `auth add-user` | the person and their first key, secret shown once (HTTP: `POST /api/v1/auth/users`, op `user_create`; a browser signs in at `POST /auth/key`, op `sign_in_with_key`) |
 | `auth_users` / `auth_set_role` / `auth_disable_user` / `auth_enable_user` / `auth_sign_out` | — | `auth users`, `auth set-role`, `auth disable-user`, `auth enable-user`, `auth sign-out` | members of this workspace, and what a change took with it |
 
 ### 4.0.1 Shared lifecycle status
@@ -1615,8 +1616,10 @@ the page sends. On the websocket, where a browser cannot set headers, it travels
 subprotocol back.
 
 With `oauth`, keys work exactly as above, and **a person at a browser signs in** through Google
-or GitHub instead — §9.2.1. A request presenting no header credential is then resolved from the
-browser's session cookie, if it carries one. A header always wins over a cookie, valid or not,
+or GitHub instead — §9.2.1. With `api_key` and a `security.auth.session_secret`, a person signs
+in by presenting one of their own keys at `POST /auth/key` (§9.2.1). Under either, a request
+presenting no header credential is resolved from the browser's session cookie, if it carries one.
+Under `api_key` with no `session_secret`, and under `none`, no cookie is a credential. A header always wins over a cookie, valid or not,
 and the cookie is **never** honored beneath the MCP mount, which is stateless by design (§6.1):
 an assistant running in a browser tab must not inherit whoever is signed in there.
 `manicule.api.security.identify` is the one place that decision is made, for HTTP routes, pages
@@ -1640,6 +1643,12 @@ delegate; a caller short of admin with no `user_id` may not mint at all. Listing
 admin or the local operator sees and may revoke every key in the workspace; anyone else sees and
 may revoke only keys they own, and revoking somebody else's key by id fails exactly as an
 unknown id would — the same non-disclosure `Keys.verify` already practices for a bad secret.
+
+**Keys for a member.** `manicule auth create-key NAME --user HANDLE` and `POST /api/v1/auth/keys`
+with `user` mint a key owned by that member rather than by the minter; an administrator or the
+local operator may do so, and the key's role is still capped by the member's. A person is named
+by user id, address, or — for a local person (§9.2.1) — handle. A key a person owns can sign a
+browser in; an unowned key cannot, and keeps working for programs as it always has.
 
 A key additionally carries `allowed_ips` (CIDR ranges it may be presented from; empty means
 anywhere) and `rate_limit` (its own requests-per-minute ceiling, replacing
@@ -1774,7 +1783,46 @@ of a workspace can read the whole workspace; roles decide what a person may *do*
 reads, `member` writes, `admin` administers people, keys and the installation — not which
 documents they may see. A corpus some people must not read belongs in another workspace.
 
-**The first administrator.** Either give one provider `role = "admin"` with an allowlist that
+**Signing in with an API key (`api_key`).** A person who holds a key can sign a browser in
+without a provider. The shape, as it would sit in the configuration file:
+
+```toml
+[security.auth]
+mode = "api_key"
+session_secret = "…"          # at least 32 characters; MANICULE_SECURITY__AUTH__SESSION_SECRET
+```
+
+`POST /auth/key` takes the key in a JSON body (`{"key": "…"}`) or a form field `key`, never the
+URL. On success it sets the same `manicule_session` cookie, with the same attributes, as the
+OAuth callback: a browser form post is answered `303` to `/`, and a JSON caller gets the
+envelope without the token. `/ui/login` shows the form, and `GET /auth/providers` reports
+`key_login_path`. It needs `auth.mode = api_key` **and** a `session_secret` of at least 32
+characters. With no secret nothing breaks: sign-in is simply not offered, `doctor`'s `sign_in`
+check stays `ok` and says how to enable it, and the cookie is not honored.
+
+*A key session is bound to its key.* The `auth_sessions` row carries `key_id`, so the effective
+role is the lesser of the key's role and the member's membership role; a revoked or expired key
+ends the session at once; the key's `allowed_ips` are enforced on every session request; and a
+disabled member's sessions end. A key with no owner cannot sign a browser in, and the refusal
+names `auth add-user` and `auth create-key --user`. A wrong key at `/auth/key` is charged to the
+same per-address failed-authentication bucket, and counts toward the same `brute_force` alert,
+as a wrong header key (§9.10), then answers 429. As elsewhere, the cookie is never honored beneath
+`/mcp`, and a header credential beats a cookie. The audit trail records `user.created`,
+`auth.login` (provider `key`, with `key_id`) and `auth.login_refused` (provider `key`, reason
+`key_not_usable` or `key_has_no_owner`).
+
+*Local people.* `manicule auth add-user HANDLE [--role]` and `POST /api/v1/auth/users` (admin;
+body `{handle, role}`; the Add a person form on `/ui/users`) create a person with provider
+`local`, subject the lower-case handle, no email and no password, a membership, and a first key
+named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`,
+`_` and `-` (at most 64, starting with a letter or digit); a duplicate is refused (409). More
+keys come from `auth create-key NAME --user HANDLE`. **Not built:** passwords; deleting a person
+(a disable already revokes their sessions and keys, and audit rows refer to them); a generic
+OIDC provider. Existing unowned operator keys are untouched; to give one a browser identity,
+mint a personal key with `auth create-key NAME --user HANDLE` and revoke the old one.
+
+**The first administrator.** Under `api_key`: `manicule auth add-user NAME --role admin`, which
+runs as the operator at the machine, and hand over the key it prints. Under `oauth`, either give one provider `role = "admin"` with an allowlist that
 names only that person, sign in, and then narrow the provider back to `member`; or let people
 sign in as members and promote one from the command line, which runs as the operator at the
 machine: `manicule auth set-role <user-id-or-address> admin`. A workspace that has an enabled
@@ -1789,11 +1837,12 @@ provider that applies to the served workspace, two applicable providers of one t
 non-loopback host while `enforce_https` is on, and a provider that admits nobody. None of these
 is a `policy_problems` entry: none of them stops a command that serves nothing.
 
-**People over HTTP**, all admin: `GET /api/v1/auth/users` lists members with their role,
+**People over HTTP**, all admin: `POST /api/v1/auth/users` creates a local person and their first
+key (`user_create`); `GET /api/v1/auth/users` lists members with their role,
 standing and live session count; `PATCH /api/v1/auth/users/{user}` takes `role` and/or
 `disabled`; `POST /api/v1/auth/users/{user}/sign-out` ends every session the member holds.
-`{user}` is a user id, or an address that names exactly one member of this workspace — two
-accounts at two providers can share one, and then the id is required.
+`{user}` is a user id, a handle (local people), or an address that names exactly one member of
+this workspace — two accounts at two providers can share one, and then the id is required.
 
 ### 9.3 Whose address a request has
 
@@ -2030,7 +2079,7 @@ network surface — HTTP, the MCP mount, and the websocket handshake. Two bucket
   full from disuse.
 - **A failed-authentication bucket per address**, refilled at `failed_auth_per_minute` — its own
   rate is also its capacity, for the same reason. It is charged by a header credential that did
-  not work (never by a request with no credential, never by one that succeeded, never by a stale
+  not work, and by a wrong key posted to `POST /auth/key` (never by a request with no credential, never by one that succeeded, never by a stale
   session cookie, and never under `auth.mode = 'none'`, where nothing is checked), and once it is
   spent such requests are refused with 429. **A working credential from the same address is never
   refused by it.** Behind a proxy nobody configured as trusted, or one office's NAT, every caller

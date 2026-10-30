@@ -750,6 +750,25 @@ async def test_doctor_reports_a_sign_in_that_would_work() -> None:
     assert "google" in check.detail
 
 
+async def test_doctor_says_how_to_let_a_key_sign_in_a_browser_and_does_not_fail_without_it() -> (
+    None
+):
+    """An installation that has run on keys alone must keep passing; it is told, not failed."""
+    bare = Settings(security={"auth": {"mode": "api_key"}})  # pyright: ignore[reportArgumentType]
+    keyed = Settings(
+        security={"auth": {"mode": "api_key", "session_secret": "s" * 40}}  # pyright: ignore[reportArgumentType]
+    )
+    without = await ApplicationService(FakeBackend(settings=bare)).doctor()
+    with_secret = await ApplicationService(FakeBackend(settings=keyed)).doctor()
+    off = next(check for check in without.checks if check.name == "sign_in")
+    on = next(check for check in with_secret.checks if check.name == "sign_in")
+    assert off.state == "ok"
+    assert "session_secret" in off.detail
+    assert off.facts["key_sign_in"] is False
+    assert on.state == "ok"
+    assert on.facts["key_sign_in"] is True
+
+
 async def test_doctor_reports_team_mode_without_authentication_even_on_loopback() -> None:
     """Loopback does not help: there is no operator-at-this-machine for a team to be."""
     settings = Settings(mode="team")  # pyright: ignore[reportArgumentType]

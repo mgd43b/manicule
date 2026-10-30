@@ -754,6 +754,9 @@
         var rateLimit = keyForm.elements.rate_limit.value;
         var allowedIps = keyForm.elements.allowed_ips.value;
         var body = { name: keyForm.elements.name.value, role: keyForm.elements.role.value };
+        if (keyForm.elements.user && keyForm.elements.user.value.trim()) {
+          body.user = keyForm.elements.user.value.trim();
+        }
         if (days) { body.expires_days = Number(days); }
         if (rateLimit) { body.rate_limit = Number(rateLimit); }
         if (allowedIps) {
@@ -781,6 +784,23 @@
      * administrator, nobody disabling themselves — is the server's: a refusal arrives in the
      * status line in its words, and the select is put back by the reload that follows. */
     var userStatus = document.querySelector("[data-user-status]");
+    var userSecret = document.querySelector("[data-user-secret]");
+    var userForm = document.querySelector("[data-create-user]");
+    if (userForm) {
+      userForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var submit = userForm.querySelector('[type="submit"]');
+        var body = { handle: userForm.elements.handle.value, role: userForm.elements.role.value };
+        runAction(submit, userStatus, "Adding…", function () {
+          return json("POST", "/api/v1/auth/users", body);
+        }, function (result, node) {
+          /* The first key's only copy, written here and nowhere else, as on the keys page. */
+          userSecret.hidden = false;
+          say(userSecret, result.envelope.data.secret);
+          actionState(node, "success", "Copy this key now — only a digest is kept, so it cannot be shown again. Reload to see the new member.");
+        });
+      });
+    }
     document.querySelectorAll("[data-user-role]").forEach(function (select) {
       var chosen = select.value;
       select.addEventListener("change", function () {

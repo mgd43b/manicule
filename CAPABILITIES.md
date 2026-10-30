@@ -14,10 +14,10 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
 | MCP capability items | 47 | #8 — **built** |
-| HTTP endpoints | 64 | #11 — **built** |
+| HTTP endpoints | 65 | #11 — **built** |
 | File types | 21 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **220** | |
+| **Total** | **221** | |
 
 ## CLI — 48
 
@@ -133,6 +133,9 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `auth alerts [--all]` and `auth ack-alert <id>` — list and clear recorded security alerts.
   `--all` includes acknowledged ones; without it, only the open ones a person still has to
   look at. `docs/surfaces.md` §9.11.
+- `auth add-user HANDLE [--role]` and `auth create-key NAME --user HANDLE` — create a local
+  person (provider `local`, no password) with a first key named `<handle>-key`, shown once, and
+  mint further keys for a member. A person's key can sign a browser in. `docs/surfaces.md` §9.2.1.
 - `auth users`, `auth set-role <user> <role>`, `auth disable-user <user>`,
   `auth enable-user <user>` and `auth sign-out <user>` — the people-admin surface: list members
   with role, standing and live session count; change a role (the last enabled administrator
@@ -223,7 +226,7 @@ corpus where collections are optional is most of it. Asking how many there *are*
 that: `doctor`'s `collection-membership` check counts them on every surface, and a sync reports
 the figure for its own source.
 
-## HTTP endpoints — 64
+## HTTP endpoints — 65
 
 Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -307,10 +310,12 @@ name — an absence with no test is an absence that comes back.
 - [ ] ~~`POST   /api/v1/documents/upload`~~ — accepting bytes over HTTP is an ingest path with no filesystem permission check and no path the operator chose. `manicule index <path>` is the ingest this build offers
 - [ ] ~~`POST   /api/v1/plugins/install`~~ — installing a plugin fetches and executes code with this process's full authority. `POST /api/v1/plugins/:name` enables one that is already installed
 - [x] `POST   /api/v1/tags`
+- [x] `POST   /auth/key` — exchanges a key a person owns for a browser session (`api_key` mode with
+  a `session_secret`); the session is bound to that key. `docs/surfaces.md` §9.2.1.
 - [x] `POST   /auth/logout` — revokes the browser's session on the server, not only its cookie
 - [x] `POST   /auth/session` — as `GET /auth/session`, which *reports* an identity rather than
-  creating one. A browser session is created only by signing in through a provider, and a
-  program presents a key on every request instead; `docs/surfaces.md` §9.2.1
+  creating one. A browser session is created only by signing in, through a provider or with a
+  person's key at `POST /auth/key`, and a program presents a key on every request instead; `docs/surfaces.md` §9.2.1
 
 ### Added, because the endpoints above could not do their job without them
 
@@ -329,6 +334,8 @@ name — an absence with no test is an absence that comes back.
   a single-operator build has no one to apply it to: list members with role, standing and live
   session count; change a role or disable/enable a membership; end every session a member holds.
   Admin-only. `docs/surfaces.md` §9.2.1.
+- `POST /api/v1/auth/users` — create a local person with a first key, secret shown once; and
+  `user` on `POST /api/v1/auth/keys` mints a key for a member. Admin-only. `docs/surfaces.md` §9.2.1.
 
 ## File types — 21
 

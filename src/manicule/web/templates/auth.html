@@ -49,6 +49,10 @@
     <input id="key-rate-limit" name="rate_limit" type="number" min="1" inputmode="numeric">
     <label for="key-allowed-ips">Allowed IPs (comma-separated CIDRs)</label>
     <input id="key-allowed-ips" name="allowed_ips" autocomplete="off" placeholder="anywhere">
+    {% if is_admin %}
+    <label for="key-user">For (handle or id; blank for yourself)</label>
+    <input id="key-user" name="user" autocomplete="off">
+    {% endif %}
     <button type="submit">Mint</button>
   </form>
   <p class="secret" data-secret hidden></p>

@@ -114,7 +114,7 @@ the failure the page shows — same type, same message, same hint.
 | admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `security_alerts`, `plugin_health`, `connector_list` | admin |
 | reembed | `/ui/reembed` | `reembed_plan`, `reembed_status` | admin |
 | lifecycle | `/ui/lifecycle` | dry runs of the lifecycle operations, `rebuild_plan`, `rebuild_status` | admin |
-| users | `/ui/users` | `user_list`, `auth_providers` | admin |
+| users | `/ui/users` | `user_list`, `auth_providers` | admin (adding a person: `user_create`) |
 | auth | `/ui/auth` | `api_key_list`, `auth_providers` | viewer — rows are the caller's own keys unless they administer |
 | layout | — | — | — |
 
@@ -200,10 +200,14 @@ on `security.auth.mode`, and so does what this surface says when it refuses one:
   considering beside it. Team mode refuses it outright, and so does an installation that holds a
   sensitive source (a Gmail mailbox, for one), on loopback too; `--no-authentication` waives
   neither ([`surfaces.md` §6](surfaces.md#6-where-a-server-listens)).
-- **`api_key`** — a key is presented on every request in a header, and there is **no session
-  cookie in this mode**. A page load carries no credential, so this surface refuses it — with an
-  HTML page that says so and points at the HTTP API and the command line, rather than a JSON
-  envelope in a browser window.
+- **`api_key`** — a key is presented on every request in a header. A page load carries none, so
+  without a `session_secret` this surface refuses it — with an HTML page that says so and points
+  at the HTTP API and the command line, rather than a JSON envelope in a browser window. With
+  `security.auth.session_secret` set (at least 32 characters), `/ui/login` shows a **key form**
+  posting to `POST /auth/key`: a person presents one of their own keys once and the browser holds
+  a session cookie bound to it, which authenticates pages, the page script's API calls and the
+  websocket, never the MCP mount. An unauthenticated page load is then refused with a link to
+  sign in, as under `oauth`. A key no person owns cannot sign a browser in.
 - **`oauth`** — people sign in. `/ui/login` links to each provider that applies to this
   workspace; after the provider sends the browser back, it holds a session cookie that
   authenticates pages, the JSON API the page's script calls, and the websocket — never the MCP
@@ -220,7 +224,8 @@ here.
 
 **People are administered on the People page** (`/ui/users`, admin): every member of this
 workspace with their role, standing and live sessions, a role select, disable or enable, and
-*sign out everywhere*. Each control calls `PATCH /api/v1/auth/users/{id}` or
+*sign out everywhere*. Under `api_key` an **Add a person** form (a handle and a role, calling
+`POST /api/v1/auth/users`) creates a local person and shows their first key's secret once. Each control calls `PATCH /api/v1/auth/users/{id}` or
 `POST /api/v1/auth/users/{id}/sign-out` through the page's script, exactly as the key buttons
 call the key routes; every rule — the last administrator stays one, nobody disables themselves,
 a disable takes the person's sessions and keys with it — is the service's, and a refusal is

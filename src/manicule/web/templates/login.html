@@ -39,12 +39,25 @@
     </p>
     <p><a href="/ui">Go to the dashboard</a></p>
   </div>
+  {% elif listed.key_login_path %}
+  <div class="panel">
+    <form method="post" action="{{ listed.key_login_path }}">
+      <label for="sign-in-key">Your API key</label>
+      <input id="sign-in-key" name="key" type="password" required autocomplete="off" spellcheck="false">
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="muted">
+      Use one of your own keys. The browser keeps a session for it, with that key's role, and the
+      session ends when the key is revoked or expires. Ask an administrator if you have none.
+    </p>
+  </div>
   {% elif listed.mode == 'api_key' %}
   <div class="panel">
     <p>
-      Nobody signs in here. This installation authenticates with API keys, presented in a header
-      on every request — which a browser cannot do for a page load. Use the HTTP API or the
-      command line.
+      Nobody signs in here yet. This installation authenticates with API keys, presented in a
+      header on every request, which a browser cannot do for a page load. Use the HTTP API or
+      the command line, or ask the operator to set <code>security.auth.session_secret</code> so
+      that a person can sign in here with one of their keys.
     </p>
   </div>
   {% else %}

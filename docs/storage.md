@@ -758,6 +758,13 @@ none can be derived from anything already stored.
 | `auth_sessions` | A signed-in browser: `token_hash UNIQUE`, `user_id`, `workspace_id`, `expires_at`, `revoked_at` | **Server-side, so revocable one at a time.** A cookie that carried the identity could only be revoked by rotating the key that signs every cookie. Only the SHA-256 of the token is stored, as for `api_keys`, so a copy of the database is not a copy of anybody's session. Resolved in one statement joining the membership, so a disabled person or a changed role is what the next request sees ([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)) |
 | `security_alerts` | A pattern of use worth a person's attention: `kind` checked against `brute_force`, `key_abuse` and `export_volume`, `subject`, `details JSON`, `acknowledged_at`, `acknowledged_by` | **No foreign keys**, for `audit_logs`' reason: an alert about a key or an address must outlive the row it names. Written by `ApplicationService.record_security_alert` whether or not `security.audit.enabled` is set ([`surfaces.md`](surfaces.md) §9.11), indexed on `(workspace_id, created_at)` |
 
+A later revision (`c9a4e7d21b30`, after `b6d1f3a7c408`) adds local people and key sessions
+without a new table: `users.provider` now also allows `'local'` (a person an administrator
+created, `subject` their lower-case handle, no email), and `auth_sessions` gains a nullable
+`key_id`, a foreign key to `api_keys.id` `ON DELETE CASCADE`. A session a key started names that
+key, so it ends when the key does and is held to the key's role and `allowed_ips`; one an OAuth
+sign-in started has a null `key_id`.
+
 Every read and write of a membership or a session carries the workspace as a predicate; a person
 is read without one, because a person is the same person everywhere.
 

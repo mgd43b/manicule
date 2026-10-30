@@ -280,6 +280,10 @@ BINDERS: Mapping[str, Binder] = {
         expires_days=args.optional_count("expires_days"),
         allowed_ips=args.texts("allowed_ips"),
         rate_limit=args.optional_count("rate_limit"),
+        user=args.optional_text("user"),
+    ),
+    "auth_add_user": lambda service, args, report: service.user_create(
+        args.text("handle"), role=args.text("role")
     ),
     # `role` is `text` rather than `optional_text` deliberately: the command line declares a
     # default of "member", so it always sends a string, and a reader that accepted nothing

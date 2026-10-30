@@ -3,7 +3,9 @@
 **A program presents a key; a person at a browser signs in.** A key is minted at the command
 line or by a signed-in person, and presented on every request in a header. A browser cannot
 attach a header to a page load, so under ``security.auth.mode = 'oauth'`` a person signs in
-through an identity provider instead, and the browser holds a session cookie from then on. Both
+through an identity provider instead, and under ``'api_key'`` (with a ``session_secret``) a
+person presents one of their own keys at ``POST /auth/key``; the browser holds a session cookie
+from then on, and a key's session is bound to that key. Both
 arrive at the same principal through :func:`~manicule.api.security.identify`, and every route
 below that takes a floor is held to it whichever credential was presented.
 
@@ -18,12 +20,13 @@ caller owns. Asking for more than viewer here would be a second, looser copy of 
 floor a route asks for is "is there a caller at all", and the service is where "what may *this*
 caller do" is decided once.
 
-**The sign-in is three routes and nothing decides anything in them.** ``GET /auth/login/{type}``
-sends the browser to the provider with a fresh ``state`` and a PKCE challenge, carrying both in
-a short-lived signed cookie; ``GET /auth/callback/{type}`` checks the browser brought them back,
-exchanges the code, and asks the service whether the person the provider named is admitted;
-``POST /auth/logout`` ends the session on the server as well as in the browser. Which provider
-applies, whether a person is admitted and in what role are the service's —
+**The provider sign-in is three routes and nothing decides anything in them.** ``GET
+/auth/login/{type}`` sends the browser to the provider with a fresh ``state`` and a PKCE
+challenge, carrying both in a short-lived signed cookie; ``GET /auth/callback/{type}`` checks
+the browser brought them back, exchanges the code, and asks the service whether the person the
+provider named is admitted; ``POST /auth/logout`` ends the session on the server as well as in
+the browser. (``POST /auth/key`` is the key's counterpart, and decides nothing either.) Which
+provider applies, whether a person is admitted and in what role are the service's —
 :meth:`~manicule.app.service.ApplicationService.sign_in` — and the protocol is
 :mod:`manicule.api.oauth`'s. :mod:`manicule.api.cookies` says what each cookie carries and why
 each attribute is what it is.
@@ -40,7 +43,9 @@ reports how the caller authenticated and, for a person, who they are.
 from __future__ import annotations
 
 import hmac
+import json
 from typing import Annotated
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import RedirectResponse
@@ -58,7 +63,7 @@ from manicule.api.cookies import (
     signin_transaction,
 )
 from manicule.api.envelopes import BAD_REQUEST, FORBIDDEN, NOT_FOUND, as_response, status_for
-from manicule.api.models import KeyBody, UserPatch
+from manicule.api.models import KeyBody, UserBody, UserPatch
 from manicule.api.security import AdminPrincipal, AnonymousPrincipal, ViewerPrincipal
 from manicule.app.dispatch import run_op
 from manicule.core.errors import UnknownEntityError
@@ -67,6 +72,9 @@ router = APIRouter(tags=["auth"])
 
 SEE_OTHER = 303
 FOUND = 302
+
+SIGNED_IN_PAGE = "/"
+"""Where a browser that signed in with a key through the page's form is sent."""
 
 SIGNED_OUT_PAGE = "/ui/login"
 """Where a browser that signed out through the page's form is sent."""
@@ -234,6 +242,75 @@ async def callback(
     return response
 
 
+MAX_KEY_BODY = 4096
+"""The most of a key sign-in request that is read. A key is about fifty characters."""
+
+
+async def presented_key(request: Request) -> str:
+    """The key a sign-in request carries, from a JSON body or a plain form post.
+
+    Read by hand, bounded, and never from the URL: a query string is logged, remembered and
+    sent in ``Referer``, and a key does not belong in any of them. A page's form posts it, a
+    program posts ``{"key": "..."}``, and anything else presented is no key.
+    """
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > MAX_KEY_BODY:
+            return ""
+    text = bytes(raw).decode("utf-8", errors="replace")
+    if "json" in request.headers.get("content-type", ""):
+        try:
+            loaded: object = json.loads(text)
+        except ValueError:
+            return ""
+        value = loaded.get("key") if isinstance(loaded, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        return value.strip() if isinstance(value, str) else ""
+    return parse_qs(text).get("key", [""])[0].strip()
+
+
+@router.post(
+    "/auth/key",
+    name="sign_in_with_key",
+    summary="Exchange an API key for a browser session.",
+)
+async def key_login(request: Request, service: Service, caller: AnonymousPrincipal) -> Response:
+    """Sign a browser in with a key a person owns, and hand it the session cookie.
+
+    Anonymous, because it is how a browser without a credential gets one. Everything that
+    decides — whether the key works, whose it is, what the session may do — is the service's:
+    :meth:`~manicule.app.service.ApplicationService.sign_in_with_key`, which also charges a
+    wrong key to the same failed-authentication bucket a wrong header is charged to.
+
+    A browser's form post is answered with a ``303`` to the front door, as sign-out is, and a
+    refusal as a page; a program gets the envelope, **without the session token**, which is for
+    the cookie alone.
+    """
+    from manicule.web.security import sign_in_refused  # noqa: PLC0415 - avoids a cycle
+
+    del caller
+    settings = service.settings
+    secret = await presented_key(request)
+    envelope = await run_op(
+        "sign_in_with_key", service.workspace, lambda: service.sign_in_with_key(secret)
+    )
+    wants_page = "text/html" in request.headers.get("accept", "")
+    if not envelope.ok or envelope.data is None:
+        message = envelope.error.message if envelope.error else "the sign-in failed"
+        if wants_page:
+            return sign_in_refused(request, message, status=status_for(envelope))
+        return as_response(envelope)
+    token = str(envelope.data.get("token", ""))
+    response: Response
+    if wants_page:
+        response = RedirectResponse(SIGNED_IN_PAGE, status_code=SEE_OTHER)
+    else:
+        without_token = {key: value for key, value in envelope.data.items() if key != "token"}
+        response = as_response(envelope.model_copy(update={"data": without_token}))
+    set_session(response, settings, token)
+    return response
+
+
 @router.post("/auth/logout", name="sign_out", summary="End this browser's session.")
 async def logout(request: Request, service: Service, caller: AnonymousPrincipal) -> Response:
     """End the session on the server, and tell the browser to forget it.
@@ -284,6 +361,7 @@ async def create_key(service: Service, caller: ViewerPrincipal, body: KeyBody) -
                 expires_days=body.expires_days,
                 allowed_ips=body.allowed_ips,
                 rate_limit=body.rate_limit,
+                user=body.user,
             ),
         )
     )
@@ -327,6 +405,28 @@ async def list_users(service: Service, caller: AdminPrincipal) -> Response:
     """
     del caller
     return as_response(await run_op("user_list", service.workspace, service.user_list))
+
+
+@router.post(
+    "/api/v1/auth/users",
+    name="user_create",
+    summary="Create a person, with the first key they sign in with.",
+)
+async def create_user(service: Service, caller: AdminPrincipal, body: UserBody) -> Response:
+    """Return the person and the only copy of their first key's secret.
+
+    There is no password: the key is the credential, and further keys are minted for the person
+    with ``POST /api/v1/auth/keys`` and ``user``. Admin-only, like every route that changes who
+    the workspace's members are.
+    """
+    del caller
+    return as_response(
+        await run_op(
+            "user_create",
+            service.workspace,
+            lambda: service.user_create(body.handle, role=body.role),
+        )
+    )
 
 
 @router.patch(

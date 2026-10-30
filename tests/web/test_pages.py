@@ -417,16 +417,17 @@ def test_a_second_page_of_a_listing_renders(path: str) -> None:
 def test_a_browser_that_presents_no_key_is_refused_as_a_page() -> None:
     """With API keys configured, a navigation carries no credential and this says so.
 
-    A browser cannot attach a header to a page load, and under ``api_key`` there is no session
-    cookie, so the honest answer is a refusal that explains itself — not a JSON envelope in a
-    browser window, and not a page that quietly renders as though the caller were the operator.
+    A browser cannot attach a header to a page load, and with no ``session_secret`` under
+    ``api_key`` there is no browser sign-in, so the honest answer is a refusal that explains
+    itself — not a JSON envelope in a browser window, and not a page that quietly renders as
+    though the caller were the operator.
     """
     backend, _ = backend_with_a_document(security={"auth": {"mode": "api_key"}})
     with client_for(backend) as client:
         response = client.get("/ui/documents")
     assert response.status_code == UNAUTHORIZED
     assert "text/html" in response.headers["content-type"]
-    assert "no session cookie" in response.text
+    assert "no browser sign-in" in response.text
     assert 'href="/ui/login"' not in response.text, "offered a sign-in nobody can complete"
     assert "{" not in response.text.split("<body")[0], "a JSON body reached a browser"
 

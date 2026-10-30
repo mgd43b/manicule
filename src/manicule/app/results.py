@@ -2087,6 +2087,11 @@ class AuthProviders(Payload):
         default=(),
         description="Where a browser starts signing in, one per provider, in the same order.",
     )
+    key_login_path: str = Field(
+        default="",
+        description="Where a browser presents an API key to sign in, when this installation "
+        "offers that. Empty when it does not.",
+    )
     detail: str = ""
 
 
@@ -2115,6 +2120,18 @@ class UserSummary(Payload):
         ge=0,
         description="Signed-in browsers that have not ended or expired. ``None`` when this "
         "reading did not count them, which is different from none.",
+    )
+    session_key_id: str = Field(
+        default="",
+        exclude=True,
+        description="Set only on a member resolved from a session a key started: that key, "
+        "so the request is charged and attributed as the key's. Never serialized.",
+    )
+    session_rate_limit: int | None = Field(
+        default=None,
+        exclude=True,
+        description="The starting key's own requests-per-minute cap, when it has one. Never "
+        "serialized.",
     )
 
 
@@ -3197,6 +3214,21 @@ class ApiKeyIssued(Payload):
     )
 
 
+class UserCreated(Payload):
+    """A person created here, and the first key they sign in with.
+
+    ``secret`` is the only copy of that key, shown once exactly as an API key's is.
+    """
+
+    user: UserSummary
+    key: ApiKeySummary
+    secret: str = Field(
+        repr=False,
+        description="Shown once and never stored. Only its SHA-256 digest is kept, so a lost "
+        "key is revoked and replaced rather than recovered.",
+    )
+
+
 class ApiKeyList(Payload):
     """Every key in this workspace."""
 
@@ -3360,6 +3392,7 @@ __all__ = [
     "TrashList",
     "TrashedDocument",
     "UpgradeReport",
+    "UserCreated",
     "UserList",
     "UserSignedOut",
     "UserSummary",

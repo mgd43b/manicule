@@ -258,6 +258,7 @@ def _cli_ops() -> set[str]:
 
 WRITERS: frozenset[str] = frozenset(
     {
+        "auth_add_user",
         "auth_create_key",
         "auth_revoke_key",
         # Memberships and sessions are rows in the data directory's database, and a disable

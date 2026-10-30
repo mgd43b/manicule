@@ -17,13 +17,31 @@
 
 <section class="panel">
   <h2>Members</h2>
-  {% if panels.providers.ok and panels.providers.data.mode != 'oauth' %}
+  <h3>Add a person</h3>
+  <form class="filters" data-create-user>
+    <label for="user-handle">Handle</label>
+    <input id="user-handle" name="handle" required autocomplete="off" pattern="[a-z0-9][a-z0-9._\-]*" maxlength="64">
+    <label for="user-role">Role</label>
+    <select id="user-role" name="role">
+      <option value="viewer">viewer</option>
+      <option value="member" selected>member</option>
+      <option value="admin">admin</option>
+    </select>
+    <button type="submit">Add</button>
+  </form>
+  <p class="secret" data-user-secret hidden></p>
   <p class="muted">
-    People become members by signing in, and this installation's authentication mode is
-    <code>{{ panels.providers.data.mode }}</code>, so nobody signs in here. Programs authenticate
-    with API keys, on the API keys page.
+    A person holds API keys, not a password: this mints their first key, shown once, for you to
+    hand over.
+    {% if panels.providers.ok and panels.providers.data.key_login_path %}
+    They sign in to this browser surface by presenting it, and a program sends it in a header.
+    {% else %}
+    A program sends it in a header; this installation does not offer a browser sign-in with a
+    key (that needs <code>security.auth.mode = "api_key"</code> and a
+    <code>security.auth.session_secret</code>).
+    {% endif %}
+    More keys are minted for them on the API keys page.
   </p>
-  {% endif %}
   <p class="muted" data-user-status role="status" aria-live="polite"></p>
 
   {% if panels.users.ok %}
@@ -68,7 +86,7 @@
       minted, at once; enabling them again restores the membership and not those credentials.
       A workspace that has an enabled administrator always keeps one.
     </p>
-    {% else %}{{ m.empty('Nobody has signed in to this workspace yet.') }}{% endif %}
+    {% else %}{{ m.empty('Nobody is a member of this workspace yet.') }}{% endif %}
   {% else %}{{ m.failed(panels.users) }}{% endif %}
 </section>
 {% endblock %}

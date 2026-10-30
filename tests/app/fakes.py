@@ -1539,6 +1539,23 @@ class FakeKeys:
     secrets: dict[str, ApiKeySummary] = field(default_factory=dict[str, ApiKeySummary])
     revoked: set[str] = field(default_factory=set[str])
     memberships: dict[str, str | None] = field(default_factory=dict[str, "str | None"])
+    people: FakeUsers | None = None
+    """The people store, when a test wants an owner's standing read from it.
+
+    ``memberships`` above is for a test that seeds a role by hand. When it names nobody and a
+    people store is attached, the owner's role is whatever that store says it is, as the real
+    store's join reads the one ``workspace_members`` table both halves share.
+    """
+
+    def _owner_role(self, user_id: str) -> str | None:
+        if user_id in self.memberships:
+            return self.memberships[user_id]
+        if self.people is None:
+            return None
+        membership = self.people.memberships.get((self.workspace, user_id))
+        if membership is None or membership.get("disabled"):
+            return None
+        return str(membership["role"])
 
     async def issue(
         self,
@@ -1606,8 +1623,8 @@ class FakeKeys:
             return None
         if summary.user_id is None:
             return summary
-        member_role = self.memberships.get(summary.user_id)
-        if summary.user_id not in self.memberships or member_role is None:
+        member_role = self._owner_role(summary.user_id)
+        if member_role is None:
             return None
         rank = {"viewer": 0, "member": 1, "admin": 2}
         effective = summary.role if rank[summary.role] <= rank[member_role] else member_role
@@ -1728,8 +1745,11 @@ class FakeUsers:
             return None
         return self._summary(user_id, self.workspace)
 
-    async def admit(self, profile: Profile, *, role: str) -> UserSummary:
+    async def admit(self, profile: Profile, *, role: str, must_be_new: bool = False) -> UserSummary:
         user_id = self._by_subject(profile.provider, profile.subject)
+        if must_be_new and user_id is not None and (self.workspace, user_id) in self.memberships:
+            msg = f"{profile.subject!r} is already a member of workspace {self.workspace!r}"
+            raise NameInUseError(msg)
         now = datetime.now(UTC).isoformat()
         if user_id is None:
             user_id = f"user-{len(self.people)}"
@@ -1763,7 +1783,9 @@ class FakeUsers:
             "created_at": datetime.now(UTC).isoformat(),
         }
 
-    async def begin_session(self, user_id: str, *, max_age_s: int) -> tuple[str, str, str]:
+    async def begin_session(
+        self, user_id: str, *, max_age_s: int, key_id: str | None = None
+    ) -> tuple[str, str, str]:
         token = f"session-token-{len(self.sessions)}"
         expires = datetime.now(UTC) + timedelta(seconds=max_age_s)
         self.sessions[token] = {
@@ -1772,10 +1794,11 @@ class FakeUsers:
             "workspace": self.workspace,
             "expires_at": expires,
             "revoked": False,
+            "key_id": key_id,
         }
         return str(self.sessions[token]["id"]), expires.isoformat(), token
 
-    async def resolve_session(self, token: str) -> UserSummary | None:
+    async def resolve_session(self, token: str, *, address: str = "") -> UserSummary | None:
         self.resolves += 1
         record = self.sessions.get(token)
         if record is None or record["workspace"] != self.workspace or record.get("revoked"):
@@ -1785,7 +1808,37 @@ class FakeUsers:
         membership = self.memberships.get((self.workspace, str(record["user_id"])))
         if membership is None or membership.get("disabled"):
             return None
-        return self._summary(str(record["user_id"]), self.workspace)
+        summary = self._summary(str(record["user_id"]), self.workspace)
+        key_id = record.get("key_id")
+        if key_id is None:
+            return summary
+        # A session a key started is only as good as the key, as the real store joins it.
+        role = self._key_session_role(str(key_id), summary.role, address)
+        if role is None or not isinstance(self.keys, FakeKeys):
+            return None
+        key = next(k for k in self.keys.issued if k.id == key_id)
+        return summary.model_copy(
+            update={
+                "role": role,
+                "session_key_id": key.id,
+                "session_rate_limit": key.rate_limit,
+            }
+        )
+
+    def _key_session_role(self, key_id: str, member_role: str, address: str) -> str | None:
+        """The role a key-started session carries, or ``None`` when the key no longer allows it."""
+        keys = self.keys
+        if not isinstance(keys, FakeKeys):
+            return None
+        key = next((k for k in keys.issued if k.id == key_id), None)
+        expired = bool(
+            key and key.expires_at and datetime.fromisoformat(key.expires_at) <= datetime.now(UTC)
+        )
+        misplaced = bool(key and key.allowed_ips and not _address_in(address, key.allowed_ips))
+        if key is None or key.id in keys.revoked or expired or misplaced:
+            return None
+        rank = {"viewer": 0, "member": 1, "admin": 2}
+        return key.role if rank[key.role] <= rank[member_role] else member_role
 
     async def end_session(self, token: str) -> bool:
         record = self.sessions.get(token)
@@ -1818,7 +1871,12 @@ class FakeUsers:
         return [
             member
             for member in await self.list_members()
-            if member.id.lower() == wanted or (member.email and member.email.lower() == wanted)
+            if member.id.lower() == wanted
+            or (member.email and member.email.lower() == wanted)
+            or (
+                member.provider == "local"
+                and str(self.people[member.id].get("subject", "")).lower() == wanted
+            )
         ]
 
     async def count_admins(self) -> int:
@@ -1889,7 +1947,7 @@ class LeakyUsers(FakeUsers):
     """
 
     @override
-    async def resolve_session(self, token: str) -> UserSummary | None:
+    async def resolve_session(self, token: str, *, address: str = "") -> UserSummary | None:
         self.resolves += 1
         record = self.sessions.get(token)
         if record is None:
@@ -1977,12 +2035,14 @@ class FakeBackend:
         return self.telemetry_
 
     async def keys(self) -> Keys:
+        self.keys_.people = self.users_
         return self.keys_
 
     async def users(self) -> Users:
         # The same key store the backend hands the service, so a disable here revokes the keys
         # a test minted there — which is the property being tested, not a convenience.
         self.users_.keys = self.keys_
+        self.keys_.people = self.users_
         return self.users_
 
     async def security_alerts(self) -> SecurityAlerts:
