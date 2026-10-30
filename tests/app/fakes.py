@@ -1748,7 +1748,11 @@ class FakeUsers:
 
     async def admit(self, profile: Profile, *, role: str, must_be_new: bool = False) -> UserSummary:
         user_id = self._by_subject(profile.provider, profile.subject)
-        if must_be_new and user_id is not None and (self.workspace, user_id) in self.memberships:
+        if (
+            must_be_new
+            and user_id is not None
+            and ((self.workspace, user_id) in self.memberships or profile.provider == "local")
+        ):
             msg = f"{profile.subject!r} is already a member of workspace {self.workspace!r}"
             raise NameInUseError(msg)
         now = datetime.now(UTC).isoformat()
@@ -1870,12 +1874,23 @@ class FakeUsers:
         stored = person.get("password_hash")
         return str(stored) if stored is not None else None
 
-    async def set_password(self, user_id: str, password_hash: str | None) -> bool:
+    async def set_password(
+        self,
+        user_id: str,
+        password_hash: str | None,
+        *,
+        expected: str | None = None,
+        require_expected: bool = False,
+    ) -> bool:
         person = self.people.get(user_id)
         if person is None or person.get("provider") != "local":
             return False
+        if require_expected and person.get("password_hash") != expected:
+            return False
         person["password_hash"] = password_hash
-        await self.end_sessions(user_id)
+        for record in self.sessions.values():
+            if record["user_id"] == user_id:
+                record["revoked"] = True
         return True
 
     async def list_members(self) -> Sequence[UserSummary]:

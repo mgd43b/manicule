@@ -1867,7 +1867,9 @@ deliberate difference from a key. A key is 256 random bits, so refusing a correc
 protection and costs a shared address its access; a password is chosen by a person and can be
 guessed, so an address that has spent its allowance of failures would otherwise keep guessing at
 the speed the hash allows, with every correct guess still succeeding. The sign-in is refused
-with `429` and `Retry-After` until the bucket refills, whatever was typed. The cost is that
+with `429` and `Retry-After` until the bucket refills, whatever was typed. The token is spent
+*before* the password is hashed and given back when it was right, so a burst of concurrent guesses
+cannot all pass a budget none of them has yet spent. The cost is that
 people behind one address share a budget for typing passwords wrongly. Keys are unaffected (§9.10).
 There is no lockout of the person. It would let anyone who knows a handle lock that person out,
 so the only thing counted is the address. The risk that remains is guessing spread across many
@@ -1886,7 +1888,8 @@ trail records `user.password_changed`.
 *Recovery.* Manicule sends no mail, so there is no reset link. A forgotten password is replaced
 by an administrator: `manicule auth set-password USER`, `PUT /api/v1/auth/users/{user}/password`
 (body `{"password": "…"}`), or Set password on `/ui/users`. That ends every session the person
-held and leaves their keys alone, and the audit trail records `user.password_set`. The
+holds, in every workspace (the password is the person's across the installation), and leaves their
+keys alone, and the audit trail records `user.password_set`. The
 administrator hands the new password over and the person changes it. Nothing forces them to.
 
 **Decisions that need review.** Each is a choice made so the feature could ship, and each is
@@ -1908,7 +1911,7 @@ open to being made the other way:
 (admin; body `{handle, role, password}`, with `role` and `password` optional; the Add a person
 form on `/ui/users`) create a person with provider
 `local`, subject the lower-case handle, no email, a membership, and either a password or a first
-key named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`,
+key named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`, A handle is unique across the installation: a person is one account with one password, so another workspace cannot create the same handle.
 `_` and `-` (at most 64, starting with a letter or digit); a duplicate is refused (409). More
 keys come from `auth create-key NAME --user HANDLE`. Given a password, a person has no key
 made for them and mints their own after signing in; given none, they have the key and no
@@ -2198,9 +2201,9 @@ network surface — HTTP, the MCP mount, and the websocket handshake. Two bucket
   audited as `auth.failed`, so a guesser at full speed does not write the trail at full speed.
   **A password is the one credential this reverses for.** A key is 256 random bits and a password
   is chosen by a person, so guessing one is possible and a correct guess must not be free. A
-  sign-in by password is therefore charged when it fails *and* refused up front, with 429 and
-  `Retry-After`, while the address has spent its allowance, before the password is checked at
-  all. The price is that people behind one shared address also share the budget for typing
+  sign-in by password is therefore charged up front and refunded when the password is right, and
+  refused with 429 and `Retry-After` while the address has spent its allowance, before the
+  password is checked at all. The price is that people behind one shared address also share the budget for typing
   passwords wrongly; a key from that address still works. There is no lockout of the person,
   because that would let anyone who knows a handle lock that person out (§9.2.1).
 

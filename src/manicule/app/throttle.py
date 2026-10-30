@@ -178,6 +178,14 @@ class KeyedLimiter:
                 return RateDecision(allowed=True)
             return RateDecision(allowed=False, retry_after_s=bucket.retry_after(now, cost=cost))
 
+    def give_back(self, key: str) -> None:
+        """Return one token to ``key``'s bucket, up to its capacity. Nothing for an unknown key."""
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is not None:
+                bucket.refill(self._clock())
+                bucket.tokens = min(bucket.capacity, bucket.tokens + 1.0)
+
     def peek(self, key: str) -> RateDecision:
         """Whether ``key`` could afford one request now, creating no bucket for a new key."""
         with self._lock:
@@ -280,14 +288,10 @@ class RateLimiter:
     def failed_auth_allowed(self, address: str) -> RateDecision:
         """Whether ``address`` could still afford a failed authentication, charging nothing.
 
-        **Asked before a password is hashed, and the one place a correct credential can be
-        refused by this bucket.** A key is 256 random bits, so refusing a correct one buys no
-        protection and costs a shared address its access; a password is chosen by a person and
-        can be guessed, and an address that has spent its allowance of failures would otherwise
-        keep guessing at the speed the hash allows, every correct guess still succeeding. So a
-        password is refused up front, with ``Retry-After``, until the bucket refills. The cost
-        is that people behind one address share a budget for typing passwords wrongly; their
-        keys are unaffected.
+        For a ``Retry-After`` after a refusal. A password attempt does not ask this first: it
+        reserves its token up front with :meth:`charge_failed_auth` and refunds it on success
+        (:meth:`refund_failed_auth`), because a read followed by a later charge lets a burst of
+        concurrent guesses all pass the read.
 
         Reads without inserting: an address that has never failed holds no bucket, so probing
         from many addresses cannot grow the tracked set.
@@ -295,6 +299,16 @@ class RateLimiter:
         if not self._enabled:
             return RateDecision(allowed=True)
         return self._failed_auth.peek(_address_key(address))
+
+    def refund_failed_auth(self, address: str) -> None:
+        """Give back the token a password attempt reserved, because the password was right.
+
+        A password attempt is charged **before** it is checked (``charge_failed_auth`` is the
+        reservation), so a burst of concurrent guesses cannot all pass a budget that none of
+        them has yet spent; a correct password is then refunded, so signing in costs nothing.
+        """
+        if self._enabled:
+            self._failed_auth.give_back(_address_key(address))
 
     def charge_caller(self, key: str, *, rate_limit: int | None = None) -> RateDecision:
         """Charge ``key`` — see :func:`caller_key` — for one ordinary request.

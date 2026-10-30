@@ -947,10 +947,22 @@ class Users(Protocol):
         """
         ...
 
-    async def set_password(self, user_id: str, password_hash: str | None) -> bool:
+    async def set_password(
+        self,
+        user_id: str,
+        password_hash: str | None,
+        *,
+        expected: str | None = None,
+        require_expected: bool = False,
+    ) -> bool:
         """Set, or with ``None`` clear, a local person's password hash. ``False`` when none.
 
-        Ends every live session the person holds, in the same transaction.
+        With ``require_expected`` the write happens only if the stored hash is still
+        ``expected`` (``None`` meaning no password), so a change that verified the old password
+        cannot overwrite a reset made meanwhile.
+
+        Ends every live session the person holds, **in every workspace**, in the same
+        transaction: the password is the person's across the installation.
         """
         ...
 

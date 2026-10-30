@@ -356,3 +356,94 @@ async def test_disabling_a_person_takes_their_password_and_enabling_does_not_ret
     await service.user_set_password("alice", OTHER)
     with acting_as(Caller(address="10.0.0.9")):
         assert (await service.sign_in_with_password("alice", OTHER)).token
+
+
+async def test_every_password_refusal_runs_the_check_even_with_nothing_to_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manicule.app import passwords  # noqa: PLC0415
+
+    checked: list[bool] = []
+    real = passwords.verify
+
+    async def recording(password: str, stored: str | None) -> bool:
+        checked.append(stored is None)
+        return await real(password, stored)
+
+    monkeypatch.setattr(passwords, "verify", recording)
+    service = _service()
+    await service.user_create("alice", password=PASSWORD)
+    await service.user_create("boss", role="admin")
+    await service.user_create("root", role="admin", password=PASSWORD)
+    await service.user_disable("root")
+    for handle in ("ghost", "root", "alice"):
+        with acting_as(Caller(address="10.1.0.1")), pytest.raises(SignInRefusedError):
+            await service.sign_in_with_password(handle, OTHER)
+    assert len(checked) == 3, "an unknown or disabled handle skipped the hash, and so was faster"
+    assert checked == [True, True, False]
+
+
+async def test_a_burst_of_guesses_cannot_outrun_the_budget() -> None:
+    import asyncio  # noqa: PLC0415
+
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    await service.user_create("alice", password=PASSWORD)
+
+    async def guess(n: int) -> str:
+        with acting_as(Caller(address="10.1.0.2")):
+            try:
+                await service.sign_in_with_password("alice", f"wrong guess number {n}")
+            except RateLimitedError:
+                return "limited"
+            except SignInRefusedError:
+                return "checked"
+        return "signed in"
+
+    outcomes = await asyncio.gather(*(guess(n) for n in range(12)))
+    assert outcomes.count("checked") == 3, "more guesses were hashed than the budget allows"
+    assert outcomes.count("limited") == 9
+
+
+async def test_a_correct_password_costs_nothing_against_the_budget() -> None:
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    await service.user_create("alice", password=PASSWORD)
+    with acting_as(Caller(address="10.1.0.3")):
+        for _ in range(10):
+            assert (await service.sign_in_with_password("alice", PASSWORD)).token
+
+
+async def test_a_second_workspace_cannot_create_the_same_handle_and_replace_its_password() -> None:
+    backend = FakeBackend(settings=Settings(**KEYED))  # pyright: ignore[reportArgumentType]
+    first = ApplicationService(backend)
+    created = await first.user_create("alice", password=PASSWORD)
+    users = await backend.users()
+    users.workspace = "other"  # type: ignore[attr-defined]
+    with pytest.raises(NameInUseError):
+        await first.user_create("alice", password=OTHER)
+    users.workspace = backend.settings.workspace  # type: ignore[attr-defined]
+    with acting_as(Caller(address="10.1.0.4")):
+        assert (await first.sign_in_with_password("alice", PASSWORD)).user.id == created.user.id
+
+
+async def test_a_reset_that_lands_while_a_change_is_hashing_is_not_overwritten() -> None:
+    backend = FakeBackend(settings=Settings(**KEYED))  # pyright: ignore[reportArgumentType]
+    service = ApplicationService(backend)
+    created = await service.user_create("alice", password=PASSWORD)
+    users = await backend.users()
+    stale = await users.password_hash_for(created.user.id)
+    await service.user_set_password("alice", OTHER)
+    assert not await users.set_password(
+        created.user.id, "scrypt$x", expected=stale, require_expected=True
+    )
+    with acting_as(Caller(address="10.1.0.5")):
+        assert (await service.sign_in_with_password("alice", OTHER)).token

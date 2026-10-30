@@ -3009,6 +3009,13 @@ class _Users:
                     )
                 )
             ).scalar_one_or_none()
+            if user is not None and must_be_new and profile.provider == "local":
+                # A local person is one account for the whole installation, with one password.
+                # Creating "the same" handle from another workspace would reuse that account
+                # and let this workspace's administrator choose a password that signs in to
+                # the other.
+                msg = f"the handle {profile.subject!r} already belongs to a person here"
+                raise NameInUseError(msg)
             if user is None:
                 user = models.User(
                     id=secrets.token_hex(8),
@@ -3212,26 +3219,47 @@ class _Users:
                 )
             ).scalar_one_or_none()
 
-    async def set_password(self, user_id: str, password_hash: str | None) -> bool:
+    async def set_password(
+        self,
+        user_id: str,
+        password_hash: str | None,
+        *,
+        expected: str | None = None,
+        require_expected: bool = False,
+    ) -> bool:
         from sqlalchemy import update  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
         from manicule.storage.types import utcnow  # noqa: PLC0415
 
+        conditions = [models.User.id == user_id, models.User.provider == "local"]
+        if require_expected:
+            # Compare-and-swap: only if the hash is still the one the caller verified, so a
+            # change that checked the old password cannot overwrite a reset that landed while
+            # it was being hashed.
+            conditions.append(
+                models.User.password_hash == expected
+                if expected is not None
+                else models.User.password_hash.is_(None)
+            )
         sessions = session_factory(self._runtime.require_engine())
         async with sessions.begin() as session:
             result = await session.execute(
-                update(models.User)
-                .where(models.User.id == user_id, models.User.provider == "local")
-                .values(password_hash=password_hash)
+                update(models.User).where(*conditions).values(password_hash=password_hash)
             )
             if result.rowcount == 0:  # type: ignore[attr-defined]
                 return False
-            # A password changed is every browser signed in with the old one ended, in the
-            # same transaction, so there is no moment the new password is set and the old
-            # sessions live.
-            await self._revoke_sessions(session, user_id, utcnow())
+            # The password is the person's across the installation, so every browser they hold
+            # in any workspace ends, in the same transaction.
+            await session.execute(
+                update(models.AuthSession)
+                .where(
+                    models.AuthSession.user_id == user_id,
+                    models.AuthSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=utcnow())
+            )
             return True
 
     async def list_members(self) -> Sequence[UserSummary]:

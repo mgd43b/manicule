@@ -102,3 +102,57 @@ async def test_disabling_a_member_clears_their_hash_for_good(runtime: Runtime) -
     await users.update_member(member.id, disabled=False)
     assert await users.password_hash_for(member.id) is None
     assert (await users.find_members("alice"))[0].has_password is False
+
+
+async def test_setting_a_password_ends_sessions_in_every_workspace(runtime: Runtime) -> None:
+    from sqlalchemy import select, update  # noqa: PLC0415
+
+    from manicule.storage import models  # noqa: PLC0415
+    from manicule.storage.engine import session_factory  # noqa: PLC0415
+    from manicule.storage.types import utcnow  # noqa: PLC0415
+
+    users = await runtime.users()
+    member = await users.admit(
+        Profile(provider=LOCAL, subject="alice", name="alice"), role="member"
+    )
+    factory = session_factory(runtime.require_engine())
+    async with factory.begin() as session:
+        session.add(
+            models.Workspace(
+                id="other", name="other", mode="team", settings={}, created_at=utcnow()
+            )
+        )
+        await session.flush()
+        session.add(
+            models.AuthSession(
+                id="s-other",
+                token_hash="d" * 64,
+                user_id=member.id,
+                workspace_id="other",
+                created_at=utcnow(),
+                expires_at=utcnow().replace(year=2099),
+            )
+        )
+    await users.set_password(member.id, HASH)
+    async with factory() as session:
+        revoked = (
+            await session.execute(
+                select(models.AuthSession.revoked_at).where(models.AuthSession.id == "s-other")
+            )
+        ).scalar_one()
+    assert revoked is not None, "a session in another workspace survived the password change"
+    del update
+
+
+async def test_a_stale_expected_hash_does_not_write(runtime: Runtime) -> None:
+    users = await runtime.users()
+    member = await users.admit(
+        Profile(provider=LOCAL, subject="alice", name="alice"), role="member"
+    )
+    await users.set_password(member.id, HASH)
+    assert not await users.set_password(
+        member.id, "scrypt$new", expected="scrypt$old", require_expected=True
+    )
+    assert await users.password_hash_for(member.id) == HASH
+    assert await users.set_password(member.id, "scrypt$new", expected=HASH, require_expected=True)
+    assert await users.password_hash_for(member.id) == "scrypt$new"

@@ -8574,37 +8574,40 @@ class ApplicationService:
         await self._audit("user.password_set", details={"user_id": member.id})
         return r.PasswordSet(user=await self._member(member.id))
 
-    async def _password_attempt_allowed(self) -> None:
-        """Refuse before hashing anything when this address has used up its failures.
+    async def _reserve_password_attempt(self) -> None:
+        """Spend one failed-authentication token **before** a password is checked.
 
-        See :meth:`~manicule.app.throttle.RateLimiter.failed_auth_allowed` for why a password,
-        unlike a key, is refused up front.
+        Charged up front rather than after a failure, so a burst of concurrent guesses cannot
+        all pass a budget that none of them has yet spent, each then waiting its turn to be
+        hashed. A correct password is refunded (:meth:`_refund_password_attempt`). This makes a
+        password the one credential a spent address is refused for even when it is correct; see
+        :meth:`~manicule.app.throttle.RateLimiter.refund_failed_auth`.
+
+        Raises:
+            RateLimitedError: The address has no allowance left.
         """
-        gate = self.rate_limiter.failed_auth_allowed(current().address)
-        if not gate.allowed:
+        decision = self.rate_limiter.charge_failed_auth(current().address)
+        if not decision.allowed:
             msg = (
                 f"too many failed authentications from this address; retry in "
-                f"{gate.retry_after_s:.0f}s"
+                f"{decision.retry_after_s:.0f}s"
             )
-            raise RateLimitedError(msg, retry_after_s=gate.retry_after_s)
+            raise RateLimitedError(msg, retry_after_s=decision.retry_after_s)
+
+    def _refund_password_attempt(self) -> None:
+        self.rate_limiter.refund_failed_auth(current().address)
 
     async def _password_failed(self, *, provider: str) -> SignInRefusedError:
         """Account for one wrong password and return the refusal to raise.
 
-        Charged to the bucket a wrong key or header is, and counted toward the same
-        ``brute_force`` alert. The sentence is the same for an unknown handle, a person with no
-        password and a wrong password.
+        The token was already spent by :meth:`_reserve_password_attempt`; this counts the
+        failure toward the same ``brute_force`` alert a wrong key is. The sentence is the same
+        for an unknown handle, a person with no password and a wrong password.
         """
-        guessing = await self.charge_failed_authentication(current().address)
+        await self.record_security_alert(self.alert_monitor.record_failed_auth(current().address))
         await self._audit(
             "auth.login_refused", details={"provider": provider, "reason": "bad_credentials"}
         )
-        if not guessing.allowed:
-            msg = (
-                f"too many failed authentications from this address; retry in "
-                f"{guessing.retry_after_s:.0f}s"
-            )
-            raise RateLimitedError(msg, retry_after_s=guessing.retry_after_s)
         msg = "that handle and password were not accepted"
         return SignInRefusedError(msg, reason="bad_credentials")
 
@@ -8628,7 +8631,7 @@ class ApplicationService:
             SignInRefusedError: The handle and password were not accepted.
         """
         self._require_browser_sign_in()
-        await self._password_attempt_allowed()
+        await self._reserve_password_attempt()
         name = handle.strip().lower()
         users = await self._backend.users()
         found = [
@@ -8638,11 +8641,20 @@ class ApplicationService:
         ]
         member = found[0] if len(found) == 1 else None
         stored = await users.password_hash_for(member.id) if member is not None else None
-        if member is None or not await passwords.verify(password, stored):
+        # Always checked, against a decoy when there is nothing real, so no refusal is faster
+        # than another.
+        matched = await passwords.verify(password, stored)
+        if member is None or not matched:
             raise await self._password_failed(provider="password")
         session_id, expires_at, token = await users.begin_session(
             member.id, max_age_s=self.settings.security.auth.session_max_age_s
         )
+        if await users.password_hash_for(member.id) != stored:
+            # A reset landed while the password was being hashed. It ended the sessions that
+            # existed then, not this one, so this one ends here.
+            await users.end_session(token)
+            raise await self._password_failed(provider="password")
+        self._refund_password_attempt()
         await self._audit(
             "auth.login",
             details={"user_id": member.id, "provider": "password", "session_id": session_id},
@@ -8671,13 +8683,18 @@ class ApplicationService:
         if caller.user_id is None or caller.key_id is not None:
             msg = "changing a password needs a browser signed in with that password"
             raise PolicyError(msg)
-        await self._password_attempt_allowed()
+        await self._reserve_password_attempt()
         users = await self._backend.users()
         stored = await users.password_hash_for(caller.user_id)
         if not await passwords.verify(current_password, stored):
             raise await self._password_failed(provider="password")
         replacement = await self._hashed(new_password)
-        await users.set_password(caller.user_id, replacement)
+        if not await users.set_password(
+            caller.user_id, replacement, expected=stored, require_expected=True
+        ):
+            # Reset while this was hashing: what was verified is no longer the password.
+            raise await self._password_failed(provider="password")
+        self._refund_password_attempt()
         member = await self._member(caller.user_id)
         session_id, expires_at, token = await users.begin_session(
             member.id, max_age_s=self.settings.security.auth.session_max_age_s
