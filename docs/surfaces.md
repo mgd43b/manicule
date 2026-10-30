@@ -1911,8 +1911,9 @@ open to being made the other way:
 (admin; body `{handle, role, password}`, with `role` and `password` optional; the Add a person
 form on `/ui/users`) create a person with provider
 `local`, subject the lower-case handle, no email, a membership, and either a password or a first
-key named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`, A handle is unique across the installation: a person is one account with one password, so another workspace cannot create the same handle.
-`_` and `-` (at most 64, starting with a letter or digit); a duplicate is refused (409). More
+key named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`,
+`_` and `-` (at most 64, starting with a letter or digit); a duplicate is refused (409), and a handle is unique across the installation: a person is one
+account with one password, so another workspace cannot create the same one. More
 keys come from `auth create-key NAME --user HANDLE`. Given a password, a person has no key
 made for them and mints their own after signing in; given none, they have the key and no
 password until an administrator sets one. **Not built:** deleting a person
