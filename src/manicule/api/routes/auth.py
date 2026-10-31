@@ -44,7 +44,9 @@ from __future__ import annotations
 
 import hmac
 import json
-from typing import Annotated
+import math
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Annotated, cast
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Query, Request, Response
@@ -62,11 +64,22 @@ from manicule.api.cookies import (
     set_signin,
     signin_transaction,
 )
-from manicule.api.envelopes import BAD_REQUEST, FORBIDDEN, NOT_FOUND, as_response, status_for
-from manicule.api.models import KeyBody, UserBody, UserPatch
+from manicule.api.envelopes import (
+    BAD_REQUEST,
+    FORBIDDEN,
+    NOT_FOUND,
+    TOO_MANY_REQUESTS,
+    as_response,
+    status_for,
+)
+from manicule.api.models import KeyBody, UserPatch
 from manicule.api.security import AdminPrincipal, AnonymousPrincipal, ViewerPrincipal
 from manicule.app.dispatch import run_op
 from manicule.core.errors import UnknownEntityError
+
+if TYPE_CHECKING:
+    from manicule.app.results import Envelope
+    from manicule.app.service import ApplicationService
 
 router = APIRouter(tags=["auth"])
 
@@ -242,31 +255,59 @@ async def callback(
     return response
 
 
-MAX_KEY_BODY = 4096
-"""The most of a key sign-in request that is read. A key is about fifty characters."""
+MAX_SIGN_IN_BODY = 4096
+"""The most of a sign-in request that is read. A key is about fifty characters; a password is
+capped at 256 bytes; this is generous to both and bounds what a request can make the server hold."""
 
 
-async def presented_key(request: Request) -> str:
-    """The key a sign-in request carries, from a JSON body or a plain form post.
+NOT_TEXT = "\ud800"
+"""What a supplied value that is not a string becomes: a lone surrogate, which the password
+policy refuses as "not valid text", so a malformed request is told so rather than read as an
+omitted field."""
 
-    Read by hand, bounded, and never from the URL: a query string is logged, remembered and
-    sent in ``Referer``, and a key does not belong in any of them. A page's form posts it, a
-    program posts ``{"key": "..."}``, and anything else presented is no key.
+
+def _text(value: object) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else NOT_TEXT
+
+
+async def presented_fields(request: Request, *names: str) -> dict[str, str]:
+    """The named string fields a credential-carrying request holds, from JSON or a form post.
+
+    **The one parser for every request that carries a secret**, read by hand, bounded, and
+    never from the URL: a query string is logged, remembered and sent in ``Referer``. It is not
+    a pydantic model on purpose, because a failed validation answers ``422`` with the offending
+    input echoed back, and the input here is a password. A field that is missing, or a body
+    past the cap, comes back as ``""``, which every caller treats as no credential; a value that
+    is present and not a string comes back as :data:`NOT_TEXT`, which no policy accepts.
+
+    Values are exactly as sent. Nothing is stripped: a space is a character a person may have
+    chosen for a password, and the service decides what is acceptable.
     """
+    empty = dict.fromkeys(names, "")
     raw = bytearray()
     async for chunk in request.stream():
         raw.extend(chunk)
-        if len(raw) > MAX_KEY_BODY:
-            return ""
+        if len(raw) > MAX_SIGN_IN_BODY:
+            return empty
     text = bytes(raw).decode("utf-8", errors="replace")
     if "json" in request.headers.get("content-type", ""):
         try:
             loaded: object = json.loads(text)
         except ValueError:
-            return ""
-        value = loaded.get("key") if isinstance(loaded, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        return value.strip() if isinstance(value, str) else ""
-    return parse_qs(text).get("key", [""])[0].strip()
+            return empty
+        if not isinstance(loaded, dict):
+            return empty
+        fields = cast("dict[str, object]", loaded)
+        return {name: _text(fields.get(name)) for name in names}
+    form = parse_qs(text, keep_blank_values=True)
+    return {name: form.get(name, [""])[0] for name in names}
+
+
+async def presented_key(request: Request) -> str:
+    """The key a sign-in request carries. Stripped, because a pasted key often carries a newline."""
+    return (await presented_fields(request, "key"))["key"].strip()
 
 
 @router.post(
@@ -289,25 +330,94 @@ async def key_login(request: Request, service: Service, caller: AnonymousPrincip
     from manicule.web.security import sign_in_refused  # noqa: PLC0415 - avoids a cycle
 
     del caller
-    settings = service.settings
     secret = await presented_key(request)
     envelope = await run_op(
         "sign_in_with_key", service.workspace, lambda: service.sign_in_with_key(secret)
     )
+    return _session_response(request, service, envelope, refuse=sign_in_refused)
+
+
+@router.post(
+    "/auth/password",
+    name="sign_in_with_password",
+    summary="Sign a browser in with a handle and password.",
+)
+async def password_login(
+    request: Request, service: Service, caller: AnonymousPrincipal
+) -> Response:
+    """Sign a person created here in with their handle and password, and hand over the cookie.
+
+    The same shape as :func:`key_login`, answered the same way: a page gets a ``303`` to the
+    front door or a refusal page, a program gets the envelope without the session token. The
+    password is read from the body only, and an address that has failed too often is refused
+    before it is checked — see
+    :meth:`~manicule.app.service.ApplicationService.sign_in_with_password`.
+    """
+    from manicule.web.security import sign_in_refused  # noqa: PLC0415 - avoids a cycle
+
+    del caller
+    fields = await presented_fields(request, "handle", "password")
+    envelope = await run_op(
+        "sign_in_with_password",
+        service.workspace,
+        lambda: service.sign_in_with_password(fields["handle"], fields["password"]),
+    )
+    return _session_response(request, service, envelope, refuse=sign_in_refused)
+
+
+@router.post(
+    "/api/v1/auth/password",
+    name="password_change",
+    summary="Change your own password.",
+)
+async def change_password(request: Request, service: Service, caller: ViewerPrincipal) -> Response:
+    """Change the signed-in person's password, given the current one, and renew the session.
+
+    Any signed-in person, whatever their role: it is their own credential. The service refuses
+    a caller who came in with an API key, however it was presented. The response carries a new
+    session cookie, because every other browser the person held has just ended.
+    """
+    del caller
+    fields = await presented_fields(request, "current_password", "new_password")
+    envelope = await run_op(
+        "password_change",
+        service.workspace,
+        lambda: service.password_change(fields["current_password"], fields["new_password"]),
+    )
+    return _session_response(request, service, envelope, refuse=None)
+
+
+def _session_response(
+    request: Request,
+    service: ApplicationService,
+    envelope: Envelope,
+    *,
+    refuse: Callable[..., Response] | None,
+) -> Response:
+    """Turn a sign-in envelope into the response that sets the cookie, or refuses.
+
+    ``refuse`` is the page renderer for a refusal when the caller asked for HTML; ``None`` for
+    a route only ever called by a program.
+    """
     wants_page = "text/html" in request.headers.get("accept", "")
     if not envelope.ok or envelope.data is None:
         message = envelope.error.message if envelope.error else "the sign-in failed"
-        if wants_page:
-            return sign_in_refused(request, message, status=status_for(envelope))
-        return as_response(envelope)
-    token = str(envelope.data.get("token", ""))
+        refused = (
+            refuse(request, message, status=status_for(envelope))
+            if wants_page and refuse is not None
+            else as_response(envelope)
+        )
+        if refused.status_code == TOO_MANY_REQUESTS:
+            wait = service.failed_authentication_retry_after_s()
+            refused.headers["Retry-After"] = str(max(1, math.ceil(wait)))
+        return refused
     response: Response
-    if wants_page:
+    if wants_page and refuse is not None:
         response = RedirectResponse(SIGNED_IN_PAGE, status_code=SEE_OTHER)
     else:
         without_token = {key: value for key, value in envelope.data.items() if key != "token"}
         response = as_response(envelope.model_copy(update={"data": without_token}))
-    set_session(response, settings, token)
+    set_session(response, service.settings, str(envelope.data.get("token", "")))
     return response
 
 
@@ -410,21 +520,51 @@ async def list_users(service: Service, caller: AdminPrincipal) -> Response:
 @router.post(
     "/api/v1/auth/users",
     name="user_create",
-    summary="Create a person, with the first key they sign in with.",
+    summary="Create a person, with a password or with the first key they sign in with.",
 )
-async def create_user(service: Service, caller: AdminPrincipal, body: UserBody) -> Response:
-    """Return the person and the only copy of their first key's secret.
+async def create_user(request: Request, service: Service, caller: AdminPrincipal) -> Response:
+    """Return the person, and the only copy of their first key's secret when no password was given.
 
-    There is no password: the key is the credential, and further keys are minted for the person
-    with ``POST /api/v1/auth/keys`` and ``user``. Admin-only, like every route that changes who
-    the workspace's members are.
+    The body is ``{"handle": ..., "role": "member", "password": ...}``, ``role`` and
+    ``password`` optional. With a password the person signs in with it and mints their own keys;
+    without one they are given a first key. Admin-only, like every route that changes who the
+    workspace's members are. Read by hand rather than as a model, because a rejected request
+    must not echo a password back — see :func:`presented_fields`.
     """
     del caller
+    fields = await presented_fields(request, "handle", "role", "password")
+    password = fields["password"] or None
     return as_response(
         await run_op(
             "user_create",
             service.workspace,
-            lambda: service.user_create(body.handle, role=body.role),
+            lambda: service.user_create(
+                fields["handle"], role=fields["role"] or "member", password=password
+            ),
+        )
+    )
+
+
+@router.put(
+    "/api/v1/auth/users/{user}/password",
+    name="user_set_password",
+    summary="Set a person's password.",
+)
+async def set_user_password(
+    user: str, request: Request, service: Service, caller: AdminPrincipal
+) -> Response:
+    """Set a local person's password and end their browser sessions. Admin-only.
+
+    The recovery path: there is no emailed link, so an administrator chooses a new password and
+    hands it over. Body ``{"password": ...}``.
+    """
+    del caller
+    fields = await presented_fields(request, "password")
+    return as_response(
+        await run_op(
+            "user_set_password",
+            service.workspace,
+            lambda: service.user_set_password(user, fields["password"]),
         )
     )
 

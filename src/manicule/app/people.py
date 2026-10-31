@@ -57,6 +57,9 @@ cookie is the credential. Thirty-two characters is well past guessing and well w
 KEY_SIGN_IN_PATH = "/auth/key"
 """Where a browser presents an API key and receives a session for it."""
 
+PASSWORD_SIGN_IN_PATH = "/auth/password"  # noqa: S105 - a URL path, not a password
+"""Where a browser presents a handle and password and receives a session."""
+
 LOCAL = "local"
 """The ``provider`` of a person an administrator created here, not one a provider vouched for."""
 
@@ -309,6 +312,7 @@ __all__ = [
     "LOCAL",
     "LOGIN_PATH",
     "MIN_SESSION_SECRET",
+    "PASSWORD_SIGN_IN_PATH",
     "REFUSALS",
     "Profile",
     "Refusal",

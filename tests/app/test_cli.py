@@ -1202,6 +1202,7 @@ CLI_ONLY_OPS: frozenset[str] = frozenset(
         "auth_list_keys",
         "auth_revoke_key",
         "auth_set_role",
+        "auth_set_password",
         "auth_sign_out",
         "auth_users",
         "auth_alerts",
@@ -2669,6 +2670,7 @@ MINIMAL: dict[str, list[str]] = {
     "auth_enable_user": ["auth", "enable-user", "user-1"],
     "auth_revoke_key": ["auth", "revoke-key", "ci"],
     "auth_set_role": ["auth", "set-role", "user-1", "viewer"],
+    "auth_set_password": ["auth", "set-password", "user-1"],
     "auth_sign_out": ["auth", "sign-out", "user-1"],
     "auth_ack_alert": ["auth", "ack-alert", "alert-1"],
     "collection_add": ["collection", "add", "col-1", "doc-1"],
@@ -2734,6 +2736,10 @@ line itself declares as optional. Copilot found it by reading; nothing here woul
 """
 
 
+PIPED: dict[str, str] = {"auth_set_password": "a long enough passphrase\n"}
+"""What a command that reads a secret is given on standard input, never as an argument."""
+
+
 def test_every_write_command_runs_with_only_its_required_arguments(
     bound: ApplicationService,
 ) -> None:
@@ -2749,7 +2755,7 @@ def test_every_write_command_runs_with_only_its_required_arguments(
     del bound
     offenders: list[str] = []
     for op, argv in sorted(MINIMAL.items()):
-        result = run(["--json", *argv])
+        result = run(["--json", *argv], stdin=PIPED.get(op))
         if result.exit_code == 0:
             continue
         try:
@@ -2971,3 +2977,27 @@ def test_switching_workspace_records_the_mode_beside_it(
     assert "cannot be served" in rendered
     written = tomllib.loads(config.read_text(encoding="utf-8"))
     assert (written["workspace"], written["mode"]) == ("team-a", "team")
+
+
+def test_a_password_is_read_from_a_pipe_and_never_taken_as_an_argument(
+    bound: ApplicationService,
+) -> None:
+    del bound
+    refused = run(["auth", "set-password", "user-1", "--password", "hunter2hunter2"])
+    assert refused.exit_code != 0, "a password on the command line is a password in the history"
+    assert "hunter2" not in refused.output
+    empty = run(["auth", "set-password", "user-1"], stdin="")
+    assert empty.exit_code != 0
+    assert "no password was given" in empty.output
+
+
+def test_add_user_with_a_password_reads_it_from_a_pipe_and_makes_no_key(
+    bound: ApplicationService,
+) -> None:
+    del bound
+    result = run(
+        ["--json", "auth", "add-user", "alice", "--password"], stdin="a long enough passphrase\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert "a long enough passphrase" not in result.output
+    assert '"key": null' in result.output.replace('":null', '": null')

@@ -337,7 +337,8 @@ server and the built command tree.
 | `start` / `stop` | — | `start` / `stop` | the address, and whether it is loopback |
 | `completion` | — | `completion` | a shell script |
 | `auth_create_key` / `auth_list_keys` / `auth_revoke_key` | — | `auth …` (`create-key --user HANDLE` mints for a member) | API keys |
-| `auth_add_user` | — | `auth add-user` | the person and their first key, secret shown once (HTTP: `POST /api/v1/auth/users`, op `user_create`; a browser signs in at `POST /auth/key`, op `sign_in_with_key`) |
+| `auth_add_user` | — | `auth add-user HANDLE [--role] [--password]` | the person, and either the password they sign in with (`--password` prompts for it, never an argument) or their first key, secret shown once (HTTP: `POST /api/v1/auth/users`, op `user_create`; a browser signs in at `POST /auth/password`, op `sign_in_with_password`, or `POST /auth/key`, op `sign_in_with_key`) |
+| `auth_set_password` | — | `auth set-password USER` | the person, with every browser session they held ended; prompts for the password, never an argument (HTTP: `PUT /api/v1/auth/users/{user}/password`, op `user_set_password`; a person changes their own at `POST /api/v1/auth/password`, op `password_change`) |
 | `auth_users` / `auth_set_role` / `auth_disable_user` / `auth_enable_user` / `auth_sign_out` | — | `auth users`, `auth set-role`, `auth disable-user`, `auth enable-user`, `auth sign-out` | members of this workspace, and what a change took with it |
 
 ### 4.0.1 Shared lifecycle status
@@ -1579,7 +1580,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | tags | `GET`/`POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`, `POST`/`DELETE /api/v1/documents/{docId}/tags/{tagId}` |
 | admin | `GET /api/v1/admin/stats`, `/reembed/{run_id}`, `/query-logs`, `/audit-logs`, `/alerts`, `POST /api/v1/admin/alerts/{id}/acknowledge`, `/search-quality`, `/plugins`, `/connectors`, `POST /api/v1/admin/connectors/{name}/sync`, `POST /api/v1/admin/connectors/{name}/reconcile` (body `{dry_run}`), `POST /api/v1/admin/connectors/{name}/reconcile/resolve` (body `{action: confirm\|discard}`) |
 | plugins | `GET /api/v1/plugins`, `GET /api/v1/plugins/search`, `POST`/`DELETE /api/v1/plugins/{name}` |
-| auth | `GET /auth/providers`, `GET /auth/session`, `GET /auth/login/{provider}`, `GET /auth/callback/{provider}`, `POST /auth/logout`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}`, `GET /api/v1/auth/users`, `PATCH /api/v1/auth/users/{user}`, `POST /api/v1/auth/users/{user}/sign-out` |
+| auth | `GET /auth/providers`, `GET /auth/session`, `GET /auth/login/{provider}`, `GET /auth/callback/{provider}`, `POST /auth/logout`, `POST /auth/key`, `POST /auth/password`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}`, `POST /api/v1/auth/password`, `GET`/`POST /api/v1/auth/users`, `PATCH /api/v1/auth/users/{user}`, `PUT /api/v1/auth/users/{user}/password`, `POST /api/v1/auth/users/{user}/sign-out` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
 | mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create`. Authentication decides who may call that write, not whether it is carried |
@@ -1617,7 +1618,8 @@ subprotocol back.
 
 With `oauth`, keys work exactly as above, and **a person at a browser signs in** through Google
 or GitHub instead — §9.2.1. With `api_key` and a `security.auth.session_secret`, a person signs
-in by presenting one of their own keys at `POST /auth/key` (§9.2.1). Under either, a request
+in with a handle and password at `POST /auth/password`, or by presenting one of their own keys at
+`POST /auth/key` (§9.2.1). Under either, a request
 presenting no header credential is resolved from the browser's session cookie, if it carries one.
 Under `api_key` with no `session_secret`, and under `none`, no cookie is a credential. A header always wins over a cookie, valid or not,
 and the cookie is **never** honored beneath the MCP mount, which is stateless by design (§6.1):
@@ -1648,7 +1650,8 @@ unknown id would — the same non-disclosure `Keys.verify` already practices for
 with `user` mint a key owned by that member rather than by the minter; an administrator or the
 local operator may do so, and the key's role is still capped by the member's. A person is named
 by user id, address, or — for a local person (§9.2.1) — handle. A key a person owns can sign a
-browser in; an unowned key cannot, and keeps working for programs as it always has.
+browser in; an unowned key cannot, and keeps working for programs as it always has. A person with
+a password has no need of one to sign in, and mints their own keys from the browser (§9.2.1).
 
 A key additionally carries `allowed_ips` (CIDR ranges it may be presented from; empty means
 anywhere) and `rate_limit` (its own requests-per-minute ceiling, replacing
@@ -1769,7 +1772,7 @@ A session minted for one workspace authenticates in no other. It ends when:
 - the person signs out — `POST /auth/logout` revokes the row, so a copy of the cookie stops
   working at the same moment, and clears the cookie; a form post is sent on to `/ui/login`;
 - an administrator signs them out everywhere, or disables them — a disable also revokes every
-  key they minted, in the same transaction;
+  key they minted and clears their password, in the same transaction;
 - it expires, or `session_secret` changes — which signs every browser out at once, deliberately.
 
 **Cross-site requests.** Two defenses, each holding without the other: `SameSite=Strict` keeps a
@@ -1783,8 +1786,9 @@ of a workspace can read the whole workspace; roles decide what a person may *do*
 reads, `member` writes, `admin` administers people, keys and the installation — not which
 documents they may see. A corpus some people must not read belongs in another workspace.
 
-**Signing in with an API key (`api_key`).** A person who holds a key can sign a browser in
-without a provider. The shape, as it would sit in the configuration file:
+**Signing in without a provider (`api_key`).** A person can sign a browser in with a handle and
+password, or with an API key they hold, without a provider. Both need the same two settings, and
+both end in the same `manicule_session` cookie. The shape, as it would sit in the configuration file:
 
 ```toml
 [security.auth]
@@ -1792,11 +1796,11 @@ mode = "api_key"
 session_secret = "…"          # at least 32 characters; MANICULE_SECURITY__AUTH__SESSION_SECRET
 ```
 
-`POST /auth/key` takes the key in a JSON body (`{"key": "…"}`) or a form field `key`, never the
+*With an API key.* `POST /auth/key` takes the key in a JSON body (`{"key": "…"}`) or a form field `key`, never the
 URL. On success it sets the same `manicule_session` cookie, with the same attributes, as the
 OAuth callback: a browser form post is answered `303` to `/`, and a JSON caller gets the
 envelope without the token. `/ui/login` shows the form, and `GET /auth/providers` reports
-`key_login_path`. It needs `auth.mode = api_key` **and** a `session_secret` of at least 32
+`key_login_path` and `password_login_path`. Both sign-ins need `auth.mode = api_key` **and** a `session_secret` of at least 32
 characters. With no secret nothing breaks: sign-in is simply not offered, `doctor`'s `sign_in`
 check stays `ok` and says how to enable it, and the cookie is not honored.
 
@@ -1811,18 +1815,115 @@ as a wrong header key (§9.10), then answers 429. As elsewhere, the cookie is ne
 `auth.login` (provider `key`, with `key_id`) and `auth.login_refused` (provider `key`, reason
 `key_not_usable` or `key_has_no_owner`).
 
-*Local people.* `manicule auth add-user HANDLE [--role]` and `POST /api/v1/auth/users` (admin;
-body `{handle, role}`; the Add a person form on `/ui/users`) create a person with provider
-`local`, subject the lower-case handle, no email and no password, a membership, and a first key
-named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`,
-`_` and `-` (at most 64, starting with a letter or digit); a duplicate is refused (409). More
-keys come from `auth create-key NAME --user HANDLE`. **Not built:** passwords; deleting a person
-(a disable already revokes their sessions and keys, and audit rows refer to them); a generic
+**Signing in with a password.** `POST /auth/password` takes `handle` and `password` in a JSON
+body or as form fields, never the URL, and sets the same cookie with the same attributes as the
+key sign-in: a browser form post is answered `303` to `/`, and a JSON caller gets the envelope
+without the token. `/ui/login` shows the form beside the one for a key. The session it starts
+has no `key_id`, like an OAuth session, so the person has the full role their membership gives
+them and is not bound to any key. A person may have a password, keys, or both; the two are
+independent, and neither is needed for the other.
+
+*Only a local person has a password here.* A person an identity provider vouches for signs in
+through that provider, which holds their password; there is none for manicule to keep. A
+password cannot be cleared on its own once set. Disabling the person clears it, in the same
+transaction that revokes their sessions and keys, so enabling them again restores the membership
+and not the password: an administrator sets a new one.
+
+*The policy.* At least 12 characters and at most 256 bytes, and not only whitespace. The
+password is normalized to Unicode NFKC, on set and on check alike, so one typed on the command
+line and one typed into a browser compare equal whichever composed or decomposed form either
+sent. Nothing is stripped: a space is a character a person may have chosen. There are no
+composition rules; length is the property that predicts how long guessing takes.
+
+*How it is stored.* Through scrypt (`hashlib.scrypt`, `n = 2^16`, `r = 8`, `p = 1`, a random
+16-byte salt), so a copy of the database costs an attacker real memory and time for every guess,
+and manicule takes on no dependency to do it. The stored string is
+`scrypt$n$r$p$salt$hash`, and it names its own cost: a check reads `n`, `r` and `p` from the
+string rather than from today's constants, so the cost can be raised later without locking
+anyone out. Hashing runs off the event loop, behind a semaphore of two, because each attempt in
+flight holds tens of megabytes. The hash lives in `users.password_hash` (`docs/storage.md`
+§4.8) and is in no result: a person is reported with `has_password`, whether and nothing more.
+
+*Where a password may travel.* In a request body, and nowhere else. One hand-written parser
+reads every body that carries a secret (`presented_fields`), bounded at 4096 bytes, because a
+pydantic model would answer a rejected request with `422` and echo the input back, and the input
+is a password. It is not a query parameter, so it is in no access log. It is not a parameter of
+any MCP tool, and it is not a command-line argument: `auth add-user --password` and
+`auth set-password USER` prompt without echo (once to enter, once to confirm), or read one line
+from a pipe.
+
+*One refusal.* An unknown handle, a person an identity provider vouches for, a person with no
+password, a disabled person and a wrong password are refused with one sentence, status `403` and
+reason `bad_credentials`. The work is the same for each: when there is no hash to check, the
+password is checked against a decoy hash of the same cost, so neither the words nor the time say
+which it was. A failure is charged to the same per-address failed-authentication bucket as a
+wrong key, and counts toward the same `brute_force` alert (§9.10, §9.11). The audit trail
+records `auth.login` (provider `password`, with `session_id`) and `auth.login_refused`
+(provider `password`, reason `bad_credentials`; never the handle that was tried, which may belong
+to nobody).
+
+*An address that has failed too often is refused before the password is checked.* This is a
+deliberate difference from a key. A key is 256 random bits, so refusing a correct one buys no
+protection and costs a shared address its access; a password is chosen by a person and can be
+guessed, so an address that has spent its allowance of failures would otherwise keep guessing at
+the speed the hash allows, with every correct guess still succeeding. The sign-in is refused
+with `429` and `Retry-After` until the bucket refills, whatever was typed. The token is spent
+*before* the password is hashed and given back when it was right, so a burst of concurrent guesses
+cannot all pass a budget none of them has yet spent. The cost is that
+people behind one address share a budget for typing passwords wrongly. Keys are unaffected (§9.10).
+There is no lockout of the person. It would let anyone who knows a handle lock that person out,
+so the only thing counted is the address. The risk that remains is guessing spread across many
+addresses, which is bounded only by the cost of scrypt and by the buckets being per process.
+
+*Your own password.* Any signed-in person, whatever their role, creates, lists and revokes only
+their own keys (the rules of §9.2) and changes only their own password. `POST /api/v1/auth/password`
+takes `current_password` and `new_password`. It needs the current password, so a browser left
+open or a stolen cookie cannot set a new one, and it must come from a browser session that a
+password could have started: not a presented API key, because a leaked key must not be able to
+take the account over, and not a session that a key started. A wrong current password is charged
+and refused exactly as a wrong sign-in is. On success every other session the person holds ends,
+and the response carries a fresh `manicule_session` cookie in place of the one in use. The audit
+trail records `user.password_changed`.
+
+*Recovery.* Manicule sends no mail, so there is no reset link. A forgotten password is replaced
+by an administrator: `manicule auth set-password USER`, `PUT /api/v1/auth/users/{user}/password`
+(body `{"password": "…"}`), or Set password on `/ui/users`. That ends every session the person
+holds, in every workspace (the password is the person's across the installation), and leaves their
+keys alone, and the audit trail records `user.password_set`. The
+administrator hands the new password over and the person changes it. Nothing forces them to.
+
+**Decisions that need review.** Each is a choice made so the feature could ship, and each is
+open to being made the other way:
+
+1. *No forced change after an administrator sets a password.* The person is expected to change
+   it, and nothing enforces that.
+2. *No emailed reset.* Manicule sends no mail, so recovery is always an administrator.
+3. *No per-person lockout.* The address is rate-limited instead, for the reason given above.
+4. *No password for identity-provider people.* Their provider holds it.
+5. *Passwords cannot be cleared on their own.* Disable the person instead, which clears the
+   password along with their sessions and keys. Enabling them again restores the membership and
+   not the password, so an administrator must set a new one before they can sign in with one.
+6. *Existing hashes are not re-hashed on sign-in when the cost is raised.* Re-hashing would end
+   the person's other sessions, so a hash keeps the cost it was made with until the password is
+   next set.
+
+*Local people.* `manicule auth add-user HANDLE [--role] [--password]` and `POST /api/v1/auth/users`
+(admin; body `{handle, role, password}`, with `role` and `password` optional; the Add a person
+form on `/ui/users`) create a person with provider
+`local`, subject the lower-case handle, no email, a membership, and either a password or a first
+key named `<handle>-key` whose secret is shown once. A handle is lower-case letters, digits, `.`,
+`_` and `-` (at most 64, starting with a letter or digit); a duplicate is refused (409), and a handle is unique across the installation: a person is one
+account with one password, so another workspace cannot create the same one. More
+keys come from `auth create-key NAME --user HANDLE`. Given a password, a person has no key
+made for them and mints their own after signing in; given none, they have the key and no
+password until an administrator sets one. **Not built:** deleting a person
+(a disable already revokes their sessions and keys and clears their password, and audit rows refer to them); a generic
 OIDC provider. Existing unowned operator keys are untouched; to give one a browser identity,
 mint a personal key with `auth create-key NAME --user HANDLE` and revoke the old one.
 
-**The first administrator.** Under `api_key`: `manicule auth add-user NAME --role admin`, which
-runs as the operator at the machine, and hand over the key it prints. Under `oauth`, either give one provider `role = "admin"` with an allowlist that
+**The first administrator.** Under `api_key`: `manicule auth add-user NAME --role admin
+--password`, which runs as the operator at the machine and prompts for the password they will
+sign in with; or without `--password`, hand over the key it prints. Under `oauth`, either give one provider `role = "admin"` with an allowlist that
 names only that person, sign in, and then narrow the provider back to `member`; or let people
 sign in as members and promote one from the command line, which runs as the operator at the
 machine: `manicule auth set-role <user-id-or-address> admin`. A workspace that has an enabled
@@ -1837,10 +1938,21 @@ provider that applies to the served workspace, two applicable providers of one t
 non-loopback host while `enforce_https` is on, and a provider that admits nobody. None of these
 is a `policy_problems` entry: none of them stops a command that serves nothing.
 
-**People over HTTP**, all admin: `POST /api/v1/auth/users` creates a local person and their first
-key (`user_create`); `GET /api/v1/auth/users` lists members with their role,
-standing and live session count; `PATCH /api/v1/auth/users/{user}` takes `role` and/or
-`disabled`; `POST /api/v1/auth/users/{user}/sign-out` ends every session the member holds.
+Under `api_key`, `doctor`'s `sign_in` check is `ok` either way and reports the facts
+`key_sign_in` and `password_sign_in`, which are both true under one condition: `auth.mode =
+api_key` and a `session_secret` of at least 32 characters. Neither is offered without it, and the
+check's detail says which setting is missing.
+
+**People over HTTP**, all admin except the first two: `POST /auth/password` signs a browser in
+(`sign_in_with_password`, no credential needed, §9.2.1) and `POST /api/v1/auth/password` changes
+the caller's own password (`password_change`, viewer floor, any signed-in person).
+`POST /api/v1/auth/users` creates a local person (`user_create`; body `handle`, optional `role`
+and `password`) and, when no password is given, their first key, secret shown once;
+`GET /api/v1/auth/users` lists members with their role, standing, whether they have a password (`has_password`) and live session count;
+`PATCH /api/v1/auth/users/{user}` takes `role` and/or `disabled`;
+`PUT /api/v1/auth/users/{user}/password` sets a local person's password and ends their sessions
+(`user_set_password`); `POST /api/v1/auth/users/{user}/sign-out` ends every session the member
+holds.
 `{user}` is a user id, a handle (local people), or an address that names exactly one member of
 this workspace — two accounts at two providers can share one, and then the id is required.
 
@@ -2079,14 +2191,22 @@ network surface — HTTP, the MCP mount, and the websocket handshake. Two bucket
   full from disuse.
 - **A failed-authentication bucket per address**, refilled at `failed_auth_per_minute` — its own
   rate is also its capacity, for the same reason. It is charged by a header credential that did
-  not work, and by a wrong key posted to `POST /auth/key` (never by a request with no credential, never by one that succeeded, never by a stale
+  not work, by a wrong key posted to `POST /auth/key`, and by a wrong password posted to
+  `POST /auth/password` or `POST /api/v1/auth/password` (never by a request with no credential, never by one that succeeded, never by a stale
   session cookie, and never under `auth.mode = 'none'`, where nothing is checked), and once it is
-  spent such requests are refused with 429. **A working credential from the same address is never
-  refused by it.** Behind a proxy nobody configured as trusted, or one office's NAT, every caller
+  spent such requests are refused with 429. **A working key or session from the same address is
+  never refused by it.** Behind a proxy nobody configured as trusted, or one office's NAT, every caller
   shares an address, and a bucket that refused correct keys would let one client with a stale key
   lock every member out — for nothing, since a key is 256 bits and a session cookie is signed.
   What it bounds is how fast an address may keep guessing; a failure past the budget is not
   audited as `auth.failed`, so a guesser at full speed does not write the trail at full speed.
+  **A password is the one credential this reverses for.** A key is 256 random bits and a password
+  is chosen by a person, so guessing one is possible and a correct guess must not be free. A
+  sign-in by password is therefore charged up front and refunded when the password is right, and
+  refused with 429 and `Retry-After` while the address has spent its allowance, before the
+  password is checked at all. The price is that people behind one shared address also share the budget for typing
+  passwords wrongly; a key from that address still works. There is no lockout of the person,
+  because that would let anyone who knows a handle lock that person out (§9.2.1).
 
 `identify` runs both checks ahead of routing, so a request bound for the MCP mount is metered by
 the identical bucket an ordinary route would spend — the mount's own guard does not charge a
@@ -2113,7 +2233,7 @@ every method then reports every request admitted.
 
 | Kind | Trigger | Subject |
 |---|---|---|
-| `brute_force` | `failed_auth_threshold` failed authentications from one address | the address |
+| `brute_force` | `failed_auth_threshold` failed authentications from one address, wrong passwords at `POST /auth/password` and `POST /api/v1/auth/password` included | the address |
 | `key_abuse` | `key_address_threshold` distinct addresses presenting one key, **or** `failed_auth_threshold` rate-limit refusals of one key | the key id |
 | `export_volume` | `export_document_threshold` distinct documents whose content one caller reads | the actor |
 

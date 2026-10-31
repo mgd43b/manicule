@@ -43,6 +43,7 @@ import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
+from manicule.app import passwords
 from manicule.app import results as r
 from manicule.app.alerts import AlertMonitor
 from manicule.app.bind import is_loopback
@@ -54,6 +55,7 @@ from manicule.app.people import (
     LOCAL,
     LOGIN_PATH,
     MIN_SESSION_SECRET,
+    PASSWORD_SIGN_IN_PATH,
     REFUSALS,
     Profile,
     Refusal,
@@ -4266,16 +4268,18 @@ class ApplicationService:
         if mode is AuthMode.API_KEY:
             enabled = key_sign_in_enabled(self.settings)
             facts["key_sign_in"] = enabled
+            facts["password_sign_in"] = enabled
             return r.Check(
                 name="sign_in",
                 state="ok",
                 detail=(
-                    "a browser signs in by presenting one of a person's API keys"
+                    "a browser signs in with a handle and password, or by presenting one of a "
+                    "person's API keys"
                     if enabled
                     else f"security.auth.mode is 'api_key'; no browser sign-in is offered. Set "
                     f"security.auth.session_secret (at least {MIN_SESSION_SECRET} characters, "
                     f"via MANICULE_SECURITY__AUTH__SESSION_SECRET) to let people sign in "
-                    f"with their keys"
+                    f"with a password or a key"
                 ),
                 facts=facts,
             )
@@ -8101,6 +8105,15 @@ class ApplicationService:
         await self.record_security_alert(self.alert_monitor.record_failed_auth(address))
         return decision
 
+    def failed_authentication_retry_after_s(self) -> float:
+        """Seconds until the calling address could afford another failed authentication.
+
+        For the ``Retry-After`` of a sign-in the service refused as rate limited: the envelope
+        carries the sentence, not the number, and a body-borne credential has no middleware
+        around it to add the header.
+        """
+        return self.rate_limiter.failed_auth_allowed(current().address).retry_after_s
+
     async def record_failed_authentication(self, *, credential_kind: str) -> None:
         """Audit a presented credential that did not authenticate.
 
@@ -8124,9 +8137,12 @@ class ApplicationService:
                     mode=auth.mode.value,
                     count=0,
                     key_login_path=KEY_SIGN_IN_PATH,
+                    password_login_path=PASSWORD_SIGN_IN_PATH,
                     detail=(
-                        "a browser signs in by presenting one of a person's API keys at "
-                        f"POST {KEY_SIGN_IN_PATH}; a program presents the key in a header."
+                        "a browser signs in with a handle and password at "
+                        f"POST {PASSWORD_SIGN_IN_PATH}, or by presenting one of a person's API "
+                        f"keys at POST {KEY_SIGN_IN_PATH}; a program presents the key in a "
+                        "header."
                     ),
                 )
             return r.AuthProviders(
@@ -8226,6 +8242,21 @@ class ApplicationService:
         )
         return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
 
+    def _require_browser_sign_in(self) -> None:
+        """Refuse a handle-and-password or key sign-in where no browser could be handed a cookie.
+
+        Raises:
+            UnknownEntityError: The mode is not ``api_key``, or no ``session_secret`` exists.
+        """
+        if not key_sign_in_enabled(self.settings):
+            msg = (
+                "signing in to a browser with a password or an API key is not available here. "
+                "It needs security.auth.mode = 'api_key' and security.auth.session_secret set "
+                f"to at least {MIN_SESSION_SECRET} characters; run `manicule doctor` to see "
+                "which."
+            )
+            raise UnknownEntityError(msg)
+
     async def sign_in_with_key(self, secret: str) -> r.SignedIn:
         """Exchange an API key a person owns for a browser session.
 
@@ -8246,13 +8277,7 @@ class ApplicationService:
                 ``api_key``, or no ``session_secret`` exists to sign the cookie.
             SignInRefusedError: The key is not usable, or is not a person's.
         """
-        if not key_sign_in_enabled(self.settings):
-            msg = (
-                "signing in to a browser with an API key is not available here. It needs "
-                "security.auth.mode = 'api_key' and security.auth.session_secret set to at "
-                f"least {MIN_SESSION_SECRET} characters; run `manicule doctor` to see which."
-            )
-            raise UnknownEntityError(msg)
+        self._require_browser_sign_in()
         identity = await self.authenticate(secret, address=current().address)
         if not identity.authenticated:
             # A wrong key here is a guess, exactly as a wrong header is, and is charged to the
@@ -8455,22 +8480,25 @@ class ApplicationService:
             keys_revoked=change.keys_revoked,
         )
 
-    async def user_create(self, handle: str, *, role: str = "member") -> r.UserCreated:
-        """Create a person in this workspace, and mint the first key they will sign in with.
+    async def user_create(
+        self, handle: str, *, role: str = "member", password: str | None = None
+    ) -> r.UserCreated:
+        """Create a person in this workspace, with a password or with the first key they use.
 
-        One step, because a person with no key can do nothing and a key with no person cannot
-        sign a browser in. The secret is returned once, here, for the administrator to hand over.
         The handle is folded to lower case and is how the person is named from then on, at the
-        command line and in ``PATCH /api/v1/auth/users/{user}``, in place of an address.
+        command line and in ``PATCH /api/v1/auth/users/{user}``, in place of an address, and is
+        what they type to sign in. Creating a handle an identity provider cannot collide with is
+        what the ``local`` provider is for.
 
-        There is no password. A person holds API keys and presents one to sign a browser in;
-        further keys are minted with :meth:`api_key_create`, and a lost one is revoked and
-        replaced. Creating a handle an identity provider cannot collide with is what the
-        ``local`` provider is for.
+        **With a ``password``** the person signs in with it and mints their own keys from the
+        browser; no key is made for them. **Without one** a first key is minted and returned
+        once, for the administrator to hand over, because a person with neither can do nothing.
+        Either way a password can be set later with :meth:`user_set_password`.
 
         Raises:
             ConfigError: The handle is empty or not made of lower-case letters, digits, ``.``,
-                ``_`` and ``-``, or the role is not one manicule has.
+                ``_`` and ``-``, the role is not one manicule has, or the password is not
+                acceptable. Nothing is created in any of those cases.
             NameInUseError: A person with this handle is already a member here.
         """
         name = handle.strip().lower()
@@ -8481,6 +8509,7 @@ class ApplicationService:
             )
             raise ConfigError(msg)
         chosen = _role(role)
+        stored = await self._hashed(password) if password is not None else None
         users = await self._backend.users()
         if await users.member_by_subject(LOCAL, name) is not None:
             msg = f"{name!r} is already a member of workspace {self.workspace!r}"
@@ -8490,10 +8519,198 @@ class ApplicationService:
         )
         self._require_member_here(member)
         await self._audit(
-            "user.created", details={"user_id": member.id, "provider": LOCAL, "role": member.role}
+            "user.created",
+            details={
+                "user_id": member.id,
+                "provider": LOCAL,
+                "role": member.role,
+                "password": stored is not None,
+            },
         )
+        if stored is not None:
+            await users.set_password(member.id, stored)
+            return r.UserCreated(user=await self._member(member.id))
         issued = await self.api_key_create(f"{name}-key", role=member.role, user=member.id)
         return r.UserCreated(user=member, key=issued.key, secret=issued.secret)
+
+    async def _hashed(self, password: str) -> str:
+        """The stored form of an acceptable password.
+
+        Raises:
+            ConfigError: The password is too short, too long, or only whitespace.
+        """
+        problem = passwords.refusal(password)
+        if problem is not None:
+            raise ConfigError(problem.message)
+        return await passwords.hash_password(password)
+
+    async def user_set_password(self, user: str, password: str) -> r.PasswordSet:
+        """Set a local person's password, as an administrator.
+
+        For a person who has none, or who has forgotten theirs: there is no emailed reset link,
+        because manicule sends no mail, so recovery is an administrator choosing a new one and
+        handing it over. Every browser the person was signed in with ends, so whoever held the
+        old password is out. Their API keys are untouched.
+
+        **No one is made to change it.** The person is told to, and :meth:`password_change` is
+        theirs to use; nothing enforces it. See the decision recorded in ``docs/surfaces.md``.
+
+        Raises:
+            UnknownEntityError: ``user`` names nobody here.
+            PolicyError: ``user`` is a person an identity provider vouches for. They have no
+                password here; their provider has theirs.
+            ConfigError: The password is not acceptable.
+        """
+        member = await self._member(user)
+        if member.provider != LOCAL:
+            msg = (
+                f"{member.id} signs in through {member.provider}, which holds their password; "
+                "only a person created here has one to set"
+            )
+            raise PolicyError(msg)
+        stored = await self._hashed(password)
+        users = await self._backend.users()
+        await users.set_password(member.id, stored)
+        await self._audit("user.password_set", details={"user_id": member.id})
+        return r.PasswordSet(user=await self._member(member.id))
+
+    async def _reserve_password_attempt(self) -> None:
+        """Spend one failed-authentication token **before** a password is checked.
+
+        Charged up front rather than after a failure, so a burst of concurrent guesses cannot
+        all pass a budget that none of them has yet spent, each then waiting its turn to be
+        hashed. A correct password is refunded (:meth:`_refund_password_attempt`). This makes a
+        password the one credential a spent address is refused for even when it is correct; see
+        :meth:`~manicule.app.throttle.RateLimiter.refund_failed_auth`.
+
+        Raises:
+            RateLimitedError: The address has no allowance left.
+        """
+        decision = self.rate_limiter.charge_failed_auth(current().address)
+        if not decision.allowed:
+            msg = (
+                f"too many failed authentications from this address; retry in "
+                f"{decision.retry_after_s:.0f}s"
+            )
+            raise RateLimitedError(msg, retry_after_s=decision.retry_after_s)
+
+    def _refund_password_attempt(self) -> None:
+        self.rate_limiter.refund_failed_auth(current().address)
+
+    async def _password_failed(self, *, provider: str) -> SignInRefusedError:
+        """Account for one wrong password and return the refusal to raise.
+
+        The token was already spent by :meth:`_reserve_password_attempt`; this counts the
+        failure toward the same ``brute_force`` alert a wrong key is. The sentence is the same
+        for an unknown handle, a person with no password and a wrong password.
+        """
+        await self.record_security_alert(self.alert_monitor.record_failed_auth(current().address))
+        await self._audit(
+            "auth.login_refused", details={"provider": provider, "reason": "bad_credentials"}
+        )
+        msg = "that handle and password were not accepted"
+        return SignInRefusedError(msg, reason="bad_credentials")
+
+    async def sign_in_with_password(self, handle: str, password: str) -> r.SignedIn:
+        """Sign a person created here in, with their handle and password.
+
+        **One refusal for every way this fails** — no such handle, an identity-provider person,
+        no password set, a disabled membership, a wrong password — and the same work for each:
+        the hash is checked against a decoy when there is nothing to check against, so neither
+        the words nor the time say which it was.
+
+        An address that has used up its failed-authentication allowance is refused *before* the
+        password is checked, which makes this the one credential a correct answer can be turned
+        away for. See :meth:`~manicule.app.throttle.RateLimiter.failed_auth_allowed`. There is
+        no per-person lockout: it would let anyone who knows a handle lock that person out.
+
+        Raises:
+            UnknownEntityError: Browser sign-in is not available here (see
+                :func:`~manicule.app.people.key_sign_in_enabled`).
+            RateLimitedError: This address has too many recent failures.
+            SignInRefusedError: The handle and password were not accepted.
+        """
+        self._require_browser_sign_in()
+        await self._reserve_password_attempt()
+        name = handle.strip().lower()
+        users = await self._backend.users()
+        found = [
+            member
+            for member in await users.find_members(name)
+            if member.provider == LOCAL and member.name == name and not member.disabled
+        ]
+        member = found[0] if len(found) == 1 else None
+        stored = await users.password_hash_for(member.id) if member is not None else None
+        # Always checked, against a decoy when there is nothing real, so no refusal is faster
+        # than another.
+        matched = await passwords.verify(password, stored)
+        if member is None or not matched:
+            raise await self._password_failed(provider="password")
+        session_id, expires_at, token = await users.begin_session(
+            member.id, max_age_s=self.settings.security.auth.session_max_age_s
+        )
+        if await users.password_hash_for(member.id) != stored:
+            # A reset landed while the password was being hashed. It ended the sessions that
+            # existed then, not this one, so this one ends here.
+            await users.end_session(token)
+            raise await self._password_failed(provider="password")
+        self._refund_password_attempt()
+        await self._audit(
+            "auth.login",
+            details={"user_id": member.id, "provider": "password", "session_id": session_id},
+            actor=member.id,
+        )
+        return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
+
+    async def password_change(self, current_password: str, new_password: str) -> r.SignedIn:
+        """Change the signed-in caller's own password, and start them a fresh session.
+
+        **Needs the current password**, so a left-open browser or a stolen cookie cannot set a
+        new one, and it needs a session that a password could have started: not a presented
+        API key (a key is for programs, and one leaked must not be able to take the account
+        over), and not a session a key started. Every other browser the person holds ends, and
+        the caller gets a new session in their place, which the surface sets as the cookie.
+
+        A wrong current password is charged exactly as a wrong sign-in is.
+
+        Raises:
+            PolicyError: The caller is not a signed-in person, or came in with a key.
+            RateLimitedError: This address has too many recent failures.
+            SignInRefusedError: The current password was not accepted.
+            ConfigError: The new password is not acceptable.
+        """
+        caller = current()
+        if caller.user_id is None or caller.key_id is not None:
+            msg = "changing a password needs a browser signed in with that password"
+            raise PolicyError(msg)
+        await self._reserve_password_attempt()
+        users = await self._backend.users()
+        stored = await users.password_hash_for(caller.user_id)
+        if not await passwords.verify(current_password, stored):
+            raise await self._password_failed(provider="password")
+        try:
+            replacement = await self._hashed(new_password)
+        except ConfigError:
+            # The current password was right: an unacceptable new one is not a failed sign-in.
+            self._refund_password_attempt()
+            raise
+        if not await users.set_password(
+            caller.user_id, replacement, expected=stored, require_expected=True
+        ):
+            # Reset while this was hashing: what was verified is no longer the password.
+            raise await self._password_failed(provider="password")
+        member = await self._member(caller.user_id)
+        session_id, expires_at, token = await users.begin_session(
+            member.id, max_age_s=self.settings.security.auth.session_max_age_s
+        )
+        if await users.password_hash_for(member.id) != replacement:
+            # A reset landed between the write and this session: it ended the sessions that
+            # existed then, not this one, so this one ends here.
+            await users.end_session(token)
+            raise await self._password_failed(provider="password")
+        self._refund_password_attempt()
+        await self._audit("user.password_changed", details={"user_id": member.id}, actor=member.id)
+        return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
 
     async def user_set_role(self, user: str, role: str) -> r.UserUpdated:
         """Change one member's role. See :meth:`user_update` for the rules it is held to."""

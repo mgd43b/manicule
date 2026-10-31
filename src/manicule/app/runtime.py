@@ -3009,6 +3009,13 @@ class _Users:
                     )
                 )
             ).scalar_one_or_none()
+            if user is not None and must_be_new and profile.provider == "local":
+                # A local person is one account for the whole installation, with one password.
+                # Creating "the same" handle from another workspace would reuse that account
+                # and let this workspace's administrator choose a password that signs in to
+                # the other.
+                msg = f"the handle {profile.subject!r} already belongs to a person here"
+                raise NameInUseError(msg)
             if user is None:
                 user = models.User(
                     id=secrets.token_hex(8),
@@ -3191,6 +3198,70 @@ class _Users:
         async with sessions.begin() as session:
             return await self._revoke_sessions(session, user_id, utcnow())
 
+    async def password_hash_for(self, user_id: str) -> str | None:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions() as session:
+            return (
+                await session.execute(
+                    select(models.User.password_hash)
+                    .join(models.WorkspaceMember, models.WorkspaceMember.user_id == models.User.id)
+                    .where(
+                        models.User.id == user_id,
+                        models.User.provider == "local",
+                        models.WorkspaceMember.workspace_id == self._runtime.workspace,
+                        models.WorkspaceMember.disabled_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+
+    async def set_password(
+        self,
+        user_id: str,
+        password_hash: str | None,
+        *,
+        expected: str | None = None,
+        require_expected: bool = False,
+    ) -> bool:
+        from sqlalchemy import update  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        conditions = [models.User.id == user_id, models.User.provider == "local"]
+        if require_expected:
+            # Compare-and-swap: only if the hash is still the one the caller verified, so a
+            # change that checked the old password cannot overwrite a reset that landed while
+            # it was being hashed.
+            conditions.append(
+                models.User.password_hash == expected
+                if expected is not None
+                else models.User.password_hash.is_(None)
+            )
+        sessions = session_factory(self._runtime.require_engine())
+        async with sessions.begin() as session:
+            result = await session.execute(
+                update(models.User).where(*conditions).values(password_hash=password_hash)
+            )
+            if result.rowcount == 0:  # type: ignore[attr-defined]
+                return False
+            # The password is the person's across the installation, so every browser they hold
+            # in any workspace ends, in the same transaction.
+            await session.execute(
+                update(models.AuthSession)
+                .where(
+                    models.AuthSession.user_id == user_id,
+                    models.AuthSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=utcnow())
+            )
+            return True
+
     async def list_members(self) -> Sequence[UserSummary]:
         from sqlalchemy import select  # noqa: PLC0415
 
@@ -3337,6 +3408,14 @@ class _Users:
                     ),
                 )
                 keys_revoked = int(revoked_keys.rowcount or 0)
+                # A password is a credential, so it goes with the keys: enabling a person
+                # restores their membership and not what they may have lost control of, and an
+                # administrator sets a new one when they come back.
+                await session.execute(
+                    update(models.User)
+                    .where(models.User.id == user_id, models.User.provider == "local")
+                    .values(password_hash=None)
+                )
             elif previously_disabled and not new_disabled:
                 membership.disabled_at = None
             await session.flush()
@@ -4535,6 +4614,7 @@ def _user_summary(user: object, membership: object, *, sessions: int | None = No
         disabled=getattr(membership, "disabled_at", None) is not None,
         created_at=_isoformat(getattr(membership, "created_at", None)),
         last_login_at=_isoformat(getattr(user, "last_login_at", None)),
+        has_password=getattr(user, "password_hash", None) is not None,
         sessions=sessions,
     )
 

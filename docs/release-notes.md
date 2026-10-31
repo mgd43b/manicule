@@ -2,11 +2,62 @@
 
 ## Unreleased
 
+### Passwords for local people: a browser signs in with a handle and password
+
+Under `security.auth.mode = "api_key"` with a `security.auth.session_secret`, a person created
+here can now sign in with a handle and password at `POST /auth/password`, and `/ui/login` shows
+that form beside the key form. The session is bound to no key, so the person has the full role
+their membership gives them. A person may have a password, keys, or both.
+
+- **Create with a password.** `manicule auth add-user HANDLE --password` prompts for it (no echo;
+  or reads one line from a pipe), `POST /api/v1/auth/users` takes an optional `password`, and so
+  does the Add a person form. With a password the person gets no first key and mints their own
+  after signing in.
+- **Change your own.** Any signed-in person, whatever their role, can change their own password
+  from the **Your password** panel on the API keys page or `POST /api/v1/auth/password`. It needs
+  the current password, and it must come from a browser a password started, not a presented key and
+  not a key session. It ends every other session and issues a fresh cookie.
+- **Recovery.** Manicule sends no mail, so an administrator sets a new password:
+  `manicule auth set-password USER`, `PUT /api/v1/auth/users/{user}/password`, or Set password on
+  `/ui/users`. That ends the person's sessions and leaves their keys alone.
+- **Policy.** At least 12 characters, at most 256 bytes, not only whitespace. Normalized to NFKC;
+  nothing is stripped. Stored through scrypt (`hashlib`, no new dependency) as a string that names
+  its own cost.
+- **Failures.** An unknown handle, a person an identity provider vouches for, a person with no
+  password, a disabled person and a wrong password all get one refusal (`403`, reason
+  `bad_credentials`) and cost the same work. Failures are charged to the same per-address bucket,
+  and counted toward the same `brute_force` alert, as a wrong key.
+- **A deliberate difference from keys.** An address that has used up its failed-authentication
+  allowance is refused for passwords *before* the password is checked (`429` with `Retry-After`),
+  because a password a person chose can be guessed. People behind one shared address share that
+  budget for mistyped passwords; keys are unaffected. There is no per-person lockout, since it
+  would let anyone who knows a handle lock that person out. Guessing spread across many addresses
+  is bounded only by the cost of scrypt and by the buckets being per process.
+- **Where a password goes.** Only in a request body, read by a bounded hand-written parser, so a
+  rejected request never echoes it. Never in a URL, an MCP tool parameter or a command-line
+  argument, and the hash is in no result (a person is reported with `has_password`).
+
+Upgrading runs one migration (`d2f5b8e31a64`), which adds a nullable `users.password_hash`.
+Existing people have no password until one is set. See `surfaces.md` §9.2.1.
+
+**Decisions that need review:**
+
+1. No forced change after an administrator sets a password; the person is expected to change it
+   and nothing enforces it.
+2. No emailed reset, because manicule sends no mail.
+3. No per-person lockout, for the reason above.
+4. No password for identity-provider people.
+5. Passwords cannot be cleared on their own. Disabling a person clears their password along with
+   their sessions and keys, in one transaction, so enabling them again restores the membership
+   and not the password; an administrator sets a new one.
+6. Existing hashes are not re-hashed on sign-in when the cost is raised, because re-hashing would
+   end the person's other sessions.
+
 ### People without an identity provider: local users, and a browser signs in with a key
 
 Under `security.auth.mode = "api_key"` an administrator can now create a person:
 `manicule auth add-user HANDLE [--role admin|member|viewer]`, `POST /api/v1/auth/users`, or the
-**Add a person** form on `/ui/users`. The person has no password and no email; they get a first
+**Add a person** form on `/ui/users`. The person has no email; they get a first
 key named `<handle>-key`, shown once. `manicule auth create-key NAME --user HANDLE` (and `user` on
 `POST /api/v1/auth/keys`) mints more.
 

@@ -462,8 +462,9 @@ dashboard; chat with streaming citations, confidence and feedback; documents, th
 trash and restore; collections and tags; connectors; plugins; workspaces; health; an admin
 dashboard; re-embedding and lifecycle plans; the people who are members of the workspace; API
 keys; and settings. Where people sign in (`security.auth.mode = "oauth"`, or `"api_key"` with a
-`security.auth.session_secret`), `/ui/login` offers Google and GitHub, or a form for a person's
-own API key (`manicule auth add-user` creates one), and the frame carries a sign-out; `docs/surfaces.md` §9.2.1 is how that works.
+`security.auth.session_secret`), `/ui/login` offers Google and GitHub, or a handle and password form and a form for a person's
+own API key (`manicule auth add-user` creates the person, with a password or a first key), and the
+frame carries a sign-out; `docs/surfaces.md` §9.2.1 is how that works.
 Command palette on `Ctrl`/`Cmd`+`K`, keyboard navigation, dark mode. `manicule start --no-web`
 prints `browser surface    off (--no-web)`, keeps the API, and answers 404 for every `/ui` path
 — and `/` lists the surfaces that are still there rather than redirecting to one that is not.

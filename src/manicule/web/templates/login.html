@@ -39,18 +39,36 @@
     </p>
     <p><a href="/ui">Go to the dashboard</a></p>
   </div>
-  {% elif listed.key_login_path %}
+  {% elif listed.key_login_path or listed.password_login_path %}
+  {% if listed.password_login_path %}
+  <div class="panel">
+    <form method="post" action="{{ listed.password_login_path }}">
+      <label for="sign-in-handle">Handle</label>
+      <input id="sign-in-handle" name="handle" type="text" required autocomplete="username" autocapitalize="none" spellcheck="false">
+      <label for="sign-in-password">Password</label>
+      <input id="sign-in-password" name="password" type="password" required autocomplete="current-password">
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="muted">
+      Your handle and password, as an administrator gave them to you. Once you are in you can
+      change the password and make API keys for your own programs. If you have forgotten it, an
+      administrator sets a new one.
+    </p>
+  </div>
+  {% endif %}
+  {% if listed.key_login_path %}
   <div class="panel">
     <form method="post" action="{{ listed.key_login_path }}">
-      <label for="sign-in-key">Your API key</label>
+      <label for="sign-in-key">{% if listed.password_login_path %}Or an API key{% else %}Your API key{% endif %}</label>
       <input id="sign-in-key" name="key" type="password" required autocomplete="off" spellcheck="false">
-      <button type="submit">Sign in</button>
+      <button type="submit">Sign in with the key</button>
     </form>
     <p class="muted">
       Use one of your own keys. The browser keeps a session for it, with that key's role, and the
       session ends when the key is revoked or expires. Ask an administrator if you have none.
     </p>
   </div>
+  {% endif %}
   {% elif listed.mode == 'api_key' %}
   <div class="panel">
     <p>

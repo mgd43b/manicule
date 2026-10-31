@@ -168,17 +168,6 @@ class KeyBody(Body):
     )
 
 
-class UserBody(Body):
-    """A request to create a person here, with the first key they sign in with."""
-
-    handle: str = Field(
-        min_length=1,
-        max_length=64,
-        description="What the person is called: lower-case letters, digits, ``.``, ``_``, ``-``.",
-    )
-    role: str = Field(default="member", description="``admin``, ``member`` or ``viewer``.")
-
-
 class UserPatch(Body):
     """A change to one member: a role, a standing, or both.
 
@@ -228,6 +217,5 @@ __all__ = [
     "ShareBody",
     "SyncBody",
     "TagBody",
-    "UserBody",
     "UserPatch",
 ]

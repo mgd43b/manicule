@@ -415,9 +415,12 @@ authentication, anonymous administrator included (§6, "Team mode takes the way 
 cross-workspace search (§16) is the per-query isolation across more than one tenant this
 section's goal list named. PII redaction (`security.data_policy.auto_redact`) predates this
 slice and is unrelated to it. A person can also be created locally (`manicule auth add-user`,
-provider `local`, no password) and sign a browser in with a key of their own at `POST /auth/key`
-under `api_key` with a `session_secret`; the session is bound to that key (§9.2.1). No passwords,
-no hard delete of a person and no generic OIDC provider exist. What is left is delivery, not the record: `security.audit`
+provider `local`) and sign a browser in under `api_key` with a `session_secret`, with a handle and
+password at `POST /auth/password` or with a key of their own at `POST /auth/key`; a key session
+is bound to its key, a password session is not (§9.2.1). A local person's password is stored
+through scrypt, a person changes their own, and an administrator sets a new one for a person who
+forgot it, because manicule sends no mail. No hard delete of a person, no password for a person an
+identity provider vouches for, and no generic OIDC provider exist. What is left is delivery, not the record: `security.audit`
 accepts a `syslog` or `webhook` destination and only `local` is wired to anything
 (`docs/deployment.md` §6.6, [#14](https://github.com/mgd43b/manicule/issues/14)).
 
@@ -426,6 +429,7 @@ accepts a `syslog` or `webhook` destination and only `local` is wired to anythin
 | OAuth | **authlib** |
 | Sessions | **itsdangerous** signed cookies, HttpOnly, SameSite=Strict |
 | API keys | stdlib `secrets` + `hashlib` |
+| Password hashing | stdlib `hashlib.scrypt` — no new dependency |
 | Rate limiting | in-process token bucket — **built**, `manicule.app.throttle` |
 
 Worth keeping from OpenDocuments: its trusted-proxy handling is genuinely good — proper

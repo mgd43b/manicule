@@ -14,10 +14,10 @@ uv run tools/extract_surface.py ../OpenDocuments > CAPABILITIES.md
 |---|---:|---|
 | CLI capability items | 48 | #8 — **built** |
 | MCP capability items | 47 | #8 — **built** |
-| HTTP endpoints | 65 | #11 — **built** |
+| HTTP endpoints | 68 | #11 — **built** |
 | File types | 21 | #4 |
 | Settings | 40 | #1 |
-| **Total** | **221** | |
+| **Total** | **224** | |
 
 ## CLI — 48
 
@@ -133,14 +133,18 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
 - `auth alerts [--all]` and `auth ack-alert <id>` — list and clear recorded security alerts.
   `--all` includes acknowledged ones; without it, only the open ones a person still has to
   look at. `docs/surfaces.md` §9.11.
-- `auth add-user HANDLE [--role]` and `auth create-key NAME --user HANDLE` — create a local
-  person (provider `local`, no password) with a first key named `<handle>-key`, shown once, and
-  mint further keys for a member. A person's key can sign a browser in. `docs/surfaces.md` §9.2.1.
+- `auth add-user HANDLE [--role] [--password]` and `auth create-key NAME --user HANDLE` — create a
+  local person (provider `local`) with either a password, prompted for and never an argument, or a
+  first key named `<handle>-key`, shown once, and mint further keys for a member. A person's
+  password or key can sign a browser in. `docs/surfaces.md` §9.2.1.
+- `auth set-password USER` — set a local person's password, prompted for and never an argument.
+  It ends their sessions and leaves their keys alone; it is how a forgotten password is
+  recovered, since manicule sends no mail. `docs/surfaces.md` §9.2.1.
 - `auth users`, `auth set-role <user> <role>`, `auth disable-user <user>`,
   `auth enable-user <user>` and `auth sign-out <user>` — the people-admin surface: list members
   with role, standing and live session count; change a role (the last enabled administrator
   cannot be demoted); disable or re-enable a membership (disabling revokes every session and key
-  the member holds, in one transaction); end every session a member holds without disabling
+  the member holds and clears their password, in one transaction); end every session a member holds without disabling
   them. `docs/surfaces.md` §9.2.1.
 
 ## MCP tools — 48
@@ -226,7 +230,7 @@ corpus where collections are optional is most of it. Asking how many there *are*
 that: `doctor`'s `collection-membership` check counts them on every surface, and a sync reports
 the figure for its own source.
 
-## HTTP endpoints — 65
+## HTTP endpoints — 68
 
 Ticket: #11 — **built.** Twelve route groups over the same application service the CLI and the
 MCP server use: health · documents · chat · conversations · collections · tags · admin ·
@@ -293,6 +297,8 @@ name — an absence with no test is an absence that comes back.
 - [ ] ~~`POST   /api/v1/admin/connectors/:type`~~ — a connector holds credentials and reaches a remote system. Sources are declared in configuration, where the whole set is reviewable in one place; `POST /admin/connectors/:name/sync` runs one that is already declared
 - [ ] ~~`POST   /api/v1/admin/connectors/github/sync`~~ — there is no per-connector route. `POST /admin/connectors/:name/sync` runs whichever connector configuration names
 - [ ] ~~`POST   /api/v1/admin/connectors/github`~~ — see `POST /api/v1/admin/connectors/:type`
+- [x] `POST   /api/v1/auth/password` — changes the caller's own password, given the current one;
+  refused for a presented key and for a session a key started. `docs/surfaces.md` §9.2.1.
 - [x] `POST   /api/v1/chat/feedback`
 - [x] `POST   /api/v1/chat/stream`
 - [x] `POST   /api/v1/chat`
@@ -313,9 +319,14 @@ name — an absence with no test is an absence that comes back.
 - [x] `POST   /auth/key` — exchanges a key a person owns for a browser session (`api_key` mode with
   a `session_secret`); the session is bound to that key. `docs/surfaces.md` §9.2.1.
 - [x] `POST   /auth/logout` — revokes the browser's session on the server, not only its cookie
+- [x] `POST   /auth/password` — signs a browser in with a handle and password (`api_key` mode with
+  a `session_secret`); the session is bound to no key. An address that has failed too often is
+  refused before the password is checked. `docs/surfaces.md` §9.2.1.
 - [x] `POST   /auth/session` — as `GET /auth/session`, which *reports* an identity rather than
   creating one. A browser session is created only by signing in, through a provider or with a
   person's key at `POST /auth/key`, and a program presents a key on every request instead; `docs/surfaces.md` §9.2.1
+- [x] `PUT    /api/v1/auth/users/:user/password` — an administrator sets a local person's password and
+  ends their sessions; recovery, since manicule sends no mail. `docs/surfaces.md` §9.2.1.
 
 ### Added, because the endpoints above could not do their job without them
 
@@ -334,8 +345,9 @@ name — an absence with no test is an absence that comes back.
   a single-operator build has no one to apply it to: list members with role, standing and live
   session count; change a role or disable/enable a membership; end every session a member holds.
   Admin-only. `docs/surfaces.md` §9.2.1.
-- `POST /api/v1/auth/users` — create a local person with a first key, secret shown once; and
-  `user` on `POST /api/v1/auth/keys` mints a key for a member. Admin-only. `docs/surfaces.md` §9.2.1.
+- `POST /api/v1/auth/users` — create a local person with a password, or with a first key, secret
+  shown once; and `user` on `POST /api/v1/auth/keys` mints a key for a member. Admin-only.
+  `docs/surfaces.md` §9.2.1.
 
 ## File types — 21
 

@@ -1824,3 +1824,47 @@ async def test_downgrading_ends_every_session_a_key_started_and_removes_local_pe
             assert list(keys) == ["k"]
     finally:
         await engine.dispose()
+
+
+async def test_a_password_hash_column_is_added_empty_and_dropped_without_touching_people(
+    data_dir: Path,
+) -> None:
+    """``d2f5b8e31a64`` adds ``users.password_hash`` as ``NULL`` for everybody who exists.
+
+    Nobody has a password until one is set, so an upgrade must not invent one; and downgrading
+    drops the column (and every hash with it) while leaving the people, their memberships and
+    their keys exactly where they were.
+    """
+    engine = create_engine(data_dir)
+    try:
+        await upgrade(engine, "c9a4e7d21b30")
+        stamp = {"t": "2026-01-01T00:00:00+00:00"}
+        async with engine.begin() as connection:
+            for statement in (
+                "INSERT INTO workspaces (id, name, mode, settings, created_at) "
+                "VALUES ('w', 'w', 'team', '{}', :t)",
+                "INSERT INTO users (id, provider, subject, created_at) VALUES "
+                "('l', 'local', 'alice', :t)",
+                "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) "
+                "VALUES ('w', 'l', 'member', :t)",
+            ):
+                await connection.execute(text(statement), stamp)
+
+        await upgrade(engine)
+        async with engine.begin() as connection:
+            hashes = (await connection.execute(text("SELECT password_hash FROM users"))).scalars()
+            assert list(hashes) == [None]
+            await connection.execute(text("UPDATE users SET password_hash = 'scrypt$x'"))
+
+        await downgrade(engine, "c9a4e7d21b30")
+        async with engine.connect() as connection:
+            columns = (await connection.execute(text("PRAGMA table_info(users)"))).all()
+            assert "password_hash" not in {column[1] for column in columns}
+            people = (await connection.execute(text("SELECT id, subject FROM users"))).all()
+            assert [tuple(row) for row in people] == [("l", "alice")]
+            members = (
+                await connection.execute(text("SELECT user_id FROM workspace_members"))
+            ).all()
+            assert len(members) == 1
+    finally:
+        await engine.dispose()

@@ -1,9 +1,11 @@
 """Creating a person here, and minting keys for people who exist.
 
-A person an administrator creates has a handle and keys and no password. The service decides who
-may create one, who may mint a key for somebody else, and what a handle may be; the HTTP and
-command-line surfaces only carry the request.
+A person an administrator creates has a handle and either a password or keys. The service
+decides who may create one, who may mint a key for somebody else, and what a handle may be; the
+HTTP and command-line surfaces only carry the request.
 """
+
+# ruff: noqa: S106 - the passwords in this file are test fixtures, not credentials
 
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ async def test_a_created_person_is_a_member_holding_one_key_in_their_role() -> N
     assert created.user.name == "alice", "the handle is folded to lower case"
     assert created.user.provider == "local"
     assert created.user.role == "member"
+    assert created.key is not None
     assert created.key.user_id == created.user.id
     assert created.key.role == "member"
     assert created.secret.startswith("mnk_")
@@ -210,3 +213,253 @@ async def test_creating_and_signing_in_are_audited_without_the_secret() -> None:
     events = {str(row["event_type"]) for row in rows}
     assert {"user.created", "api_key.created", "auth.login"} <= events
     assert created.secret not in repr(rows)
+
+
+# --- passwords --------------------------------------------------------------------------------
+
+PASSWORD = "a long enough passphrase"  # noqa: S105 - a test fixture
+OTHER = "another long passphrase!"
+WEB = Caller(role=Role.MEMBER, user_id="u-web")
+
+
+async def test_a_person_created_with_a_password_has_no_key_and_signs_in_with_it() -> None:
+    service = _service()
+    created = await service.user_create("Alice", password=PASSWORD)
+    assert created.key is None
+    assert created.secret == ""
+    assert created.user.has_password is True
+    with acting_as(Caller(address="10.0.0.1")):
+        signed = await service.sign_in_with_password(" ALICE ", PASSWORD)
+    assert signed.user.id == created.user.id
+    assert signed.token
+
+
+async def test_an_unacceptable_password_creates_nobody() -> None:
+    service = _service()
+    with pytest.raises(ConfigError, match="at least 12"):
+        await service.user_create("alice", password="short")
+    assert (await service.user_list()).count == 0
+
+
+async def test_every_failure_to_sign_in_with_a_password_is_one_refusal() -> None:
+    service = _service()
+    await service.user_create("alice", password=PASSWORD)
+    await service.user_create("keyonly")
+    messages: set[str] = set()
+    for handle, password in [("alice", OTHER), ("ghost", PASSWORD), ("keyonly", PASSWORD)]:
+        with acting_as(Caller(address="10.0.0.2")), pytest.raises(SignInRefusedError) as raised:
+            await service.sign_in_with_password(handle, password)
+        messages.add(str(raised.value))
+        assert raised.value.reason == "bad_credentials"
+    assert len(messages) == 1
+    assert PASSWORD not in "".join(messages)
+
+
+async def test_password_sign_in_is_not_available_without_a_session_secret() -> None:
+    service = _service(security={"auth": {"mode": "api_key"}})
+    with pytest.raises(UnknownEntityError):
+        await service.sign_in_with_password("alice", PASSWORD)
+
+
+async def test_wrong_passwords_are_charged_to_the_bucket_keys_are_and_then_refused_up_front() -> (
+    None
+):
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    await service.user_create("alice", password=PASSWORD)
+    outcomes: list[type[Exception]] = []
+    with acting_as(Caller(address="10.0.0.3")):
+        for attempt in range(6):
+            with pytest.raises((SignInRefusedError, RateLimitedError)) as raised:
+                await service.sign_in_with_password("alice", f"wrong password {attempt}")
+            outcomes.append(type(raised.value))
+        assert RateLimitedError in outcomes
+        with pytest.raises(RateLimitedError):
+            await service.sign_in_with_password("alice", PASSWORD)
+    with acting_as(Caller(address="10.0.0.4")):
+        assert (await service.sign_in_with_password("alice", PASSWORD)).token, (
+            "another address is not affected by this one's failures"
+        )
+
+
+async def test_an_administrator_sets_a_password_for_a_local_person_only() -> None:
+    service = _service()
+    created = await service.user_create("alice")
+    result = await service.user_set_password("alice", PASSWORD)
+    assert result.user.has_password is True
+    with acting_as(Caller(address="10.0.0.5")):
+        assert (await service.sign_in_with_password("alice", PASSWORD)).user.id == created.user.id
+    with pytest.raises(ConfigError, match="at least 12"):
+        await service.user_set_password("alice", "short")
+    with pytest.raises(UnknownEntityError):
+        await service.user_set_password("ghost", PASSWORD)
+
+
+async def test_setting_a_password_ends_the_sessions_and_leaves_the_keys() -> None:
+    service = _service()
+    created = await service.user_create("alice", password=PASSWORD)
+    with acting_as(Caller(address="10.0.0.6")):
+        signed = await service.sign_in_with_password("alice", PASSWORD)
+    minted = await service.api_key_create("laptop", role="member", user=created.user.id)
+    assert (await service.authenticate_session(signed.token)).authenticated
+    await service.user_set_password("alice", OTHER)
+    assert not (await service.authenticate_session(signed.token)).authenticated
+    assert (await service.authenticate(minted.secret)).authenticated
+
+
+async def test_changing_your_own_password_needs_the_old_one_and_a_session_not_a_key() -> None:
+    service = _service()
+    created = await service.user_create("alice", password=PASSWORD)
+    me = Caller(role=Role.MEMBER, user_id=created.user.id, address="10.0.0.7")
+    with acting_as(me):
+        with pytest.raises(SignInRefusedError):
+            await service.password_change(OTHER, OTHER)
+        with pytest.raises(ConfigError, match="at least 12"):
+            await service.password_change(PASSWORD, "short")
+        renewed = await service.password_change(PASSWORD, OTHER)
+    assert renewed.token
+    with acting_as(Caller(address="10.0.0.8")):
+        assert (await service.sign_in_with_password("alice", OTHER)).token
+    for refused in (
+        Caller(role=Role.MEMBER, user_id=created.user.id, key_id="a-key"),
+        Caller(role=Role.MEMBER),
+        Caller(),
+    ):
+        with acting_as(refused), pytest.raises(PolicyError):
+            await service.password_change(OTHER, PASSWORD)
+
+
+async def test_a_provider_persons_password_is_not_ours_to_set() -> None:
+    from manicule.app.people import Profile  # noqa: PLC0415
+
+    backend = FakeBackend(settings=Settings(**KEYED))  # pyright: ignore[reportArgumentType]
+    service = ApplicationService(backend)
+    users = await backend.users()
+    google = await users.admit(Profile(provider="google", subject="g", name="g"), role="member")
+    with pytest.raises(PolicyError, match="google"):
+        await service.user_set_password(google.id, PASSWORD)
+
+
+async def test_disabling_a_person_takes_their_password_and_enabling_does_not_return_it() -> None:
+    service = _service()
+    await service.user_create("root", role="admin")
+    created = await service.user_create("alice", password=PASSWORD)
+    await service.user_disable(created.user.id)
+    await service.user_enable(created.user.id)
+    assert (await service.user_list()).users[-1].has_password is False
+    with acting_as(Caller(address="10.0.0.9")), pytest.raises(SignInRefusedError):
+        await service.sign_in_with_password("alice", PASSWORD)
+    await service.user_set_password("alice", OTHER)
+    with acting_as(Caller(address="10.0.0.9")):
+        assert (await service.sign_in_with_password("alice", OTHER)).token
+
+
+async def test_every_password_refusal_runs_the_check_even_with_nothing_to_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manicule.app import passwords  # noqa: PLC0415
+
+    checked: list[bool] = []
+    real = passwords.verify
+
+    async def recording(password: str, stored: str | None) -> bool:
+        checked.append(stored is None)
+        return await real(password, stored)
+
+    monkeypatch.setattr(passwords, "verify", recording)
+    service = _service()
+    await service.user_create("alice", password=PASSWORD)
+    await service.user_create("boss", role="admin")
+    await service.user_create("root", role="admin", password=PASSWORD)
+    await service.user_disable("root")
+    for handle in ("ghost", "root", "alice"):
+        with acting_as(Caller(address="10.1.0.1")), pytest.raises(SignInRefusedError):
+            await service.sign_in_with_password(handle, OTHER)
+    assert len(checked) == 3, "an unknown or disabled handle skipped the hash, and so was faster"
+    assert checked == [True, True, False]
+
+
+async def test_a_burst_of_guesses_cannot_outrun_the_budget() -> None:
+    import asyncio  # noqa: PLC0415
+
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    await service.user_create("alice", password=PASSWORD)
+
+    async def guess(n: int) -> str:
+        with acting_as(Caller(address="10.1.0.2")):
+            try:
+                await service.sign_in_with_password("alice", f"wrong guess number {n}")
+            except RateLimitedError:
+                return "limited"
+            except SignInRefusedError:
+                return "checked"
+        return "signed in"
+
+    outcomes = await asyncio.gather(*(guess(n) for n in range(12)))
+    assert outcomes.count("checked") == 3, "more guesses were hashed than the budget allows"
+    assert outcomes.count("limited") == 9
+
+
+async def test_a_correct_password_costs_nothing_against_the_budget() -> None:
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    await service.user_create("alice", password=PASSWORD)
+    with acting_as(Caller(address="10.1.0.3")):
+        for _ in range(10):
+            assert (await service.sign_in_with_password("alice", PASSWORD)).token
+
+
+async def test_an_unacceptable_new_password_costs_nothing_against_the_budget() -> None:
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    created = await service.user_create("alice", password=PASSWORD)
+    me = Caller(role=Role.MEMBER, user_id=created.user.id, address="10.1.0.9")
+    with acting_as(me):
+        for _ in range(6):
+            with pytest.raises(ConfigError):
+                await service.password_change(PASSWORD, "short")
+        assert (await service.password_change(PASSWORD, OTHER)).token
+
+
+async def test_a_second_workspace_cannot_create_the_same_handle_and_replace_its_password() -> None:
+    backend = FakeBackend(settings=Settings(**KEYED))  # pyright: ignore[reportArgumentType]
+    first = ApplicationService(backend)
+    created = await first.user_create("alice", password=PASSWORD)
+    users = await backend.users()
+    users.workspace = "other"  # type: ignore[attr-defined]
+    with pytest.raises(NameInUseError):
+        await first.user_create("alice", password=OTHER)
+    users.workspace = backend.settings.workspace  # type: ignore[attr-defined]
+    with acting_as(Caller(address="10.1.0.4")):
+        assert (await first.sign_in_with_password("alice", PASSWORD)).user.id == created.user.id
+
+
+async def test_a_reset_that_lands_while_a_change_is_hashing_is_not_overwritten() -> None:
+    backend = FakeBackend(settings=Settings(**KEYED))  # pyright: ignore[reportArgumentType]
+    service = ApplicationService(backend)
+    created = await service.user_create("alice", password=PASSWORD)
+    users = await backend.users()
+    stale = await users.password_hash_for(created.user.id)
+    await service.user_set_password("alice", OTHER)
+    assert not await users.set_password(
+        created.user.id, "scrypt$x", expected=stale, require_expected=True
+    )
+    with acting_as(Caller(address="10.1.0.5")):
+        assert (await service.sign_in_with_password("alice", OTHER)).token

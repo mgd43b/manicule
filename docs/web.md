@@ -114,8 +114,8 @@ the failure the page shows — same type, same message, same hint.
 | admin | `/ui/admin` | `index_status`, `search_quality`, `query_logs`, `audit_log`, `security_alerts`, `plugin_health`, `connector_list` | admin |
 | reembed | `/ui/reembed` | `reembed_plan`, `reembed_status` | admin |
 | lifecycle | `/ui/lifecycle` | dry runs of the lifecycle operations, `rebuild_plan`, `rebuild_status` | admin |
-| users | `/ui/users` | `user_list`, `auth_providers` | admin (adding a person: `user_create`) |
-| auth | `/ui/auth` | `api_key_list`, `auth_providers` | viewer — rows are the caller's own keys unless they administer |
+| users | `/ui/users` | `user_list`, `auth_providers` | admin (adding a person: `user_create`; setting a password: `user_set_password`) |
+| auth | `/ui/auth` | `api_key_list`, `auth_providers` | viewer — rows are the caller's own keys unless they administer; changing your own password: `password_change` |
 | layout | — | — | — |
 
 Plus two pages that take no credential at all, in a smaller frame with no navigation:
@@ -203,11 +203,14 @@ on `security.auth.mode`, and so does what this surface says when it refuses one:
 - **`api_key`** — a key is presented on every request in a header. A page load carries none, so
   without a `session_secret` this surface refuses it — with an HTML page that says so and points
   at the HTTP API and the command line, rather than a JSON envelope in a browser window. With
-  `security.auth.session_secret` set (at least 32 characters), `/ui/login` shows a **key form**
-  posting to `POST /auth/key`: a person presents one of their own keys once and the browser holds
-  a session cookie bound to it, which authenticates pages, the page script's API calls and the
-  websocket, never the MCP mount. An unauthenticated page load is then refused with a link to
-  sign in, as under `oauth`. A key no person owns cannot sign a browser in.
+  `security.auth.session_secret` set (at least 32 characters), `/ui/login` shows two forms. A
+  **handle and password form** posts to `POST /auth/password`: the browser holds a session cookie
+  that is bound to no key, like an `oauth` one. A **key form** posts to `POST /auth/key`: a person
+  presents one of their own keys once and the browser holds a session cookie bound to it. Either
+  cookie authenticates pages, the page script's API calls and the websocket, never the MCP mount.
+  An unauthenticated page load is then refused with a link to sign in, as under `oauth`. A key no
+  person owns cannot sign a browser in. A person may have a password, keys, or both. A password
+  field is a password input, posted in the request body, and is never in a URL.
 - **`oauth`** — people sign in. `/ui/login` links to each provider that applies to this
   workspace; after the provider sends the browser back, it holds a session cookie that
   authenticates pages, the JSON API the page's script calls, and the websocket — never the MCP
@@ -224,13 +227,24 @@ here.
 
 **People are administered on the People page** (`/ui/users`, admin): every member of this
 workspace with their role, standing and live sessions, a role select, disable or enable, and
-*sign out everywhere*. Under `api_key` an **Add a person** form (a handle and a role, calling
-`POST /api/v1/auth/users`) creates a local person and shows their first key's secret once. Each control calls `PATCH /api/v1/auth/users/{id}` or
-`POST /api/v1/auth/users/{id}/sign-out` through the page's script, exactly as the key buttons
-call the key routes; every rule — the last administrator stays one, nobody disables themselves,
-a disable takes the person's sessions and keys with it — is the service's, and a refusal is
+*sign out everywhere*. A **Password** column says whether a local person has one (`set` or `none`;
+a person an identity provider vouches for shows their provider's), and a **Set password** control
+on each local row, with its own field, sets a new one. This is how a forgotten password is
+recovered: nothing is emailed, so an administrator chooses one and hands it over. It ends that
+person's sessions and leaves their keys alone. Under `api_key` an **Add a person** form (a handle,
+a role and an optional password, calling `POST /api/v1/auth/users`) creates a local person: with
+a password they sign in with it and make their own keys, and without one the page shows their
+first key's secret once. Each control calls `PATCH /api/v1/auth/users/{id}`,
+`PUT /api/v1/auth/users/{id}/password` or `POST /api/v1/auth/users/{id}/sign-out` through the
+page's script, exactly as the key buttons call the key routes; every rule — the last administrator stays one, nobody disables themselves,
+a disable takes the person's sessions, keys and password with it, so enabling them again needs a new password set — is the service's, and a refusal is
 shown in the service's words. The API keys page is for keys only, and shows each key's owner,
-allowed addresses and rate limit ([`surfaces.md` §9.2](surfaces.md#92-identity)).
+allowed addresses and rate limit ([`surfaces.md` §9.2](surfaces.md#92-identity)). The same page
+carries a **Your password** panel for a person signed in with a password: the current password,
+a new one and its confirmation, calling `POST /api/v1/auth/password`. It needs the current
+password, ends every other browser the person is signed in with, and keeps this one signed in
+with a fresh cookie. It is not shown to a person who signed in with a key or a provider, because
+no password started that session ([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)).
 
 **A workspace is shared, not partitioned.** Several people may be members of one workspace, and
 every member can read all of it: roles decide what a person may *do*, not which documents they

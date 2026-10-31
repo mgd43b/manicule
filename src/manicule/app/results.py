@@ -2092,6 +2092,11 @@ class AuthProviders(Payload):
         description="Where a browser presents an API key to sign in, when this installation "
         "offers that. Empty when it does not.",
     )
+    password_login_path: str = Field(
+        default="",
+        description="Where a browser presents a handle and password to sign in, when this "
+        "installation offers that. Empty when it does not.",
+    )
     detail: str = ""
 
 
@@ -2115,6 +2120,11 @@ class UserSummary(Payload):
     disabled: bool = False
     created_at: str = Field(default="", description="When they became a member.")
     last_login_at: str = ""
+    has_password: bool = Field(
+        default=False,
+        description="Whether this person can sign in with a handle and a password. Only whether: "
+        "the hash is never in a result.",
+    )
     sessions: int | None = Field(
         default=None,
         ge=0,
@@ -3215,18 +3225,29 @@ class ApiKeyIssued(Payload):
 
 
 class UserCreated(Payload):
-    """A person created here, and the first key they sign in with.
+    """A person created here: with a password they chose or were given, or with a first key.
 
-    ``secret`` is the only copy of that key, shown once exactly as an API key's is.
+    Created with a password, they have no key yet and mint their own after signing in; created
+    without one, they have the key this carries. ``secret`` is the only copy of that key, shown
+    once exactly as an API key's is.
     """
 
     user: UserSummary
-    key: ApiKeySummary
+    key: ApiKeySummary | None = Field(
+        default=None, description="The first key, when no password was given."
+    )
     secret: str = Field(
+        default="",
         repr=False,
         description="Shown once and never stored. Only its SHA-256 digest is kept, so a lost "
-        "key is revoked and replaced rather than recovered.",
+        "key is revoked and replaced rather than recovered. Empty when a password was given.",
     )
+
+
+class PasswordSet(Payload):
+    """A local person's password set by an administrator, with every browser they held ended."""
+
+    user: UserSummary
 
 
 class ApiKeyList(Payload):
