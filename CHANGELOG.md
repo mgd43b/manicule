@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.23](https://github.com/mgd43b/manicule/compare/v0.2.22...v0.2.23) (2026-10-31)
+
+
+### Features
+
+* **auth:** sign in with a handle and password, and manage your own keys and password ([#531](https://github.com/mgd43b/manicule/issues/531)) ([517ec99](https://github.com/mgd43b/manicule/commit/517ec990ff4a8715a04af64b952e3bcf6b1dd28f))
+
+
+### Bug Fixes
+
+* **deps:** bump joserfc from 1.7.4 to 1.7.6 ([#532](https://github.com/mgd43b/manicule/issues/532)) ([1c4ab11](https://github.com/mgd43b/manicule/commit/1c4ab111c6897f8a3113723b5e1e86d5e22d29d0))
+
 ## [0.2.22](https://github.com/mgd43b/manicule/compare/v0.2.21...v0.2.22) (2026-10-30)
 
 
