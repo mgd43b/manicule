@@ -31,7 +31,7 @@
 {% if can_change_password and panels.providers.ok and panels.providers.data.password_login_path %}
 <section class="panel">
   <h2>Your password</h2>
-  <form class="filters" data-change-password>
+  <form class="filters" method="post" action="/api/v1/auth/password" data-change-password>
     <label for="current-password">Current password</label>
     <input id="current-password" name="current_password" type="password" required autocomplete="current-password">
     <label for="new-password">New password</label>

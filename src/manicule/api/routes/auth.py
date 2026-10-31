@@ -260,14 +260,27 @@ MAX_SIGN_IN_BODY = 4096
 capped at 256 bytes; this is generous to both and bounds what a request can make the server hold."""
 
 
+NOT_TEXT = "\ud800"
+"""What a supplied value that is not a string becomes: a lone surrogate, which the password
+policy refuses as "not valid text", so a malformed request is told so rather than read as an
+omitted field."""
+
+
+def _text(value: object) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else NOT_TEXT
+
+
 async def presented_fields(request: Request, *names: str) -> dict[str, str]:
     """The named string fields a credential-carrying request holds, from JSON or a form post.
 
     **The one parser for every request that carries a secret**, read by hand, bounded, and
     never from the URL: a query string is logged, remembered and sent in ``Referer``. It is not
     a pydantic model on purpose, because a failed validation answers ``422`` with the offending
-    input echoed back, and the input here is a password. A field that is missing, not a
-    string, or past the cap comes back as ``""``, which every caller treats as no credential.
+    input echoed back, and the input here is a password. A field that is missing, or a body
+    past the cap, comes back as ``""``, which every caller treats as no credential; a value that
+    is present and not a string comes back as :data:`NOT_TEXT`, which no policy accepts.
 
     Values are exactly as sent. Nothing is stripped: a space is a character a person may have
     chosen for a password, and the service decides what is acceptable.
@@ -287,7 +300,7 @@ async def presented_fields(request: Request, *names: str) -> dict[str, str]:
         if not isinstance(loaded, dict):
             return empty
         fields = cast("dict[str, object]", loaded)
-        return {name: value if isinstance(value := fields.get(name), str) else "" for name in names}
+        return {name: _text(fields.get(name)) for name in names}
     form = parse_qs(text, keep_blank_values=True)
     return {name: form.get(name, [""])[0] for name in names}
 

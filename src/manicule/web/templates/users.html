@@ -18,7 +18,7 @@
 <section class="panel">
   <h2>Members</h2>
   <h3>Add a person</h3>
-  <form class="filters" data-create-user>
+  <form class="filters" method="post" action="/api/v1/auth/users" data-create-user>
     <label for="user-handle">Handle</label>
     <input id="user-handle" name="handle" required autocomplete="off" pattern="[a-z0-9][a-z0-9._\-]*" maxlength="64">
     <label for="user-role">Role</label>

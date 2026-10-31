@@ -384,3 +384,16 @@ def test_a_lone_surrogate_in_a_password_is_a_refusal_not_a_crash() -> None:
         )
     assert created.status_code == BAD_REQUEST
     assert signed.status_code == FORBIDDEN
+
+
+def test_a_password_that_is_not_a_string_is_refused_not_ignored() -> None:
+    backend = _backend()
+    admin = asyncio.run(_admin(backend))
+    with client_for(backend) as client:
+        created = client.post(
+            "/api/v1/auth/users",
+            json={"handle": "bob", "password": ["a long enough passphrase"]},
+            headers={"X-API-Key": admin},
+        )
+    assert created.status_code == BAD_REQUEST
+    assert "passphrase" not in created.text

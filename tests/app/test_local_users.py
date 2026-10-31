@@ -422,6 +422,22 @@ async def test_a_correct_password_costs_nothing_against_the_budget() -> None:
             assert (await service.sign_in_with_password("alice", PASSWORD)).token
 
 
+async def test_an_unacceptable_new_password_costs_nothing_against_the_budget() -> None:
+    service = _service(
+        security={
+            "auth": {"mode": "api_key", "session_secret": "s" * 40},
+            "rate_limit": {"failed_auth_per_minute": 3},
+        }
+    )
+    created = await service.user_create("alice", password=PASSWORD)
+    me = Caller(role=Role.MEMBER, user_id=created.user.id, address="10.1.0.9")
+    with acting_as(me):
+        for _ in range(6):
+            with pytest.raises(ConfigError):
+                await service.password_change(PASSWORD, "short")
+        assert (await service.password_change(PASSWORD, OTHER)).token
+
+
 async def test_a_second_workspace_cannot_create_the_same_handle_and_replace_its_password() -> None:
     backend = FakeBackend(settings=Settings(**KEYED))  # pyright: ignore[reportArgumentType]
     first = ApplicationService(backend)

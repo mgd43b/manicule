@@ -8688,17 +8688,27 @@ class ApplicationService:
         stored = await users.password_hash_for(caller.user_id)
         if not await passwords.verify(current_password, stored):
             raise await self._password_failed(provider="password")
-        replacement = await self._hashed(new_password)
+        try:
+            replacement = await self._hashed(new_password)
+        except ConfigError:
+            # The current password was right: an unacceptable new one is not a failed sign-in.
+            self._refund_password_attempt()
+            raise
         if not await users.set_password(
             caller.user_id, replacement, expected=stored, require_expected=True
         ):
             # Reset while this was hashing: what was verified is no longer the password.
             raise await self._password_failed(provider="password")
-        self._refund_password_attempt()
         member = await self._member(caller.user_id)
         session_id, expires_at, token = await users.begin_session(
             member.id, max_age_s=self.settings.security.auth.session_max_age_s
         )
+        if await users.password_hash_for(member.id) != replacement:
+            # A reset landed between the write and this session: it ended the sessions that
+            # existed then, not this one, so this one ends here.
+            await users.end_session(token)
+            raise await self._password_failed(provider="password")
+        self._refund_password_attempt()
         await self._audit("user.password_changed", details={"user_id": member.id}, actor=member.id)
         return r.SignedIn(user=member, session_id=session_id, expires_at=expires_at, token=token)
 
