@@ -1460,7 +1460,7 @@ wheels = [
 
 [[package]]
 name = "manicule"
-version = "0.2.23"
+version = "0.2.24"
 source = { editable = "." }
 dependencies = [
     { name = "packaging" },
@@ -1681,7 +1681,7 @@ dev = [
 
 [[package]]
 name = "manicule-mlx"
-version = "0.2.23"
+version = "0.2.24"
 source = { editable = "packages/manicule-mlx" }
 dependencies = [
     { name = "manicule" },
@@ -1698,7 +1698,7 @@ requires-dist = [
 
 [[package]]
 name = "manicule-ollama"
-version = "0.2.23"
+version = "0.2.24"
 source = { editable = "packages/manicule-ollama" }
 dependencies = [
     { name = "httpx" },
