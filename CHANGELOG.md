@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.24](https://github.com/mgd43b/manicule/compare/v0.2.23...v0.2.24) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** bump astral-sh/uv ([#537](https://github.com/mgd43b/manicule/issues/537)) ([3d5387a](https://github.com/mgd43b/manicule/commit/3d5387abde6e4bccae706583192d147e4b4ec297))
+* **deps:** bump the index-affecting-embedding group with 2 updates ([#535](https://github.com/mgd43b/manicule/issues/535)) ([a4695a9](https://github.com/mgd43b/manicule/commit/a4695a91abdd6f4d85d6d98c180a13e2c131e2d6))
+* **deps:** bump the runtime group with 6 updates ([#539](https://github.com/mgd43b/manicule/issues/539)) ([50c4591](https://github.com/mgd43b/manicule/commit/50c4591036f1ac030a2ebe0f9e382d165f9480d0))
+
 ## [0.2.23](https://github.com/mgd43b/manicule/compare/v0.2.22...v0.2.23) (2026-10-31)
 
 
