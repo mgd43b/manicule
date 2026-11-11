@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.25](https://github.com/mgd43b/manicule/compare/v0.2.24...v0.2.25) (2026-11-11)
+
+
+### Features
+
+* **connectors:** add an Outlook connector for Microsoft 365 mail and calendar ([#546](https://github.com/mgd43b/manicule/issues/546)) ([c6fbd46](https://github.com/mgd43b/manicule/commit/c6fbd46bf2021049398f005d5198a705471e6f96))
+* **connectors:** index a Trilium Notes server ([#547](https://github.com/mgd43b/manicule/issues/547)) ([78d8ba7](https://github.com/mgd43b/manicule/commit/78d8ba7ffa3f8de83ffb86f88e61abaad8ab4ecc))
+* restrict sources to reader groups, enforced at the hydrating join and on the way out ([#548](https://github.com/mgd43b/manicule/issues/548)) ([ce5b89a](https://github.com/mgd43b/manicule/commit/ce5b89a5659ad30c25d5f2080c2db4f794f9e8f2))
+* reuse stored vectors across workspaces with the same embedding input ([#550](https://github.com/mgd43b/manicule/issues/550)) ([4289e62](https://github.com/mgd43b/manicule/commit/4289e6264144a37638f9dbf5b06f33484a7d6309))
+
+
+### Bug Fixes
+
+* **deps:** bump the index-affecting-extraction group across 1 directory with 3 updates ([#551](https://github.com/mgd43b/manicule/issues/551)) ([6c0dd52](https://github.com/mgd43b/manicule/commit/6c0dd52286d40464e61ffedd86cbebc1748dfeb1))
+* **deps:** bump the runtime group across 1 directory with 8 updates ([#552](https://github.com/mgd43b/manicule/issues/552)) ([043884a](https://github.com/mgd43b/manicule/commit/043884a323225dd00bc41efab58fdedb473344d0))
+* **deps:** hold typer below 0.29, which the CLI cannot build on ([#549](https://github.com/mgd43b/manicule/issues/549)) ([4c113a2](https://github.com/mgd43b/manicule/commit/4c113a25410768b9facb6d4fb2da21f2b16a5cd6))
+
 ## [0.2.24](https://github.com/mgd43b/manicule/compare/v0.2.23...v0.2.24) (2026-11-02)
 
 
