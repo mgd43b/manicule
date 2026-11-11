@@ -1245,6 +1245,7 @@ class Runtime:
                 _RuntimeDonors(
                     self._workspaces, embedder.fingerprint, fingerprint.embed_text_middleware
                 ),
+                fingerprint=embedder.fingerprint,
                 ledger=_VectorReuseLedger(self),
             ),
         )

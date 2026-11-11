@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from manicule.core.content import Chunk
-    from manicule.core.embedding import Vector
+    from manicule.core.embedding import EmbedFingerprint, Vector
     from manicule.core.protocols import VectorStore
 
 _LOG = logging.getLogger(__name__)
@@ -89,8 +89,23 @@ class SharedVectors:
     needs the document's ``(source, source_id)`` and a chunk carries only its document id.
     """
 
-    def __init__(self, donors: Donors, *, ledger: BorrowLedger | None = None) -> None:
+    def __init__(
+        self,
+        donors: Donors,
+        *,
+        fingerprint: EmbedFingerprint,
+        ledger: BorrowLedger | None = None,
+    ) -> None:
+        """Lend from ``donors`` into a workspace that embeds with ``fingerprint``.
+
+        ``fingerprint`` is the borrowing workspace's embedder, and the first clause of the reuse
+        condition is checked against it here rather than trusted to whoever chose the donors.
+        A donor store classifies its own rows against *its* recorded fingerprint, so a donor
+        from another model would find its own rows perfectly readable — and lend a vector from
+        a different space under a name that looks current.
+        """
         self._donors = donors
+        self._fingerprint = fingerprint
         self._ledger = ledger
 
     def for_document(self, source: str, source_id: str) -> DocumentLender:
@@ -118,6 +133,17 @@ class SharedVectors:
         for donor in await self._donors.donors():
             if not remaining:
                 break
+            try:
+                recorded = await donor.vectors.fingerprint()
+            except Exception as exc:  # noqa: BLE001 - a donor's failure is not this document's
+                _LOG.warning(
+                    "could not read another workspace's embedding fingerprint for reuse; "
+                    "embedding instead: %s",
+                    type(exc).__name__,
+                )
+                continue
+            if recorded is None or not recorded.matches(self._fingerprint):
+                continue
             addressed = document_id(donor.workspace, source, source_id)
             proxies: list[Chunk] = [
                 chunk.model_copy(update={"document_id": addressed}) for chunk in remaining

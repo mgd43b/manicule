@@ -56,6 +56,7 @@ from manicule.core.protocols import (
     VectorStore,
 )
 from manicule.core.retrieval import Filter
+from manicule.ingest.shared_vectors import Donor, SharedVectors
 from manicule.plugins import BuildContext, ComponentRegistry
 from manicule.storage.config import QdrantVectorStoreConfig
 from manicule.storage.plugin import PLUGIN, build_qdrant_vector_store
@@ -2196,3 +2197,133 @@ async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
         ), "scored against the int8 copy rather than the checksummed originals"
     finally:
         await _drop(server_store, server_client, 8)
+
+
+# --- lending to another workspace (docs/storage.md §6.2.1) -----------------------------------
+
+
+class _Donors:
+    """A fixed donor set, which is all :class:`SharedVectors` asks of the runtime."""
+
+    def __init__(self, *donors: Donor) -> None:
+        self._donors = donors
+
+    async def donors(self) -> tuple[Donor, ...]:
+        return self._donors
+
+
+def _page(workspace: str, count: int) -> list[Chunk]:
+    """One source page's chunks, as ``workspace`` files them: its own document, its own ids."""
+    document = make_document("handbook", "page", workspace_id=workspace)
+    return [make_chunk(document, index, f"paragraph {index} of the page") for index in range(count)]
+
+
+async def _lend_between(
+    lender: QdrantVectorStore, borrower: QdrantVectorStore, offered: list[list[float]]
+) -> tuple[list[Chunk], dict[str, tuple[float, ...]]]:
+    """Index a page in ``lender``'s workspace and lend it, through an opened handle, to the other.
+
+    The handle is the one the runtime uses: :meth:`QdrantVectorStore.open_workspace` on the
+    borrowing store, sharing its client, reading and never preparing.
+    """
+    space = fingerprint(len(offered[0]))
+    await lender.ensure_ready(space)
+    await borrower.ensure_ready(space)
+    await lender.upsert(_page(lender.workspace_id, len(offered)), offered)
+    ours = _page(borrower.workspace_id, len(offered))
+    opened = await borrower.open_workspace(lender.workspace_id, space)
+    shared = SharedVectors(
+        _Donors(Donor(workspace=lender.workspace_id, vectors=opened)), fingerprint=space
+    )
+    lent = await shared.lend(ours, source="handbook", source_id="page")
+    return ours, {chunk_id: tuple(vector) for chunk_id, vector in lent.items()}
+
+
+async def test_another_workspace_lends_its_stored_vector_through_an_opened_handle(
+    client: AsyncQdrantClient,
+) -> None:
+    """Local mode, so one-hot vectors: it re-normalizes on write, and these survive that."""
+    lender = QdrantVectorStore(
+        client, workspace_id="alpha", collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    borrower = QdrantVectorStore(
+        client, workspace_id="beta", collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    offered = [spread(4, index) for index in range(3)]
+
+    ours, lent = await _lend_between(lender, borrower, offered)
+
+    assert [lent[item.id] for item in ours] == [tuple(vector) for vector in offered]
+    await borrower.upsert(ours, [lent[item.id] for item in ours])
+    verdicts = await borrower.stored_vectors(ours)
+    assert {verdict.integrity for verdict in verdicts.values()} == {VectorIntegrity.VERIFIED}
+
+
+async def test_an_unrelated_workspace_lends_nothing(client: AsyncQdrantClient) -> None:
+    """The same text under another source is another document, and its identity says so."""
+    lender = QdrantVectorStore(
+        client, workspace_id="alpha", collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    borrower = QdrantVectorStore(
+        client, workspace_id="beta", collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    space = fingerprint(4)
+    await lender.ensure_ready(space)
+    await borrower.ensure_ready(space)
+    elsewhere = make_document("runbooks", "page", workspace_id="alpha")
+    await lender.upsert(
+        [make_chunk(elsewhere, index, f"paragraph {index} of the page") for index in range(2)],
+        [spread(4, index) for index in range(2)],
+    )
+    shared = SharedVectors(
+        _Donors(Donor(workspace="alpha", vectors=await borrower.open_workspace("alpha", space))),
+        fingerprint=space,
+    )
+
+    assert await shared.lend(_page("beta", 2), source="handbook", source_id="page") == {}
+
+
+@pytest.mark.contract
+async def test_a_real_server_lends_exactly_the_float32_it_stored(
+    server_client: AsyncQdrantClient,
+) -> None:
+    """Numeric fidelity of the copy, which only a real server can show.
+
+    The borrowed vector must be the lender's stored vector bit for bit, and the borrower's own
+    copy must pass a recomputed checksum exactly as a freshly embedded one would.
+    """
+    run = uuid.uuid4()
+    lender = QdrantVectorStore(
+        server_client,
+        workspace_id=f"{WORKSPACE}-lender-{run}",
+        collection_prefix=TEST_COLLECTION_PREFIX,
+    )
+    borrower = QdrantVectorStore(
+        server_client,
+        workspace_id=f"{WORKSPACE}-borrower-{run}",
+        collection_prefix=TEST_COLLECTION_PREFIX,
+    )
+    offered = [
+        [byte / 255 - 0.5 for byte in hashlib.sha256(f"lent-{index}".encode()).digest()[:8]]
+        for index in range(5)
+    ]
+    try:
+        ours, lent = await _lend_between(lender, borrower, offered)
+        held = await lender.stored_vectors(_page(lender.workspace_id, len(offered)))
+
+        assert [lent[item.id] for item in ours] == [
+            canonical_stored_vector(vector) for vector in offered
+        ]
+        assert sorted(lent.values()) == sorted(verdict.vector for verdict in held.values())
+        await borrower.upsert(ours, [lent[item.id] for item in ours])
+        coverage = await borrower.checksum_coverage(recompute=True)
+        assert (coverage.rows, coverage.verified, coverage.failed) == (
+            len(offered),
+            len(offered),
+            0,
+        )
+        mine = await borrower.stored_vectors(ours)
+        assert [mine[item.id].vector for item in ours] == [lent[item.id] for item in ours]
+    finally:
+        await _drop(lender, server_client, 8)
+        await _drop(borrower, server_client, 8)
