@@ -700,6 +700,11 @@ def embedding_input_identity(
         keeps is the case reuse exists for: the same document re-parsed, where a chunk id moves
         because it carries its position and the embedded string does not move at all.
 
+        Reuse *across* workspaces does not loosen this. A lender asks another workspace's store
+        about the document the same ``(source, source_id)`` is *there*, under that workspace's
+        own document id, so the identity that store compares is still one it recorded itself
+        (``docs/storage.md`` §6.2.6, :mod:`manicule.ingest.shared_vectors`).
+
     ``embed_text``
         The exact string handed to the embedder — every code point of it, in order. There is
         deliberately **no Unicode normalization**: NFC and NFD forms of one word tokenize
