@@ -289,7 +289,7 @@ def _signal(process: asyncio.subprocess.Process, number: int) -> None:
     """Signal the whole process group, because a fetch is a tree of processes.
 
     ``git fetch`` starts ``git-remote-https`` and ``index-pack``, and ``start_new_session`` made
-    the parent the leader of a group of its own. Signalling only the parent leaves the helpers
+    the parent the leader of a group of its own. Signaling only the parent leaves the helpers
     running and holding the pipe, which is a hung sync that looks stopped.
     """
     with contextlib.suppress(ProcessLookupError, PermissionError):
