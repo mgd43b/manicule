@@ -3,7 +3,8 @@
 The index is not permission-aware: whoever can search a workspace reads everything in it. For
 most sources that is a decision about who may use the installation. For a mailbox it is not a
 decision anyone made — one person's mail would be readable by every process that can reach the
-port — so a connector type registers itself as **sensitive**
+port, and so would their notes (``docs/connectors/trilium.md`` §7) — so a connector type registers
+itself as **sensitive**
 (:attr:`~manicule.plugins.registry.ComponentRecord.sensitive`, beside its ``config_model``) and
 :func:`~manicule.app.bind.require_sensitive_source_authentication` refuses to serve such an
 installation without authentication, on every address.
