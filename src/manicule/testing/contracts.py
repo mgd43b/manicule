@@ -65,6 +65,7 @@ from manicule.core.protocols import (
     VersionStore,
     read_blocks,
 )
+from manicule.core.readers import admits
 from manicule.core.retrieval import Candidate, Query
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only, never at run time
@@ -955,6 +956,12 @@ async def assert_pipeline_enforces_scope(
     document in another workspace or soft-deleted, and the status it reports covers the rest.
     Pass the handle for the workspace the query names.
 
+    **Readers are the fourth exclusion.** When the query carries a reader set
+    (:attr:`~manicule.core.retrieval.Filter.readers`), every candidate's document must admit
+    it through the gates ``get_document`` returns it carrying. Put a document the reader set
+    may not read — live, indexed and in-workspace, so that only its readers exclude it — in
+    the fixture, and a stage that skipped the reader half of the join fails here.
+
     Args:
         pipeline: The stages, in the order the runner would call them.
         docstore: The document store scoped to the query's workspace.
@@ -997,6 +1004,14 @@ async def assert_pipeline_enforces_scope(
                     f"'indexed'. Only an indexed document has chunks whose vectors and text "
                     f"are both current; the rest are visible to the store and must not be "
                     f"visible to a search"
+                )
+            elif not admits(query.filter.readers, document.access):
+                _fail(
+                    f"{where}, which the query's reader set may not read. Who may read a "
+                    f"document is held on the document and its source in the authoritative "
+                    f"store, never in the vector table, so a stage that searched it without "
+                    f"hydrating through the reader-aware join has handed a restricted reader a "
+                    f"passage they were never meant to see"
                 )
 
     if expect_results:
