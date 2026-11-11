@@ -59,7 +59,7 @@ async def test_what_the_parser_reads_is_what_a_person_would_search_for() -> None
     )
 
 
-async def test_a_cancelled_event_says_so() -> None:
+async def test_a_canceled_event_says_so() -> None:
     (stanza,) = await parsed(event(isCancelled=True))
 
     assert "Status: CANCELLED" in stanza

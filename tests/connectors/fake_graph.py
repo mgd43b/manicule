@@ -133,7 +133,7 @@ class FakeEvent:
     body: str = ""
     organizer: str = "Pat Example <pat@example.org>"
     attendees: tuple[str, ...] = ()
-    cancelled: bool = False
+    canceled: bool = False
     series_master: str | None = None
     ical_uid: str = ""
 
@@ -600,7 +600,7 @@ class FakeGraph:
                 "organizer": person(event.organizer),
                 "attendees": [person(a) for a in event.attendees],
                 "body": {"contentType": "text", "content": event.body},
-                "isCancelled": event.cancelled,
+                "isCancelled": event.canceled,
                 "webLink": f"https://outlook.office365.com/owa/?itemid={quote(event.id, safe='')}",
                 "createdDateTime": "2026-01-05T10:00:00Z",
             },

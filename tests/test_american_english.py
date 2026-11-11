@@ -228,6 +228,18 @@ EXTERNAL: tuple[tuple[str, str], ...] = (
         "not a longer fragment.",
     ),
     (
+        "isCancelled",
+        "Microsoft Graph's event property, which the Outlook connector selects by name and the "
+        "synthetic Graph serves under it. Respelled, the request would ask for a property that "
+        "does not exist and the answer would silently lose whether an event was canceled.",
+    ),
+    (
+        "CANCELLED",
+        "RFC 5545 defines the iCalendar STATUS value with this spelling, and the calendar "
+        "parser prints it as written. A renderer that wrote the American spelling would produce "
+        "a status no other calendar reader recognizes.",
+    ),
+    (
         'ac:name="colour"',
         "Confluence spells the status macro's parameter this way, so a storage-format fixture "
         "has to carry the real name. The test using it asserts that the value never reaches "
