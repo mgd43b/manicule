@@ -9,8 +9,9 @@ Two facts decide most of this document, and both are consequences of decisions t
 elsewhere:
 
 - **The data directory is the corpus**, not a derived index of it (§1).
-- **The index is not permission-aware**, so what one user can search, every user can search
-  (§1.2).
+- **The index holds everything the sync account can see**, and the source's own restrictions
+  do not travel with it. Inside a workspace, an administrator can restrict a source to reader
+  groups; anything else one user can search, every user can search (§1.2).
 
 ---
 
@@ -73,23 +74,64 @@ every re-parse a re-fetch. A connector may set `retain_source_bytes = true` or `
 `enabled`; omitting it inherits the storage default. This is useful when remote sites need an
 offline copy but a durable local Git checkout should remain the only copy of its own bytes.
 
-### 1.2 The index is not permission-aware
+### 1.2 Who can read what is indexed
 
 Content is fetched as whatever account the connector is configured with, so the index holds
-everything **that** account can see, and anyone who can search the index can retrieve any of
-it. `docs/connectors/confluence.md` §9 says this for Confluence and it is a property of the
-whole system: source-side restrictions do not travel with the content, and they do not travel
-with the retained bytes either.
+everything **that** account can see. `docs/connectors/confluence.md` §9 says this for
+Confluence and it is a property of the whole system: source-side restrictions do not travel
+with the content, and they do not travel with the retained bytes either.
 
 The operational form of that: **the sync account is the blast radius.** Point a connector at
 an account with access to exactly what the index is meant to hold. An admin token indexes
 everything an admin can see, into a directory that is a verbatim copy, on a machine whose file
 permissions are now the only access control left.
 
-**Team mode does not change this.** Every member of a workspace can search all of it; a role
-decides what a person may *do* — read, write, administer — and not which documents they may see
-([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)). Content some
-members must not read belongs in a workspace they are not members of.
+**A role does not change this.** A role decides what a person may *do* — read, write,
+administer — and not which documents they may see
+([`surfaces.md` §9.2.1](surfaces.md#921-signing-in-and-the-browser-session)).
+
+**Reader groups do.** An administrator can restrict a source of a workspace to the members of
+one or more reader groups, and from the next query on, a document of that source is readable
+only by them:
+
+```bash
+manicule readers create finance
+manicule readers add finance alice bob          # members of this workspace, by handle or id
+manicule readers grant ledger finance           # the source, as documents name it
+manicule readers list                            # groups, members, and every granted source
+manicule readers revoke ledger finance          # its last grant revoked, everyone reads it again
+```
+
+What that does, precisely:
+
+- **A source with no grant is readable by every reader of the workspace**, which is every
+  source of an installation that granted nothing; such an installation reads exactly as it did
+  before reader groups existed. A source with any grant is readable only by a member of a group
+  it is granted to.
+- **The operator at this machine is not restricted**: the command line, stdio MCP and a served
+  process with `security.auth.mode = none` act with the authority of whoever started the process.
+  Every network caller is, **administrators included** — an administrator who needs to read a
+  restricted source joins a group granted it, and that change is audited. A key nobody owns has no
+  person to put in a group, so it reads only sources with no grant; mint keys for a person
+  (`manicule auth create-key --user HANDLE`) when a program needs to read a restricted source.
+- **It is enforced where the workspace is**: by the store when it hydrates retrieved chunk ids
+  into documents and when it runs the lexical leg's statement, and again on the way out of the
+  service, by a check that reads only the gates each document came back carrying. Never in the
+  vector store, whose schema carries no reader column. A refused document is refused whole, and
+  the refusal names no document.
+- **Counts follow it.** `stats` and `collection_counts` report what the caller may read;
+  `index_status`, which reports the whole index, is an administrator's while any grant is in
+  force; an administrator's `stats` reports the workspace's totals.
+- **Conversations follow it.** While any grant is in force a restricted caller opens only
+  conversations they started, a turn citing a document they may not read is withheld whole, and
+  conversations cannot be shared — a share link is read by whoever holds it, so it can honor no
+  reader set, and links minted earlier stop serving.
+- **Grants are per source, not per page.** A Confluence page's own restrictions are still not
+  read; restrict the source that indexes it, or index it into another workspace.
+
+Content some members must not read belongs either in a source granted only to the people who
+may read it, or in a workspace they are not members of. `doctor` is an operator's diagnostic and
+is not narrowed: its findings can name documents by source id.
 
 ---
 
