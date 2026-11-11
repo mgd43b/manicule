@@ -74,13 +74,13 @@ def _refused_everywhere(settings: Settings) -> None:
 # --- the registry says which types are sensitive ---------------------------------------------
 
 
-def test_only_the_mail_connectors_are_registered_as_sensitive() -> None:
+def test_only_the_mail_and_notes_connectors_are_registered_as_sensitive() -> None:
     from manicule.plugins import discover  # noqa: PLC0415
 
     registry = discover().registry
-    mail = {"gmail", "mbox"}
-    assert registry.sensitive_names(ComponentKind.CONNECTOR) == mail
-    assert not any(record.sensitive for record in registry.records() if record.name not in mail)
+    private = {"gmail", "mbox", "trilium"}
+    assert registry.sensitive_names(ComponentKind.CONNECTOR) == private
+    assert not any(record.sensitive for record in registry.records() if record.name not in private)
 
 
 def test_a_component_is_not_sensitive_unless_it_says_so() -> None:

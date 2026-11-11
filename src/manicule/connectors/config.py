@@ -47,6 +47,8 @@ __all__ = [
     "MBOX_REPRESENTATION_VERSION",
     "REPRESENTATION_VERSION",
     "SNAPSHOT_CONNECTOR_NAME",
+    "TRILIUM_CONNECTOR_NAME",
+    "TRILIUM_REPRESENTATION_VERSION",
     "AuthMethod",
     "ConfluenceConfig",
     "ConfluenceSnapshotConfig",
@@ -57,10 +59,12 @@ __all__ = [
     "GitSiteConfig",
     "GmailConfig",
     "MboxConfig",
+    "TriliumConfig",
     "resolve_credentials",
     "resolve_gmail_client_secret",
     "resolve_gmail_credentials",
     "resolve_label_ids",
+    "resolve_trilium_token",
 ]
 
 CONNECTOR_NAME = "confluence"
@@ -79,6 +83,17 @@ A message's identity is the digest of its bytes (``docs/connectors/mbox.md`` §4
 message can never have changed and one constant stands for all of them. It is part of the scope
 fingerprint, so changing what is delivered discards the watermark and the next sync reads every
 file again.
+"""
+
+TRILIUM_CONNECTOR_NAME = "trilium"
+"""The registered name of the Trilium Notes connector."""
+
+TRILIUM_REPRESENTATION_VERSION = "trilium/1"
+"""What the Trilium connector delivers a note as, folded into every version token.
+
+Part of the scope fingerprint too, so changing how a note becomes a document (the heading
+wrapper, the media types) re-reads every note rather than leaving the old rendering in place
+(``docs/connectors/trilium.md`` §4). Bump the number when the representation changes.
 """
 
 SNAPSHOT_CONNECTOR_NAME = "confluence-snapshot"
@@ -365,6 +380,121 @@ class MboxConfig(BaseModel):
                 "exclude": sorted(self.exclude),
                 "skip_known_message_ids": self.skip_known_message_ids,
                 "representation": MBOX_REPRESENTATION_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
+
+
+class TriliumConfig(BaseModel):
+    """Configuration for :class:`~manicule.connectors.trilium.TriliumConnector`.
+
+    Every other key is refused, which is how the settings that are deliberately absent (a date
+    range, a note-type list, a ``since``) stay absent: a filter evaluated on a full walk and not
+    on a re-walk is the failure ``docs/connectors/gmail.md`` §3 states for labels, and the types
+    worth indexing are a property of the format, not a preference
+    (``docs/connectors/trilium.md`` §1).
+
+    **The token is held as a secret and never has a place in a file that is committed.** It
+    reads every note on the server it was created on, protected-note titles included, whatever
+    ``root_note_ids`` says: the scope is enforced by the connector, not by Trilium (§7).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    base_url: str = Field(
+        min_length=1,
+        description="The Trilium server's root, including any context path: "
+        "``https://notes.example.org`` or ``https://example.org/trilium``. Every request and "
+        "every redirect is checked against this origin, because each carries the token.",
+    )
+    token: SecretStr | None = Field(
+        default=None,
+        description="An ETAPI token (Options, then ETAPI). Resolved from the environment when "
+        "unset: see ``token_env``.",
+    )
+    token_env: str = Field(
+        default="TRILIUM_ETAPI_TOKEN",
+        min_length=1,
+        description="Environment variable consulted when no token is set here. A credential "
+        "in a configuration file is a credential in version control eventually.",
+    )
+    root_note_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=256,
+        description="Notes whose subtrees are indexed. A note is admitted when any of its paths "
+        "to the root passes through one of them. Empty means every note not excluded.",
+    )
+    exclude_labels: tuple[str, ...] = Field(
+        default=("manicule-skip",),
+        max_length=256,
+        description="Label names (without the ``#``). A note carrying one, and every note "
+        "beneath it, is never read. Exclusion wins over ``root_note_ids`` and is judged on every "
+        "path, so a clone escaping an excluded note is excluded too.",
+    )
+    include_archived: bool = Field(
+        default=False,
+        description="Whether to index notes labeled ``#archived``. Archiving is how a person "
+        "says a note is not part of what they look at, so the default leaves them out.",
+    )
+    max_notes: int = Field(
+        default=100_000,
+        ge=1,
+        description="The most notes one sweep may return. ETAPI has no cursor, so a response "
+        "with exactly this many is presumed truncated and refused rather than trusted: a short "
+        "inventory would delete the notes it missed (docs/connectors/trilium.md §6.1).",
+    )
+    request_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    max_retries: int = Field(
+        default=5,
+        ge=0,
+        description="Attempts after the first for a throttled, failed or interrupted request.",
+    )
+    max_retry_after_seconds: float = Field(
+        default=120.0,
+        gt=0.0,
+        description="Longest single pause honored from a ``Retry-After`` header.",
+    )
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str) -> str:
+        return normalize_base_url(value)
+
+    @field_validator("root_note_ids", "exclude_labels")
+    @classmethod
+    def _names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(dict.fromkeys(value.strip().lstrip("#") for value in values))
+        if any(not value for value in cleaned):
+            msg = "a note id or label name must not be blank"
+            raise ValueError(msg)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _token_not_blank(self) -> Self:
+        if self.token is not None and not self.token.get_secret_value():
+            msg = (
+                f"token is set to an empty string. Leave it unset to read ${self.token_env}, "
+                f"or give it a value."
+            )
+            raise ValueError(msg)
+        return self
+
+    def scope_fingerprint(self, source_scope: str) -> str:
+        """The scope a stored watermark and a completed inventory are valid for.
+
+        Everything that changes which notes discovery yields is in it, so editing any option
+        makes the next run a new scope and a note newly outside it is retired by the inventory
+        rather than left indexed. The token is not in it, so rotating one is not a new source.
+        """
+        material = json.dumps(
+            {
+                "source_scope": source_scope,
+                "root_note_ids": sorted(self.root_note_ids),
+                "exclude_labels": sorted(self.exclude_labels),
+                "include_archived": self.include_archived,
+                "representation": TRILIUM_REPRESENTATION_VERSION,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1228,6 +1358,33 @@ def resolve_gmail_credentials(
 def _gmail_where(instance: str) -> str:
     """The table a Gmail setting belongs in, for the message that asks for it."""
     return f"[connectors.{instance}.options]" if instance else 'plugins.config."connector.gmail"'
+
+
+def resolve_trilium_token(
+    config: TriliumConfig, environ: Mapping[str, str] | None = None, *, instance: str = ""
+) -> TriliumConfig:
+    """Fill in the ETAPI token from the environment, refusing a configuration that has none.
+
+    Runs in the factory, before the connector is constructed, on the principle
+    :func:`resolve_credentials` states. An explicitly configured token is never overwritten by
+    an environment variable, and a blank variable counts as unset.
+
+    Raises:
+        ConfigError: No token is configured or in the environment. Names the setting and the
+            variable, never a value.
+    """
+    env = os.environ if environ is None else environ
+    token = config.token or _secret(env.get(config.token_env))
+    if token is None:
+        where = (
+            f"[connectors.{instance}.options]" if instance else 'plugins.config."connector.trilium"'
+        )
+        msg = (
+            f"the Trilium connector needs an ETAPI token. Set token in {where}, or put it in "
+            f"${config.token_env}. Create one in Trilium under Options, then ETAPI."
+        )
+        raise ConfigError(msg)
+    return config.model_copy(update={"token": token})
 
 
 def _secret(value: str | None) -> SecretStr | None:
