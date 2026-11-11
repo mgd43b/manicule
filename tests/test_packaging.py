@@ -102,6 +102,36 @@ def _extras(pyproject: dict[str, Any]) -> dict[str, list[str]]:
     return cast(dict[str, list[str]], _project(pyproject)["optional-dependencies"])
 
 
+def test_typer_is_held_below_the_release_the_cli_cannot_build_against(
+    pyproject: dict[str, Any],
+) -> None:
+    """The `serve` extra stops short of Typer 0.29, which `manicule.cli.main` cannot build on.
+
+    0.29 made `type_descriptor` a required argument of `typer.core.TyperOption`, and the shared
+    `--json` and `--workspace` options are built with that constructor, so the console script
+    dies with a `TypeError` before printing anything. Nothing in the test suite runs against
+    0.29: the lock pins 0.27.3. What reaches 0.29 is an installation that resolves the newest
+    Typer, which is `pip install manicule` and the `dist` job, and a missing ceiling is how that
+    job went red on a pull request that did not touch the CLI. This is the part that can be
+    checked from the tree. Dropping the ceiling means moving the shared options to a public
+    mechanism first (see the comment beside the requirement in `pyproject.toml`).
+    """
+    (typer,) = [
+        requirement
+        for requirement in map(Requirement, _extras(pyproject)["serve"])
+        if requirement.name == "typer"
+    ]
+
+    with (REPO_ROOT / "uv.lock").open("rb") as handle:
+        packages = cast(list[dict[str, Any]], tomllib.load(handle)["package"])
+    (locked,) = [package["version"] for package in packages if package["name"] == "typer"]
+
+    assert typer.specifier.contains(locked), "the version the lock pins must stay allowed"
+    assert not typer.specifier.contains("0.29.0"), (
+        "typer 0.29 requires a type_descriptor that manicule.cli.main does not pass"
+    )
+
+
 def test_all_extra_is_every_extra_but_the_heavyweights(pyproject: dict[str, Any]) -> None:
     """`all` covers every extra except the two that download gigabytes."""
     extras = _extras(pyproject)
