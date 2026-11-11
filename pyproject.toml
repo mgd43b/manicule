@@ -182,9 +182,18 @@ browser-auth = [
 serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #12 — the browser UI.
   # Typer derives the command line from type hints, so the signature of a service call and
   # the shape of the command that reaches it cannot drift. MIT.
-  # Capped below 0.29, which vendors Click and makes `TyperOption(...)` require a
-  # `type_descriptor`: `cli/main.py` builds the shared `--json`/`--workspace` options with it,
-  # so `manicule --help` raises on a fresh install that resolves 0.29. Lift the cap with the port.
+  #
+  # The ceiling is 0.29, exclusive, and it is a ceiling rather than a preference. As of 0.29.0
+  # Typer dropped its dependency on Click and carries a private copy (`typer._click`), and with it
+  # changed the constructor of `typer.core.TyperOption`: `type_descriptor`, a `typer._coercion` object, is
+  # now a required argument. `manicule.cli.main` builds the options every command shares
+  # (`--json`, `--workspace`) with that constructor, so against 0.29 the console script dies
+  # with a `TypeError` before it prints anything. `manicule.cli.shell` also reaches into
+  # `typer._completion_shared`. Supporting both would mean building a private object of each
+  # internals, which is the next release's breakage written in advance. The lock pins 0.27.3 and
+  # passes; what the ceiling stands between is an *installation* that resolved the newest Typer
+  # (the `dist` job in ci.yml, and anybody running `pip install manicule`). Lift it by moving the
+  # shared options to a public mechanism, not by teaching this constructor a second shape.
   "typer>=0.15,<0.29",
   # Rich renders the tables, progress and diagnostics. MIT.
   "rich>=13.9",
