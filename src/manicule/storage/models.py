@@ -1627,6 +1627,30 @@ class IndexState(Base):
     )
 
 
+class VectorReuseLedger(Base):
+    """How many vectors each workspace copied from another instead of embedding them.
+
+    The operator's count for ``docs/storage.md`` §6.2.6, and the only place the fact is
+    recorded. One row per *receiving* workspace, keyed by it and by nothing else: the workspace
+    that lent is deliberately not recorded, because "which other tenant already held this
+    text" is exactly what reuse must not let anybody learn, and a column naming it would be a
+    record of it. Read only by a surface that has established the caller is the operator at
+    this machine (:meth:`manicule.app.service.ApplicationService.stats`).
+    """
+
+    __tablename__ = "vector_reuse_ledger"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    vectors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    __table_args__ = (CheckConstraint("vectors >= 0", name="vectors_is_not_negative"),)
+
+
 class CorpusRevision(Base):
     """Workspace-local revision moved by triggers on authoritative corpus mutations."""
 
