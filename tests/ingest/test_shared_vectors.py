@@ -11,11 +11,11 @@ and nothing else of it.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 
-from manicule.core.embedding import VectorState, vector_checksum
+from manicule.core.embedding import StoredVector, VectorState, vector_checksum
 from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import document_id
 from manicule.ingest.embedding import EmbeddingWork, embed_or_reuse
@@ -301,3 +301,38 @@ async def test_borrowed_vectors_are_placed_where_their_chunks_are() -> None:
         )
     assert sum(model.batches) == len(chunks) - len(lent)
     assert work.embedded == len(chunks)
+
+
+class MisreportingStore(fakes.MemoryVectors):
+    """A donor that hands back a vector beside every verdict, readable or not.
+
+    No shipped store does: they return a vector only with a readable verdict. A plugin store is
+    not bound by that except through its contract, so the lender reads the verdict, not the
+    presence of numbers.
+    """
+
+    def __init__(self, state: VectorState) -> None:
+        super().__init__()
+        self.state = state
+
+    @override
+    async def stored_vectors(self, chunks: Sequence[Chunk]) -> dict[str, StoredVector]:
+        return {
+            chunk.id: StoredVector(state=self.state, vector=(1.0, 0.0, 0.0, 0.0, 0.0))
+            for chunk in chunks
+        }
+
+
+@pytest.mark.parametrize("state", [VectorState.STALE, VectorState.CORRUPT])
+async def test_only_a_readable_verdict_is_lent(state: VectorState) -> None:
+    model = fakes.CountingEmbedder()
+    donor = MisreportingStore(state)
+    await donor.ensure_ready(model.fingerprint)
+    shared = SharedVectors(
+        StaticDonors([Donor(workspace="alpha", vectors=donor)]), fingerprint=model.fingerprint
+    )
+    pipeline, store, _, _ = await _workspace("beta")
+    await pipeline.run(fakes.DictConnector(PAGES, name=SOURCE))
+    chunks = next(iter(store.chunks.values()))
+
+    assert await shared.lend(chunks, source=SOURCE, source_id="page-0") == {}
