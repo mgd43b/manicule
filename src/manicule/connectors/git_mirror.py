@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import os
 import shutil
 import signal
@@ -49,13 +50,22 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 __all__ = [
-    "TIP_REF",
     "GitFetchError",
     "GitMirror",
+    "tip_ref",
 ]
 
-TIP_REF: Final = "refs/manicule/tip"
-"""The ref every fetch lands on, so the reader can name the commit without knowing the revision."""
+
+def tip_ref(revision: str) -> str:
+    """The ref a fetch of ``revision`` lands on, so the reader can name the commit it got.
+
+    **One ref per revision, not one per mirror.** Two sources may name one remote and share its
+    mirror, and if both fetched into one ref the later fetch would silently replace the commit the
+    earlier source was about to resolve: a source indexing ``main`` would index ``develop``'s
+    tree under its own name. The name is a digest, so nothing an operator typed becomes a ref.
+    """
+    return f"refs/manicule/{hashlib.blake2b(revision.encode(), digest_size=8).hexdigest()}"
+
 
 _DEFAULT_TIMEOUT_S: Final = 300.0
 _STDERR_LIMIT: Final = 8 * 1024
@@ -113,7 +123,7 @@ class GitMirror:
         return self._directory
 
     async def refresh(self, revision: str) -> str:
-        """Fetch ``revision`` into :data:`TIP_REF` and return that ref's name.
+        """Fetch ``revision`` into its own ref (:func:`tip_ref`) and return that ref's name.
 
         Serialized, because two fetches into one repository fight over its locks and a source
         and a scheduled reconciliation can ask at once.
@@ -134,7 +144,7 @@ class GitMirror:
         async with self._lock:
             await self._initialize(executable)
             await self._fetch(executable, revision)
-        return TIP_REF
+        return tip_ref(revision)
 
     async def _initialize(self, executable: str) -> None:
         head = self._directory / "HEAD"
@@ -160,7 +170,7 @@ class GitMirror:
                 "--no-write-fetch-head",
                 "--no-recurse-submodules",
                 self._url,
-                f"+{revision}:{TIP_REF}",
+                f"+{revision}:{tip_ref(revision)}",
             ],
             what=f"fetching revision {revision!r} from {self._url}",
         )
@@ -246,6 +256,11 @@ class GitMirror:
             hint = " Check that the token in token_env can read this repository."
         elif "not found" in lowered or "couldn't find remote ref" in lowered:
             hint = " Check the repository address and the revision."
+        else:
+            hint = (
+                f" If the mirror is damaged, delete {self._directory}: it is a cache, and the next "
+                f"sync fetches it again."
+            )
         return f": {text[:_MESSAGE_LIMIT]}.{hint}"
 
 

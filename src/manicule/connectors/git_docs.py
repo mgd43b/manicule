@@ -52,7 +52,12 @@ from urllib.parse import quote
 from manicule.connectors import bmad_layout, globs
 from manicule.connectors.config import GitDocsConfig
 from manicule.connectors.git_mirror import GitMirror
-from manicule.connectors.git_reader import GitSourceError, GitTreeEntry, PinnedGitReader
+from manicule.connectors.git_reader import (
+    GitSourceError,
+    GitTreeEntry,
+    PinnedGitReader,
+    path_below,
+)
 from manicule.connectors.git_remote import is_remote, mirror_directory
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.errors import ConfigError
@@ -114,18 +119,21 @@ class _Inventory:
     watermark: Watermark
 
 
-def _token(entry: GitTreeEntry, facts: bmad_layout.BmadFacts | None) -> str:
+def _token(entry: GitTreeEntry, facts: bmad_layout.BmadFacts | None, address: str) -> str:
     """What makes this document different from itself an hour ago.
 
-    The blob and the facts read from its path, and the policy so that changing how either is
-    derived re-ingests rather than leaving documents described by the old rules. **Not** the
-    commit, and not the address: both move with every push, and a token that moved with them would
-    make every commit re-embed the whole corpus.
+    The blob, the facts read from its path, the policy, and the **template** its citation address
+    is made from, so that changing how any of them is derived re-ingests rather than leaving
+    documents described by the old rules or cited at an address nobody now configures. **Not** the
+    commit: it moves with every push, and a token that moved with it would make every commit
+    re-embed the whole corpus. (The address itself contains the commit, which is why the template
+    and not the address is what goes in.)
     """
     material = json.dumps(
         {
             "blob": entry.object_id,
             "policy": _POLICY,
+            "address": address,
             "facts": None
             if facts is None
             else [facts.layout, facts.kind, facts.initiative, facts.epic],
@@ -136,24 +144,15 @@ def _token(entry: GitTreeEntry, facts: bmad_layout.BmadFacts | None) -> str:
     return hashlib.blake2b(material, digest_size=20).hexdigest()
 
 
-def _relative(path: str, root: str) -> str:
-    if root == ".":
-        return path
-    prefix = f"{root}/"
-    if not path.startswith(prefix):
-        raise GitSourceError("Git returned a path outside the configured content root")
-    return path[len(prefix) :]
-
-
 class GitDocsConnector:
     """Index the Markdown and text in a Git repository, read from one commit at a time."""
 
-    full_inventory_authority = "direct_current_content"
-
-    # Deliberately **not** ``enumerates_full_inventory``. A run that finds the commit it last
-    # synced yields nothing at all, and a manifest that is empty because nothing changed must
-    # never be read as "the whole source is empty". The connector says which kind of run it just
-    # had through :attr:`walked_full_inventory`, after the fact, as the mail connectors do.
+    # Deliberately **not** ``enumerates_full_inventory``, and so no ``full_inventory_authority``
+    # either: both describe a manifest that is the whole source, and a quiet run's is empty. A run
+    # that finds the commit it last synced yields nothing at all, and a manifest that is empty
+    # because nothing changed must never be read as "the whole source is empty". The connector
+    # says which kind of run it just had through :attr:`walked_full_inventory`, after the fact, as
+    # the mail connectors do.
 
     def __init__(
         self,
@@ -322,7 +321,7 @@ class GitDocsConnector:
         oversized = unsupported = 0
         for entry in entries:
             if not entry.ordinary_blob or not globs.admitted(
-                _relative(entry.path, self._config.content_root),
+                path_below(entry.path, self._config.content_root),
                 include=self._config.include,
                 exclude=self._config.exclude,
             ):
@@ -349,7 +348,7 @@ class GitDocsConnector:
                     title=PurePosixPath(entry.path).stem,
                     section_path=tuple(parts[:-1]),
                     facts=facts,
-                    version_token=_token(entry, facts),
+                    version_token=_token(entry, facts, self._address_template() or ""),
                 )
             )
         if oversized or unsupported:
@@ -378,7 +377,6 @@ class GitDocsConnector:
                 value=reader.commit,
                 observed_at=datetime.now(UTC),
                 metadata={
-                    "full_inventory_authority": self.full_inventory_authority,
                     "policy": _POLICY,
                     "scope": self.scope_fingerprint,
                     "documents": len(documents),
@@ -397,11 +395,17 @@ class GitDocsConnector:
             return detected
         return frozenset({setting})
 
+    def _address_template(self) -> str | None:
+        """The citation address with ``{commit}`` and ``{path}`` still in it, or ``None``."""
+        if self._config.blob_url is not None:
+            return self._config.blob_url
+        if self._remote:
+            return f"{self._config.repository.removesuffix('.git')}/blob/{{commit}}/{{path}}"
+        return None
+
     def address_of(self, commit: str, path: str) -> str:
         """Where a reader opens ``path`` as it was at ``commit``."""
-        template = self._config.blob_url
-        if template is None and self._remote:
-            template = f"{self._config.repository.removesuffix('.git')}/blob/{{commit}}/{{path}}"
+        template = self._address_template()
         if template is not None:
             quoted = quote(path, safe="/")
             return template.replace("{commit}", commit).replace("{path}", quoted)
@@ -442,6 +446,9 @@ class GitDocsConnector:
             if self._unchanged_since(watermark, commit):
                 await reader.aclose()
                 inventory = None
+                # Cleared, so a reconciliation later in this task cannot reuse an inventory an
+                # earlier run in the same task pinned at some other commit.
+                self._run_inventory.set(None)
             else:
                 inventory = await self._remember(await self._list(reader))
                 self._run_inventory.set(inventory)

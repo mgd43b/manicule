@@ -68,7 +68,9 @@ _PLANNING: Final = "planning-artifacts"
 _IMPLEMENTATION: Final = "implementation-artifacts"
 _INITIATIVE: Final = "initiative-"
 _EPIC: Final = "epic-"
-_STORY_FILE: Final = re.compile(r"^(?P<epic>\d+)-\d+(?:-[^/]+)?\.md$")
+_STORY_FILE: Final = re.compile(r"^(?P<epic>\d{1,3})-\d{1,3}(?:-[^/]+)?\.md$")
+"""``<epic>-<story>-<slug>``. Bounded to three digits so a dated note (``2026-01-standup.md``) in the
+same folder is not read as the story of epic 2026."""
 
 _PLANNING_KINDS: Final = (
     ("prd", "prd"),

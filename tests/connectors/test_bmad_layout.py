@@ -103,6 +103,7 @@ V6_TREE = (
         ("_bmad-output/planning-artifacts/notes.md", "planning", None),
         ("_bmad-output/implementation-artifacts/1-2-user-auth.md", "story", "1"),
         ("_bmad-output/implementation-artifacts/stories/story-checkout.md", "story", None),
+        ("_bmad-output/implementation-artifacts/2026-01-standup.md", "implementation", None),
         ("_bmad-output/implementation-artifacts/epic-1-retro-2026-01-01.md", "retrospective", None),
     ],
 )

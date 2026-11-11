@@ -18,6 +18,7 @@ from manicule.connectors.git_reader import (
     GitSourceError,
     GitTreeEntry,
     PinnedGitReader,
+    path_below,
 )
 from manicule.connectors.site_routes import (
     MAX_MANIFEST_BYTES,
@@ -73,15 +74,6 @@ def _media_type(record: SiteRouteRecord) -> str:
         ".mdx": "text/mdx",
         ".html": "text/html",
     }.get(PurePosixPath(record.source).suffix.lower(), "application/octet-stream")
-
-
-def _relative(path: str, root: str) -> str:
-    if root == ".":
-        return path
-    prefix = f"{root}/"
-    if not path.startswith(prefix):
-        raise GitSourceError("Git returned a path outside the configured content root")
-    return path[len(prefix) :]
 
 
 def _token(entry: GitTreeEntry, record: SiteRouteRecord) -> str:
@@ -202,7 +194,7 @@ class GitSiteConnector:
             for entry in ordinary
             if entry.path != self._config.route_manifest
             and globs.admitted(
-                _relative(entry.path, self._config.content_root),
+                path_below(entry.path, self._config.content_root),
                 include=self._config.include,
                 exclude=self._config.exclude,
             )

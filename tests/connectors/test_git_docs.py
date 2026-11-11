@@ -414,6 +414,45 @@ async def test_a_deleted_document_leaves_the_index_through_reconciliation(reposi
         await connector.teardown()
 
 
+async def test_a_quiet_run_does_not_leave_an_earlier_inventory_for_reconciliation(
+    repository: Path,
+) -> None:
+    """A reconciliation reuses the inventory its own task pinned, so a quiet run, which pins
+    none, must clear what an earlier run in that task left, or the pass reads a stale commit."""
+    connector = GitDocsConnector(config_for(repository))
+    try:
+        await discovered(connector)  # this task now holds an inventory at the first commit
+        (repository / "docs" / "guide.md").unlink()
+        commit(repository, "drop the guide")
+        await asyncio.create_task(identities(connector))  # another task indexes the new commit
+        stored = connector.watermark
+        assert stored is not None
+
+        assert [doc async for doc in connector.discover(stored)] == []
+
+        assert "docs/guide.md" not in [item async for item in connector.reconcile()]
+    finally:
+        await connector.teardown()
+
+
+async def test_changing_the_citation_address_re_ingests_documents_that_did_not_change(
+    repository: Path,
+) -> None:
+    """The token holds the address *template*: otherwise correcting a wrong ``blob_url`` would
+    leave every stored citation at the old address until its document next changed."""
+    old = GitDocsConnector(config_for(repository, blob_url="https://a.example.org/{commit}/{path}"))
+    new = GitDocsConnector(config_for(repository, blob_url="https://b.example.org/{commit}/{path}"))
+    try:
+        before = {doc.source_id: doc.version_token for doc in await discovered(old)}
+        after = {doc.source_id: doc.version_token for doc in await discovered(new)}
+
+        assert before.keys() == after.keys()
+        assert all(before[path] != after[path] for path in before)
+    finally:
+        await old.teardown()
+        await new.teardown()
+
+
 async def test_a_pass_after_a_restart_enumerates_the_current_revision(repository: Path) -> None:
     connector = GitDocsConnector(config_for(repository))
     try:

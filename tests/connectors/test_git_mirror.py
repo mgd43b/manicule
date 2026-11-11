@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from manicule.connectors.git_mirror import TIP_REF, GitFetchError, GitMirror
+from manicule.connectors.git_mirror import GitFetchError, GitMirror, tip_ref
 from manicule.connectors.git_reader import PinnedGitReader
 from manicule.connectors.git_remote import (
     is_remote,
@@ -83,14 +83,14 @@ async def test_a_refresh_brings_the_tip_and_a_second_one_brings_the_next_commit(
 
     ref = await mirror.refresh("HEAD")
     first = git(mirror.directory, "rev-parse", ref)
-    assert ref == TIP_REF
+    assert ref == tip_ref("HEAD")
     assert first == git(origin, "rev-parse", "HEAD")
 
     (origin / "guide.md").write_text("# Guide, revised\n", encoding="utf-8")
     second_commit = commit(origin, "second")
     await mirror.refresh("HEAD")
 
-    assert git(mirror.directory, "rev-parse", TIP_REF) == second_commit != first
+    assert git(mirror.directory, "rev-parse", tip_ref("HEAD")) == second_commit != first
 
 
 async def test_the_reader_pins_what_the_mirror_fetched(origin: Path, tmp_path: Path) -> None:
@@ -112,7 +112,7 @@ async def test_history_is_not_fetched(origin: Path, tmp_path: Path) -> None:
 
     await mirror.refresh("HEAD")
 
-    assert git(mirror.directory, "rev-list", "--count", TIP_REF) == "1"
+    assert git(mirror.directory, "rev-list", "--count", tip_ref("HEAD")) == "1"
 
 
 async def test_the_mirror_holds_no_address_and_no_credential(origin: Path, tmp_path: Path) -> None:
@@ -248,7 +248,27 @@ async def test_two_sources_refreshing_one_mirror_at_once_both_succeed(
 
     await asyncio.gather(*(m.refresh("HEAD") for m in (first, second, first, second)))
 
-    assert git(first.directory, "rev-parse", TIP_REF) == git(origin, "rev-parse", "HEAD")
+    assert git(first.directory, "rev-parse", tip_ref("HEAD")) == git(origin, "rev-parse", "HEAD")
+
+
+async def test_two_sources_on_one_remote_with_different_revisions_keep_their_own_commits(
+    origin: Path, tmp_path: Path
+) -> None:
+    """They share a mirror, and if they shared a ref the later fetch would replace the commit the
+    earlier source was about to read: a source indexing ``main`` would index ``develop``."""
+    default = git(origin, "rev-parse", "--abbrev-ref", "HEAD")
+    git(origin, "checkout", "--quiet", "-b", "develop")
+    (origin / "guide.md").write_text("# On develop\n", encoding="utf-8")
+    on_develop = commit(origin, "develop")
+    main = mirror_of(origin, tmp_path)
+    develop = mirror_of(origin, tmp_path)
+
+    main_ref = await main.refresh(default)
+    develop_ref = await develop.refresh("develop")
+
+    assert main_ref != develop_ref
+    assert git(main.directory, "rev-parse", develop_ref) == on_develop
+    assert git(main.directory, "rev-parse", main_ref) != on_develop
 
 
 async def test_a_revision_that_is_not_a_ref_is_refused_before_git_runs(

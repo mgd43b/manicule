@@ -99,6 +99,12 @@ ref of its own and handed to the reader as a path and a ref name.
   disabled and nothing can prompt. SSH is absent on purpose: it needs a key file and a trusted
   `known_hosts`, which is two more things to provision into a container and two more ways for a
   fetch to hang.
+- **One ref per revision.** Two sources on one remote share its mirror and may name different
+  revisions, so each lands in a ref of its own (`refs/manicule/<digest of the revision>`). One
+  shared ref would let the later fetch replace the commit the earlier source was about to read.
+- **A private certificate authority** is trusted through the environment, not through Git's own
+  configuration, which is deliberately not read: set `SSL_CERT_FILE` (or `SSL_CERT_DIR`) for the
+  manicule process, and Git's TLS library honors it.
 - **A fetch is bounded.** `fetch_timeout_s` stops the whole process tree, not only its parent, so
   `git-remote-https` cannot outlive the sync that started it.
 
@@ -117,7 +123,8 @@ checkout while a sync runs cannot hand it half of two states.
 
 - **Identity is the path from the repository root.** A rename is a deletion and an addition, which
   is what `reconcile` and content-hash deduplication are for.
-- **The change token is the blob's object id** (plus the BMAD facts and the policy version, §6). It
+- **The change token is the blob's object id** (plus the BMAD facts, the policy version and the
+  citation address's template, §5 and §6). It
   is **not** the commit and not the address, both of which move with every push; a token that did
   would re-embed the whole corpus each time anybody touched a line of code. A commit that changed no
   document changes no token, and nothing is fetched.
@@ -129,7 +136,8 @@ checkout while a sync runs cannot hand it half of two states.
   nothing when nothing moved. Any other commit lists the admitted tree, and each document's blob-id
   token decides whether its bytes are read. The rules are compared as well as the commit so that
   a release that changes how a document is described re-ingests at a commit nobody has pushed
-  to. A diff against the previous commit would list less and was not used: a depth-1 mirror
+  to, and the token covers the citation address's template (never the address itself, which holds
+  the commit), so correcting `blob_url` re-cites documents that did not change. A diff against the previous commit would list less and was not used: a depth-1 mirror
   usually no longer has the previous commit.
 - **An empty manifest is not an empty source.** Because a quiet run lists nothing, the connector
   does not declare that its manifests are full inventories. It reports instead, after each run,

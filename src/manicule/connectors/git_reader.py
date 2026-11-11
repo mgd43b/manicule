@@ -22,6 +22,7 @@ __all__ = [
     "GitTreeEntry",
     "PinnedGitReader",
     "hardened_git_environment",
+    "path_below",
 ]
 
 _OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -44,6 +45,21 @@ class GitObjectMissingError(BodyUnavailableError):
 
 class GitBlobTooLargeError(GitSourceError):
     """A blob exceeded the configured ceiling before its body was requested."""
+
+
+def path_below(path: str, root: str) -> str:
+    """``path`` relative to the content root ``root`` (``"."`` is the repository root).
+
+    Raises:
+        GitSourceError: ``path`` is not under ``root``, which means Git returned something other
+            than what was asked for.
+    """
+    if root == ".":
+        return path
+    prefix = f"{root}/"
+    if not path.startswith(prefix):
+        raise GitSourceError("Git returned a path outside the configured content root")
+    return path[len(prefix) :]
 
 
 class _OutputLimitError(RuntimeError):
