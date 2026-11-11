@@ -1417,9 +1417,11 @@ the right dimension, finite, and match its recorded checksum. The lender takes a
 from a verdict of `readable`, and only from a store whose recorded fingerprint `matches` the
 borrowing workspace's embedder (clause 1). It checks that clause itself rather than trusting
 whoever chose the donors, because a store classifies its rows against *its own* fingerprint, so
-a store built by another model would find every one of them readable. No store gains a method,
-so every backend, plugin ones included, lends through the `stored_vectors` contract it already
-passes.
+a store built by another model would find every one of them readable. No store gains a method:
+the lender needs only `stored_vectors` and `fingerprint`. A backend can lend when the runtime can
+open another workspace's handle on it, which means the embedded backend's published directory or
+any store implementing `MultiWorkspaceVectorStore`, as Qdrant does. A plugin store that
+implements neither is never a donor, and its workspaces embed exactly as before.
 
 What follows from keying on the document in the other workspace's terms:
 
@@ -1447,7 +1449,9 @@ each other workspace's published LanceDB generation read-only, as a spanning sea
 declaration so the identities it derives are the ones that workspace recorded. On Qdrant it uses
 `open_workspace`, which shares the client and never prepares a collection. A workspace with no
 index, one built by another model, or one whose handle cannot be opened is skipped, never
-refused, and a donor that fails mid-read is skipped with a warning. The model is still there.
+refused, and so is a workspace whose lookup fails for any reason. A failure is logged at
+warning on the operator's log and never becomes the borrowing document's status. The model is
+still there. The ledger counts a document's copied vectors only once that document commits.
 
 **The copy is written as a fresh vector.** The borrowing workspace stores the vector through its
 own `upsert`, under its own chunk id, publication and identity, and computes its own checksum

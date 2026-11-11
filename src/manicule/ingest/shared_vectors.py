@@ -19,8 +19,11 @@ document and the other workspace's own store is asked
 condition — the fingerprint, the embedding input, a readable vector whose recorded checksum
 still describes it — is then decided by the rule that store already applies to itself
 (:func:`~manicule.core.embedding.classify_stored_vector`), and nothing about it is written
-twice. No store gains a method, so every backend, plugin ones included, lends through the
-contract it already passes.
+twice. No store gains a method: the lender needs only ``stored_vectors`` and ``fingerprint``.
+Whether a backend can lend depends on whether the runtime can open another workspace's handle on
+it — the embedded backend's published directory, or any store implementing
+:class:`~manicule.core.protocols.MultiWorkspaceVectorStore`, as Qdrant does. A plugin store that
+implements neither is never a donor, and its workspaces embed as they always did.
 
 What comes back is a vector and only a vector. Nothing of the other workspace's rows — no
 chunk, no id, no text — reaches this one: the borrowing workspace writes its own chunk under
@@ -135,7 +138,15 @@ class SharedVectors:
         remaining: list[Chunk] = list(chunks)
         if not remaining:
             return found
-        for donor in await self._donors.donors(source=source, source_id=source_id):
+        try:
+            donors = await self._donors.donors(source=source, source_id=source_id)
+        except Exception as exc:  # noqa: BLE001 - another workspace's state is not this document's
+            _LOG.warning(
+                "could not find other workspaces' vectors for reuse; embedding instead: %s",
+                type(exc).__name__,
+            )
+            return found
+        for donor in donors:
             if not remaining:
                 break
             try:
@@ -166,27 +177,45 @@ class SharedVectors:
                 if verdict is not None and verdict.is_reusable:
                     found[chunk.id] = verdict.vector
             remaining = [chunk for chunk in remaining if chunk.id not in found]
-        if found and self._ledger is not None:
-            try:
-                await self._ledger.record(len(found))
-            except Exception as exc:  # noqa: BLE001 - accounting must not fail an ingest
-                _LOG.warning(
-                    "could not record vectors reused across workspaces: %s", type(exc).__name__
-                )
         return found
 
+    async def record(self, vectors: int) -> None:
+        """Add ``vectors`` to the operator's ledger, never failing the ingest that copied them."""
+        if vectors <= 0 or self._ledger is None:
+            return
+        try:
+            await self._ledger.record(vectors)
+        except Exception as exc:  # noqa: BLE001 - accounting must not fail an ingest
+            _LOG.warning(
+                "could not record vectors reused across workspaces: %s", type(exc).__name__
+            )
 
-@dataclass(frozen=True, slots=True)
+
+@dataclass(slots=True)
 class DocumentLender:
-    """:class:`SharedVectors` bound to one document, as :func:`embed_or_reuse` asks for it."""
+    """:class:`SharedVectors` bound to one document, as :func:`embed_or_reuse` asks for it.
+
+    It remembers how many vectors it lent, and the pipeline settles that count into
+    the operator's ledger only once the document has committed. A document that is demoted or
+    superseded after borrowing used no copied vector, and counting it would report passes saved
+    that a retry then spends.
+    """
 
     shared: SharedVectors
     source: str
     source_id: str
+    lent: int = 0
 
     async def lend(self, chunks: Sequence[Chunk]) -> Mapping[str, Vector]:
         """See :meth:`SharedVectors.lend`."""
-        return await self.shared.lend(chunks, source=self.source, source_id=self.source_id)
+        found = await self.shared.lend(chunks, source=self.source, source_id=self.source_id)
+        self.lent += len(found)
+        return found
+
+    async def settle(self) -> None:
+        """Record what this document borrowed, once it is committed. Idempotent."""
+        lent, self.lent = self.lent, 0
+        await self.shared.record(lent)
 
 
 __all__ = ["BorrowLedger", "DocumentLender", "Donor", "Donors", "SharedVectors"]

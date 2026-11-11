@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import secrets
 import shutil
@@ -132,6 +133,8 @@ if TYPE_CHECKING:
     from manicule.storage.source_lifecycle import ResetPreparation
     from manicule.storage.vector_migration import VectorMigration
     from manicule.storage.vectors import LanceVectorStore, PublishedLanceVectorStore
+
+_LOG = logging.getLogger(__name__)
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -2694,6 +2697,18 @@ class _Keys:
             return _key_summary(row)
 
 
+def _recorded_matches(recorded: str | None, fingerprint: EmbedFingerprint) -> bool:
+    """Whether a recorded embedding is ``fingerprint``'s. An unreadable record is not."""
+    from manicule.core.embedding import EmbedFingerprint as Fingerprint  # noqa: PLC0415
+
+    if recorded is None:
+        return False
+    try:
+        return Fingerprint.model_validate_json(recorded).matches(fingerprint)
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimeDonors:
     """The other workspaces of this data directory that may lend vectors, asked when needed.
@@ -2715,9 +2730,9 @@ class _RuntimeDonors:
 class _VectorReuseLedger:
     """The operator's count of vectors this workspace copied from another one.
 
-    Satisfies :class:`~manicule.ingest.shared_vectors.BorrowLedger`. One upsert per document
-    that borrowed anything, in the engine's writer queue like every other write here. It names
-    the receiving workspace and nothing else (``docs/storage.md`` §6.2.6).
+    Satisfies :class:`~manicule.ingest.shared_vectors.BorrowLedger`. One upsert per committed
+    document that borrowed anything, in the engine's writer queue like every other write here.
+    It names the receiving workspace and nothing else (``docs/storage.md`` §6.2.6).
     """
 
     def __init__(self, runtime: Runtime) -> None:
@@ -2951,7 +2966,6 @@ class _Workspaces:
         """
         from sqlalchemy import select  # noqa: PLC0415
 
-        from manicule.core.embedding import EmbedFingerprint as Fingerprint  # noqa: PLC0415
         from manicule.core.ids import document_id  # noqa: PLC0415
         from manicule.ingest.shared_vectors import Donor as Lending  # noqa: PLC0415
         from manicule.storage import models  # noqa: PLC0415
@@ -2962,9 +2976,7 @@ class _Workspaces:
             eligible = {
                 document_id(name, source, source_id): name
                 for name, (recorded, _namespace, _epoch) in known.items()
-                if name != runtime.workspace
-                and recorded is not None
-                and Fingerprint.model_validate_json(recorded).matches(fingerprint)
+                if name != runtime.workspace and _recorded_matches(recorded, fingerprint)
             }
             if not eligible:
                 return []
@@ -2988,7 +3000,11 @@ class _Workspaces:
                         middleware=middleware,
                         cache=self._donor_vectors,
                     )
-                except (ConfigError, VectorStoreStateError, FingerprintMismatchError):
+                except Exception as exc:  # noqa: BLE001 - a donor that cannot be opened lends nothing
+                    _LOG.warning(
+                        "skipped another workspace as a source of reusable vectors: %s",
+                        type(exc).__name__,
+                    )
                     continue
                 found.append(Lending(workspace=name, vectors=vectors))
             return found

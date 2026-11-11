@@ -4237,6 +4237,11 @@ class IngestPipeline:
             # shares while they run would serialize a sweep against a concurrent sync on work
             # neither of them needs the model for.
             previous = await self._previous_inputs(document, existing)
+            lender = (
+                None
+                if self._shared_vectors is None
+                else self._shared_vectors.for_document(document.source, document.source_id)
+            )
             with self._timings.timing(Stage.EMBED):
                 vectors, work = await embed_or_reuse(
                     self._embedder,
@@ -4249,11 +4254,7 @@ class IngestPipeline:
                     lock=self._embedding,
                     reuse=reuse_vectors,
                     timings=self._timings,
-                    lender=(
-                        None
-                        if self._shared_vectors is None
-                        else self._shared_vectors.for_document(document.source, document.source_id)
-                    ),
+                    lender=lender,
                 )
         except (_SupersededError, StorageBusyError):
             # A refused writer slot is the run's to stop on, not this document's to fail:
@@ -4284,6 +4285,10 @@ class IngestPipeline:
                 retention=retention,
                 expected=expected,
             )
+        # Only a committed document used the vectors it borrowed, so only it is counted. The
+        # count goes to the operator's ledger and nowhere a caller of this workspace can see.
+        if lender is not None and outcome.status is DocumentStatus.INDEXED:
+            await lender.settle()
         return replace(outcome, embedding=work)
 
     async def _previous_inputs(

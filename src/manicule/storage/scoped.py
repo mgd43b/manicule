@@ -78,9 +78,10 @@ A record of who asked what, and of who is allowed to ask: the query log, the aud
 its alerts, conversations and their turns, and the people, memberships, sessions and keys that
 identify a caller. And one operator's tally: the count of vectors a workspace copied from
 another instead of embedding (``docs/storage.md`` §6.2.6), written beside an ingest whose own
-corpus writes already count. Most of them are written *because* somebody searched, asked or signed in,
-which is exactly why a commit to one of them must not move the generation counter — the search
-that wrote it would invalidate its own cached ranking, and the next identical search would miss.
+corpus writes already count. Most of them are written *because* somebody searched, asked or
+signed in, which is exactly why a commit to one of them must not move the generation counter —
+the search that wrote it would invalidate its own cached ranking, and the next identical search
+would miss.
 
 **An exemption list, not a list of tables that count.** A table missing from here — including
 one added next year — counts, and the cost is a cold cache. A list of tables that count would

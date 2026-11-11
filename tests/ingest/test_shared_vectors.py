@@ -337,3 +337,53 @@ async def test_only_a_readable_verdict_is_lent(state: VectorState) -> None:
     chunks = next(iter(store.chunks.values()))
 
     assert await shared.lend(chunks, source=SOURCE, source_id="page-0") == {}
+
+
+class BrokenDonors:
+    """A donor set whose resolution fails, as another workspace's damaged state would."""
+
+    async def donors(self, *, source: str, source_id: str) -> Sequence[Donor]:
+        del source, source_id
+        msg = "another workspace's index state could not be read"
+        raise RuntimeError(msg)
+
+
+async def test_a_failure_to_find_donors_never_fails_the_document() -> None:
+    """Another workspace's state is never the reason this one's document is demoted."""
+    model = fakes.CountingEmbedder()
+    vectors = fakes.MemoryVectors()
+    await vectors.ensure_ready(model.fingerprint)
+    shared = SharedVectors(BrokenDonors(), fingerprint=model.fingerprint)
+    pipeline, store, _ = build(
+        vectors=vectors, embedder=model, workspace="beta", shared_vectors=shared
+    )
+
+    report = await pipeline.run(fakes.DictConnector(PAGES, name=SOURCE))
+
+    assert report.by_status == {"indexed": len(PAGES)}
+    assert sum(model.batches) == CHUNKS
+    assert all(document.status_detail is None for document in store.documents.values())
+
+
+async def test_a_document_that_does_not_commit_is_not_counted() -> None:
+    """The ledger counts passes saved, and a document that failed to store saved none."""
+    first, _, held, _ = await _workspace("alpha")
+    await first.run(fakes.DictConnector(PAGES, name=SOURCE))
+    model = fakes.CountingEmbedder()
+    refusing = fakes.RefusingVectors()
+    await refusing.ensure_ready(model.fingerprint)
+    ledger = RecordingLedger()
+    shared = SharedVectors(
+        StaticDonors([Donor(workspace="alpha", vectors=held)]),
+        fingerprint=model.fingerprint,
+        ledger=ledger,
+    )
+    pipeline, _, _ = build(
+        vectors=refusing, embedder=model, workspace="beta", shared_vectors=shared
+    )
+
+    report = await pipeline.run(fakes.DictConnector(PAGES, name=SOURCE))
+
+    assert "indexed" not in report.by_status
+    assert model.batches == [], "the vectors were borrowed; only storing them failed"
+    assert ledger.recorded == []
