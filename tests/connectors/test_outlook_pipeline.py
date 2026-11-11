@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -197,6 +198,40 @@ async def test_an_edited_event_is_fetched_again_and_nothing_else_is(harness: Har
     text = "\n".join(c.text for c in await harness.store.document_chunks(document.id))
     assert "Room 9" in text
     assert "Room 4" not in text
+
+
+async def test_an_event_edited_between_discovery_and_fetch_is_indexed_and_does_not_loop(
+    harness: Harness,
+) -> None:
+    """Its change key moved under the discovered one; the pipeline must accept the newer revision
+    rather than reject it as stale and retry the same enumeration forever."""
+    server = harness.server
+    server.add_event(planning())
+
+    def edit_once(request: httpx.Request) -> None:
+        if request.url.path.endswith("/me/events/e1"):
+            server.before_request = None
+            server.edit_event("e1", subject="Moved to Thursday", location="Room 9")
+
+    connector = await harness.connector(mail=False)
+    try:
+        server.before_request = edit_once
+        first = await harness.sync(connector)
+        second = await harness.sync(connector)
+        settled = harness.fetches("/me/events/")
+        third = await harness.sync(connector)
+    finally:
+        await connector.teardown()
+
+    document = await harness.store.find_document("work", EVENT_PREFIX + "e1")
+    assert document is not None
+    assert first.error == ""
+    assert first.indexed == 1
+    assert document.title == "Moved to Thursday"
+    assert second.error == ""
+    assert third.error == ""
+    assert third.indexed == 0
+    assert harness.fetches("/me/events/") == settled, "it settles: no loop of retried enumerations"
 
 
 async def test_a_new_message_in_a_second_sync_is_the_only_one_fetched(harness: Harness) -> None:

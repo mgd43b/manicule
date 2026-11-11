@@ -11,15 +11,17 @@ import json
 import logging
 import zlib
 
+import httpx
 import pytest
 
 from manicule.connectors.errors import (
     ConnectorError,
+    CursorExpiredError,
     MailboxMismatchError,
     NotFoundError,
     UntrustedLinkError,
 )
-from manicule.connectors.outlook import EVENT_PREFIX, MESSAGE_PREFIX
+from manicule.connectors.outlook import EVENT_PREFIX, MESSAGE_PREFIX, OutlookConnector
 from manicule.connectors.outlook_config import (
     EVENT_REPRESENTATION_VERSION,
     MAIL_REPRESENTATION_VERSION,
@@ -226,6 +228,103 @@ async def test_an_expired_delta_walks_that_folder_again_and_the_others_resume(
     assert connector.walked_full_inventory is False, (
         "some folders resumed, so it is not a full walk"
     )
+
+
+async def test_every_folder_falling_back_to_a_full_walk_is_a_full_inventory() -> None:
+    """When all stored state is gone the walk is complete, so a reconciliation must follow it."""
+    server, time = tenant()
+    server.add_message(mail("First"))
+    server.add_message(mail("Second"), "Archive")
+    async with opened(server, time, calendar=False) as connector:
+        await drain(connector)
+        watermark = connector.watermark
+        server.expire_deltas()
+        await drain(connector, watermark)
+
+        assert connector.walked_full_inventory is True
+
+
+async def test_paging_state_lost_part_way_through_a_first_walk_stops_the_run() -> None:
+    """A partial walk must not be committed as the whole folder."""
+    server, time = tenant()
+    for number in range(6):
+        server.add_message(mail(f"Message {number}"))
+    async with opened(server, time, calendar=False) as connector:
+        server.fail_paging = (410, "syncStateNotFound")
+        with pytest.raises(CursorExpiredError):
+            await drain(connector)
+
+        assert connector.watermark is None
+        assert connector.walked_full_inventory is False
+
+
+async def test_a_folder_deleted_before_its_first_request_is_skipped_and_the_rest_are_walked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server, time = tenant()
+    kept = server.add_message(mail("Kept"))
+    server.add_message(mail("Gone"), "Old Mail")
+
+    def delete_it_before_it_is_walked(request: httpx.Request) -> None:
+        if request.url.path.endswith("/messages/delta") and "inbox" in request.url.path:
+            server.before_request = None
+            server.delete_folder("Old Mail")
+
+    async with opened(server, time, calendar=False) as connector:
+        server.before_request = delete_it_before_it_is_walked
+        with caplog.at_level(logging.WARNING, logger="manicule.connectors.outlook"):
+            found = await drain(connector)
+
+        assert ids(found) == [msg(kept)]
+        assert "disappeared" in caplog.text
+        assert connector.watermark is not None
+
+
+async def test_a_fallback_for_a_folder_that_is_also_gone_is_skipped_not_fatal() -> None:
+    server, time = tenant()
+    server.add_message(mail("Kept"))
+    server.add_message(mail("Gone"), "Old Mail")
+    async with opened(server, time, calendar=False) as connector:
+        await drain(connector)
+        watermark = connector.watermark
+        server.expire_deltas(404, "ErrorItemNotFound")
+        server.delete_folder("Old Mail")
+        found = await drain(connector, watermark)
+
+    assert len(found) == 1
+
+
+def test_a_deletion_proposal_made_under_one_calendar_window_is_not_valid_under_another() -> None:
+    narrow = connector_over(*tenant(), calendar_days_back=7, calendar_days_forward=7)
+    wide = connector_over(*tenant(), calendar_days_back=7, calendar_days_forward=365)
+    same = connector_over(*tenant(), calendar_days_back=7, calendar_days_forward=7)
+
+    assert narrow.scope_fingerprint == wide.scope_fingerprint, "no delta link is discarded"
+    assert narrow.reconciliation_scope != wide.reconciliation_scope
+    assert narrow.reconciliation_scope == same.reconciliation_scope
+
+
+def test_a_mail_only_instance_ignores_the_calendar_window_in_its_reconciliation_scope() -> None:
+    a = connector_over(*tenant(), calendar=False, calendar_days_forward=7)
+    b = connector_over(*tenant(), calendar=False, calendar_days_forward=365)
+
+    assert a.reconciliation_scope == b.reconciliation_scope
+
+
+@pytest.mark.parametrize(
+    ("discovered", "fetched", "accepted"),
+    [
+        ("ck-1|ics/1", "ck-1|ics/1", True),
+        ("ck-1|ics/1", "ck-2|ics/1", True),
+        ("ck-1|ics/1", "ck-2|ics/2", False),
+        ("mime/1", "mime/1", True),
+        ("mime/1", "ck-2|ics/1", False),
+    ],
+)
+def test_an_event_edited_after_discovery_is_the_newer_revision_and_a_new_rendering_is_not(
+    discovered: str, fetched: str, accepted: bool
+) -> None:
+    assert OutlookConnector.fetched_revision_at_least(discovered, fetched) is accepted
 
 
 @pytest.mark.parametrize(

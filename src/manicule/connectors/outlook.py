@@ -164,8 +164,22 @@ class OutlookConnector:
 
     @property
     def reconciliation_scope(self) -> str:
-        """Fences a completed inventory, and a held deletion proposal, to this exact scope."""
-        return f"outlook:{self.scope_fingerprint}"
+        """Fences a completed inventory, and a held deletion proposal, to this exact scope.
+
+        **It includes the calendar window, which the mail-delta fingerprint deliberately does
+        not** (``outlook.md`` §7.1): the calendar keeps no position, so its window is no part of
+        what a stored delta link is valid for. But an inventory is the events *in the window*, so
+        a deletion proposed under a narrow window must not be confirmable after the window is
+        widened, which would delete events that are now in scope. Independent of
+        :attr:`scope_fingerprint`, so widening the window re-fences deletion without discarding
+        a single delta link.
+        """
+        window = (
+            f"{self._config.calendar_days_back}:{self._config.calendar_days_forward}"
+            if self._config.calendar
+            else "-"
+        )
+        return f"outlook:{self.scope_fingerprint}:{window}"
 
     @property
     def enumerates_full_inventory(self) -> bool:
@@ -333,22 +347,25 @@ class OutlookConnector:
             try:
                 async for batch in self._walk_folder(folder, link, links):
                     yield batch
-                from_scratch = from_scratch and link is None
             except CursorExpiredError:
                 if link is None:
-                    # A folder deleted or moved between the tree read and this walk. Nothing
-                    # that was yielded is wrong, and reconciliation is what removes its mail.
-                    _log.warning(
-                        "source %r: a folder disappeared during the walk; skipped", self.name
-                    )
-                    continue
+                    # Paging state that expired during a walk from scratch is not a missing
+                    # folder, and skipping the rest of it would commit a partial inventory as
+                    # complete. Only a first request answered "no such folder" is a vanished
+                    # folder (:class:`NotFoundError`, below).
+                    raise
                 _log.warning(
                     "source %r: Graph no longer holds a folder's delta state; walking it again",
                     self.name,
                 )
-                from_scratch = False
-                async for batch in self._walk_folder(folder, None, links):
+                # A fallback that completes is a walk from scratch, so it leaves the aggregate
+                # flag alone: only a folder that *resumed* makes the run incremental.
+                async for batch in self._walk_new(folder, links):
                     yield batch
+            except NotFoundError:
+                self._skip_vanished()
+            else:
+                from_scratch = from_scratch and link is None
         if self._config.calendar:
             async for events in self._client.list_events(*self._window()):
                 batch = [self._discovered_event(stub) for stub in events]
@@ -357,6 +374,24 @@ class OutlookConnector:
         self._links = links
         self._walked_full = from_scratch
         self._enumerated = True
+
+    async def _walk_new(
+        self, folder: Folder, links: dict[str, str]
+    ) -> AsyncIterator[Sequence[DiscoveredDoc]]:
+        """A folder walked from scratch after its stored state was lost.
+
+        The stored link's 404 was ambiguous (state gone, or folder gone), so a first request
+        that is itself answered "no such folder" is the folder having vanished.
+        """
+        try:
+            async for batch in self._walk_folder(folder, None, links):
+                yield batch
+        except NotFoundError:
+            self._skip_vanished()
+
+    def _skip_vanished(self) -> None:
+        """A folder deleted between the tree read and its walk; reconciliation removes its mail."""
+        _log.warning("source %r: a folder disappeared during the walk; skipped", self.name)
 
     async def _walk_folder(
         self, folder: Folder, link: str | None, links: dict[str, str]
@@ -385,6 +420,25 @@ class OutlookConnector:
             version_token=MAIL_REPRESENTATION_VERSION,
             media_type=MESSAGE_MEDIA_TYPE,
         )
+
+    @staticmethod
+    def fetched_revision_at_least(discovered: str, fetched: str) -> bool:
+        """Whether fetched bytes are not older than the revision discovery listed.
+
+        An event's ``changeKey`` is opaque and cannot be ordered, and the pipeline's default
+        (equality) would reject an event **edited between discovery and fetch** as a stale body,
+        so the next sync would retry the same enumeration forever (``outlook.md`` §7.1). A fetch
+        happens after discovery, and a key only moves when the event is edited, so a different key
+        of the same representation is the newer revision and is accepted: its token is what gets
+        stored, so the next listing, at that same key, fetches nothing. If the key were somehow
+        older (a lagging replica), the next listing differs from the stored one and fetches again.
+        A different representation is not accepted, and a message's token is constant.
+        """
+        if discovered == fetched:
+            return True
+        _, _, wanted = discovered.partition("|")
+        _, _, got = fetched.partition("|")
+        return bool(wanted) and wanted == got
 
     def _discovered_event(self, stub: EventStub) -> DiscoveredDoc:
         return DiscoveredDoc(

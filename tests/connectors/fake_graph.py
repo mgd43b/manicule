@@ -193,6 +193,11 @@ class FakeGraph:
     expiry_status: int = 410
     expiry_code: str = "syncStateNotFound"
     loop_pagination: bool = False
+    fail_paging: tuple[int, str] | None = None
+    """Answer every ``$skiptoken`` request of a delta round with this ``(status, code)``."""
+    before_request: Callable[[httpx.Request], None] | None = None
+    """Called with each Graph request before it is answered, so a test can change the tenant
+    between two calls the way a person editing a mailbox does."""
 
     # throttling and failure
     throttle: list[tuple[int, str | None]] = field(default_factory=list[tuple[int, str | None]])
@@ -413,6 +418,8 @@ class FakeGraph:
     # --- graph ----------------------------------------------------------------------------
 
     def _graph(self, request: httpx.Request) -> httpx.Response:
+        if self.before_request is not None:
+            self.before_request(request)
         if self.throttle:
             status, retry_after = self.throttle.pop(0)
             headers = {"Retry-After": retry_after} if retry_after is not None else {}
@@ -511,6 +518,9 @@ class FakeGraph:
             since = int(parts[1])
             offset = int(parts[2]) if parts[0] == "S" else 0
             floor_hit = since < self.delta_floor and parts[0] == "D"
+        if self.fail_paging is not None and "$skiptoken" in params:
+            status, code = self.fail_paging
+            return httpx.Response(status, json=_error(status, code))
         if floor_hit:
             return httpx.Response(
                 self.expiry_status, json=_error(self.expiry_status, self.expiry_code)

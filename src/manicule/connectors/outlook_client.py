@@ -327,8 +327,9 @@ class OutlookClient:
 
         Raises:
             CursorExpiredError: Graph no longer holds the delta state behind a link of this round
-                (a 410, or a 404 or ``syncStateNotFound`` for a stored or paged link). For a first
-                round it means the folder is gone.
+                (a 410, or a 404 or ``syncStateNotFound`` for a stored or paged link), including
+                one lost part way through a round from scratch.
+            NotFoundError: The first request of a round from scratch found no such folder.
             UntrustedLinkError: A stored or returned link is not Graph's.
         """
         operation = "messages.delta"
@@ -340,10 +341,17 @@ class OutlookClient:
                 {"$select": _MESSAGE_FIELDS},
             )
         seen: set[str] = set()
+        first = delta_link is None
         while True:
+            # A 404 means the delta state is gone for every request but the first of a round from
+            # scratch, where there is no state yet and it can only mean the folder is gone.
             payload = await self._get_json(
-                operation, url, prefer="odata.maxpagesize=" + str(PAGE_SIZE), expired=True
+                operation,
+                url,
+                prefer="odata.maxpagesize=" + str(PAGE_SIZE),
+                expired=not first,
             )
+            first = False
             messages: list[MessageStub] = []
             removed = 0
             for entry in _entries(payload, "value", operation):

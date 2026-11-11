@@ -277,7 +277,9 @@ token is never sent to it, so a poisoned watermark cannot exfiltrate it. A link 
 round is a loop and is refused.
 
 **A folder that was deleted between the tree read and its walk** is skipped with a warning, and
-reconciliation is what removes its mail.
+reconciliation is what removes its mail. Only a first request answered "no such folder" means that:
+**paging state lost part way through a walk from scratch stops the run** (`CursorExpiredError`),
+because skipping the rest of a folder would commit a partial inventory as complete.
 
 **Expired state.** Microsoft documents that an Outlook delta token's lifetime is not fixed (it
 depends on the size of an internal cache) and that an expired one is answered with a 40x error
@@ -287,9 +289,11 @@ such as `syncStateNotFound`, and a reset with `410 Gone`. A `410`, a `404`, or a
 wrong, and the walk yields everything again at the same constant token, so only messages not
 already stored are fetched. The other folders still resume.
 
-**`walked_full_inventory`** is true only when *every* folder started from scratch, because only a
+**`walked_full_inventory`** is true only when *every* folder was walked from scratch, because only a
 walk that listed the whole scope may be followed by a reconciliation that treats it as one
-([`ingest.md`](../ingest.md) §11).
+([`ingest.md`](../ingest.md) §11). A folder whose stored state expired and was walked again counts
+as from scratch, so when every link has expired the run is a full walk and a reconciliation follows;
+a single folder that resumed from its link makes the run incremental.
 
 ### 4.4 Batches
 
@@ -360,6 +364,15 @@ and an event whose `changeKey` is unchanged is not fetched again.
   change key. A daily meeting is a document a day inside the window. The series master is not
   indexed.
 - The window is not in the scope fingerprint, because the calendar has no position to invalidate.
+  It **is** in `reconciliation_scope`, which fences a completed inventory and a held deletion
+  proposal: a deletion proposed under a narrow window must not be confirmable after the window is
+  widened, which would delete events that are now in scope. Widening the window re-fences deletion
+  without discarding a delta link.
+- **An event edited between discovery and fetch is accepted at its newer key.** A `changeKey` is
+  opaque and cannot be ordered, and the pipeline's default (equal tokens) would reject the fetch as
+  a stale body and retry the same enumeration forever. `fetched_revision_at_least` accepts a
+  different key of the same representation as the newer revision. The pipeline stores the key the
+  *listing* gave, so the next sync fetches that event once more at the new key and then settles.
 
 ### 7.2 The representation: iCalendar, not JSON
 
