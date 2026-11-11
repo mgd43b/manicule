@@ -157,9 +157,14 @@ changes the heading and the breadcrumb without changing a byte of content, and
 still be re-read. Discovery does not fetch to decide; it compares tokens, as `DiscoveredDoc`
 requires.
 
+**The token is also the record's `version`.** When only a label changes, the bytes and their hash
+are unchanged, and the pipeline skips an unchanged document unless its source record differs, so
+the stored metadata would keep the old labels while the token moved on. A record carrying the whole
+token changes whenever the token does, and the pipeline rewrites it.
+
 **Metadata carries** `trilium_note_id`, `trilium_type`, `trilium_mime`, `trilium_labels` (the
 values of each label name, as a list, because Trilium allows several labels with one name), `trilium_parent_note_ids`, and in the provenance record the title, the
-canonical address, `blobId` as the version, `utcDateCreated` and `utcDateModified` as the
+canonical address, the version token as the version, `utcDateCreated` and `utcDateModified` as the
 note's own dates, and the breadcrumb. A title the record cannot hold (a control character) is
 cleaned of it, and a record that cannot be built at all leaves the note indexed with an
 `unavailable_reason`.
@@ -230,9 +235,12 @@ proved complete is worse than none, which is `mbox.md` §5.4's rule: absence is 
 alternative, splitting the sweep by subtree when it reaches the limit, was rejected for a server
 cap nobody has observed (§10).
 
-**Every entry is read strictly.** An entry without a `noteId`, or whose `parentNoteIds`,
-`attributes` or `isProtected` are not the shapes ETAPI documents, fails the sweep. Dropping it
-would hide a note from the inventory, and hiding a note deletes it.
+**Every entry is read strictly, because lenient reading fails open both ways.** A missing `noteId`
+or `type` (which would read as a type that is not indexed), non-string parent ids, an
+`isProtected`, `parentNoteIds` or `attributes` of the wrong shape, or an attribute or label that
+cannot be read fails the whole sweep. Dropping an entry hides a note from the inventory, and hiding
+a note deletes it; an unreadable label cannot exclude, so a subtree someone marked private would be
+indexed.
 
 ### 6.2 `discover`
 
