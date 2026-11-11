@@ -199,6 +199,26 @@ async def test_one_readers_cached_ranking_is_never_served_to_another(
     assert _documents(other) == {OPEN_ID}
 
 
+async def test_a_narrower_readers_cached_ranking_is_never_served_to_a_wider_one(
+    service: ApplicationService, restricted: People
+) -> None:
+    """The other direction, which the rehydrating join cannot catch.
+
+    Vic's ranking holds nothing restricted, so every document in it is one Erin may read and
+    the join would serve it to her whole — a ranking short of the passage she may read, with a
+    confidence computed without it. Only the reader set in the key keeps the two apart.
+    """
+    with acting_as(viewer(restricted.vic)):
+        await service.search(QUESTION, limit=5)
+        again = await service.search(QUESTION, limit=5)
+    with acting_as(viewer(restricted.erin)):
+        wider = await service.search(QUESTION, limit=5)
+
+    assert again.cached is True, "the fixture must reach the cache, or this proves nothing"
+    assert wider.cached is False, "a ranking cached for one reader set was served to another"
+    assert RESTRICTED_ID in _documents(wider)
+
+
 async def test_a_grant_invalidates_a_ranking_cached_before_it(
     service: ApplicationService, people: People
 ) -> None:
