@@ -999,8 +999,11 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
         recorded as a structured memory, so it can be dated and weighed later. Add to the front
         matter `knowledge_type` (procedure, constraint, fact, decision, known_issue or
         ownership) and `evidence`: a list of sources, each with `kind` (slack, jira, ...),
-        `locator` (an http(s) permalink), `said_at` (a full timestamp with a UTC offset, when the
-        *source* said it), `quote` (its words, verbatim) and optionally `author`. Optional:
+        `locator` (an http(s) permalink; or, only where the installation has enabled it in
+        `authoring.local_evidence`, `claude-session:<session-uuid>#<message-uuid>` or
+        `git:<repo>@<commit>:<path>#L<first>-L<last>`; never a `file:` address or a path),
+        `said_at` (a full timestamp with a UTC offset, when the *source* said it),
+        `quote` (its words, verbatim) and optionally `author`. Optional:
         `evidence_status` (single_source, corroborated, disputed or superseded; derived from the
         evidence when omitted) and `relationships` (each `relation` — supersedes, superseded_by,
         contradicts, depends_on or relates_to — and the other memory's `target` slug). The body

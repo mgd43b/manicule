@@ -565,7 +565,7 @@ Operational knowledge — how an environment really behaves — mostly lives in 
 and without the place and the time it is folklore. A memory whose front matter declares a
 `knowledge_type` is a **structured memory**: a title, a problem, an answer and where it applies in
 the body, and in front matter its type, its `evidence` and how the memory relates to others. Each
-source carries a `kind`, an http(s) `locator`, when the *source* said it (`said_at`), and the
+source carries a `kind`, a `locator` (an http(s) address, or a `claude-session:` or `git:` locator where the operator has enabled it in `authoring.local_evidence`), when the *source* said it (`said_at`), and the
 `quote` — required, because a permalink is a pointer and pointers die.
 
 Nothing connects to any chat product; a caller reads a message however it reads it and records the

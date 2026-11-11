@@ -3388,7 +3388,9 @@ class ApplicationService:
         # to the same rule. Operator-supplied rather than caller-supplied, which makes this
         # unlikely rather than impossible — and "unlikely" is not what a path check is for.
         _require_segment(collection, "collection name")
-        content = _authored_markdown(body, slug=slug)
+        content = _authored_markdown(
+            body, slug=slug, local_evidence=frozenset(authoring.local_evidence)
+        )
         await self._require_readable_source(authoring.source)
 
         store = await self._backend.organization()
@@ -11252,7 +11254,7 @@ def _require_segment(value: str, what: str) -> None:
         raise ValueError(msg)
 
 
-def _authored_markdown(body: str, *, slug: str) -> str:
+def _authored_markdown(body: str, *, slug: str, local_evidence: frozenset[str]) -> str:
     """The body as it will be written, refusing what would not parse as intended.
 
     Three refusals, and none of them authors anything. An empty document is a file with no
@@ -11285,7 +11287,7 @@ def _authored_markdown(body: str, *, slug: str) -> str:
             "does not have — so every heading path below it would be wrong. Close the fence."
         )
         raise ValueError(msg)
-    check_knowledge(body, slug=slug)
+    check_knowledge(body, slug=slug, local_evidence=local_evidence)
     return body if body.endswith("\n") else body + "\n"
 
 

@@ -57,9 +57,11 @@
 {% macro knowledge(record) %}
 {# What a structured memory rests on. Nothing for a document that is not one.
 
-   Every value is rendered as text, **including the locator**. It is restricted to http and https
-   before it is stored, so a link would be safe — but an address that is never an `href` has no
-   sink to get wrong, and the same is true of the quote, which is somebody else's message.
+   Every value is rendered as text, **including the locator**. It is a web address or one of the
+   local schemes (`claude-session:`, `git:`) an operator turned on, and a local one is not a link
+   in any browser. An address that is never an `href` has no sink to get wrong, which is why a
+   scheme is added to that set without a template change; the same is true of the quote, which
+   is somebody else's message.
 
    The word is "attested", not "verified": these are the sources the memory's author recorded,
    and nothing here was opened or checked. `verified` is what an answer citation's quotation is

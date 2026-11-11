@@ -159,7 +159,15 @@ from manicule.storage.ledger import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        Awaitable,
+        Callable,
+        Collection,
+        Coroutine,
+        Mapping,
+        Sequence,
+    )
     from collections.abc import Set as AbstractSet
 
     from manicule.core.content import Chunk, Metadata
@@ -1053,7 +1061,9 @@ rest of the document is not decoded at all, which keeps this off the cost of a l
 """
 
 
-def _with_knowledge(raw: RawDocument, existing: Document | None) -> RawDocument:
+def _with_knowledge(
+    raw: RawDocument, existing: Document | None, *, local_evidence: AbstractSet[str] = frozenset()
+) -> RawDocument:
     """``raw``, carrying the structured-memory record its front matter declares, if any.
 
     **Only Markdown, and only a document that declares ``knowledge_type``.** Everything else is
@@ -1067,7 +1077,9 @@ def _with_knowledge(raw: RawDocument, existing: Document | None) -> RawDocument:
     it; the key is written only when there is something to overwrite, so a document that never
     had a record never gets one.
     """
-    declared = _declared_knowledge(raw) if raw.media_type in MARKDOWN_MEDIA_TYPES else None
+    declared = (
+        _declared_knowledge(raw, local_evidence) if raw.media_type in MARKDOWN_MEDIA_TYPES else None
+    )
     if declared is not None:
         return raw.model_copy(
             update={"metadata": {**raw.metadata, KNOWLEDGE_KEY: declared.as_metadata_value()}}
@@ -1079,7 +1091,7 @@ def _with_knowledge(raw: RawDocument, existing: Document | None) -> RawDocument:
     return raw
 
 
-def _declared_knowledge(raw: RawDocument) -> Knowledge | None:
+def _declared_knowledge(raw: RawDocument, local_evidence: AbstractSet[str]) -> Knowledge | None:
     """The record a Markdown document's front matter declares, or ``None``."""
     head = raw.content[:_FRONT_MATTER_PROBE]
     try:
@@ -1088,7 +1100,7 @@ def _declared_knowledge(raw: RawDocument) -> Knowledge | None:
         # An encoding name Python does not know. The parser will refuse the document for the
         # same reason and say so; this stage has nothing to add.
         return None
-    return read_knowledge(text)
+    return read_knowledge(text, local_evidence=local_evidence)
 
 
 class IngestPipeline:
@@ -1128,6 +1140,7 @@ class IngestPipeline:
         expected_reset_epoch: int | None = None,
         sensitive_sources: AbstractSet[str] = frozenset(),
         shared_vectors: SharedVectors | None = None,
+        local_evidence: Collection[str] = (),
     ) -> None:
         derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
         if any(component is None for component in derived) and not all(
@@ -1145,6 +1158,7 @@ class IngestPipeline:
             require_measured(chunk_fingerprint)
         self._store = store
         self._sensitive_sources, self._marked_sensitive = frozenset(sensitive_sources), set[str]()
+        self._local_evidence = frozenset(local_evidence)
         # Other workspaces' stored vectors, consulted for what this one's store cannot supply
         # (`docs/storage.md` §6.2.6). Always on where the runtime provides it; `None` is a
         # pipeline built without a view of any other workspace, which is every unit test.
@@ -3973,7 +3987,7 @@ class IngestPipeline:
                 container_depth=container_depth,
             )
             return skipped, ()
-        raw = _with_knowledge(transformed, existing)
+        raw = _with_knowledge(transformed, existing, local_evidence=self._local_evidence)
 
         await self._advance(existing, DocumentStatus.PARSING)
 

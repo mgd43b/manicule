@@ -515,7 +515,11 @@ class EvidenceReference(Payload):
     """
 
     kind: str = Field(description="What sort of place: slack, jira, confluence, email, ...")
-    locator: str = Field(description="Where a reader goes to see it. An http or https address.")
+    locator: str = Field(
+        description="Where a reader goes to see it. An http or https address, or a local locator "
+        "(claude-session:<session-uuid>#<message-uuid> or git:<repo>@<commit>:<path>#L<a>-L<b>) "
+        "the operator enabled in authoring.local_evidence. Shown as text, never a link."
+    )
     said_at: str = Field(
         description="When the **source** said it. Never when the memory was written or indexed."
     )

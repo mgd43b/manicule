@@ -149,3 +149,38 @@ def test_switching_the_escaping_off_lets_the_evidence_through(
         f"the escaping was switched off and {path} still did not carry the raw evidence, so the "
         f"assertions above are not testing the escaping on this page"
     )
+
+
+def test_a_local_locator_renders_as_escaped_text_and_never_as_a_link() -> None:
+    """A git path may hold markup, since only its shape is checked, so it must reach HTML inert."""
+    git = "git:handbook@" + "a" * 40 + ":docs/<script>window.__local=1</script>.md#L3"
+    session = (
+        "claude-session:0f1e2d3c-4b5a-4968-8776-655443322110#a1b2c3d4-e5f6-4789-8abc-def012345678"
+    )
+    said = datetime(2026, 3, 2, 14, 5, tzinfo=UTC)
+    backend, document = _backend_holding(
+        Knowledge(
+            record=KnowledgeRecord(
+                knowledge_type=KnowledgeType.CONSTRAINT,
+                evidence_status=EvidenceStatus.CORROBORATED,
+                evidence=(
+                    EvidenceSource(
+                        kind="git", locator=git, quote="failover is manual", said_at=said
+                    ),
+                    EvidenceSource(
+                        kind="session", locator=session, quote="second place", said_at=said
+                    ),
+                ),
+            )
+        )
+    )
+
+    with client_for(backend) as client:
+        body = client.get(f"/ui/documents/{document.id}").text
+
+    assert git not in body
+    assert str(escape(git)) in body, "the git locator is not on the page, so nothing was tested"
+    assert session in body, "the session locator is not on the page, so nothing was tested"
+    assert "<script>window.__local" not in body
+    assert 'href="git:' not in body
+    assert 'href="claude-session:' not in body

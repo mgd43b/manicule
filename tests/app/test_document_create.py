@@ -50,7 +50,7 @@ from manicule.mcp.server import build_server
 from manicule.plugins.registry import ComponentRegistry
 from tests.api.live import mounted
 from tests.app.fakes import FakeBackend, FakeIngestion, FakeStore, make_chunk, make_document
-from tests.knowledge_samples import EVIDENCE, SECOND_SOURCE, SLUG, memory
+from tests.knowledge_samples import EVIDENCE, LOCATOR, SECOND_SOURCE, SLUG, memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -118,7 +118,12 @@ class IndexingIngestion(FakeIngestion):
         return RunReport(connector=name, discovered=1, by_status={DocumentStatus.INDEXED.value: 1})
 
 
-def settings_for(root: Path, *, collections: tuple[str, ...] = (COLLECTION,)) -> Settings:
+def settings_for(
+    root: Path,
+    *,
+    collections: tuple[str, ...] = (COLLECTION,),
+    local_evidence: tuple[str, ...] = (),
+) -> Settings:
     """Configuration declaring one filesystem source and authoring into it.
 
     Authentication is on, because ``manicule.app.bind.require_authoring_authentication`` refuses
@@ -128,7 +133,9 @@ def settings_for(root: Path, *, collections: tuple[str, ...] = (COLLECTION,)) ->
     """
     return Settings(
         connectors={SOURCE: ConnectorSettings(type="filesystem", options={"root": str(root)})},
-        authoring=AuthoringSettings(source=SOURCE, collections=collections),
+        authoring=AuthoringSettings(
+            source=SOURCE, collections=collections, local_evidence=local_evidence
+        ),
         security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
     )
 
@@ -1068,6 +1075,48 @@ async def test_a_memory_that_would_not_be_read_as_one_is_refused_and_writes_noth
 
     with pytest.raises(ValueError, match=says):
         await service.document_create(collection=COLLECTION, slug=SLUG, body=body)
+
+    assert written_under(root) == []
+
+
+SESSION_EVIDENCE = EVIDENCE.replace(
+    LOCATOR,
+    "claude-session:0f1e2d3c-4b5a-4968-8776-655443322110#a1b2c3d4-e5f6-4789-8abc-def012345678",
+)
+
+
+async def test_a_local_locator_is_accepted_once_its_scheme_is_enabled(root: Path) -> None:
+    service = await service_for(settings_for(root, local_evidence=("claude-session",)))
+    body = memory(evidence=SESSION_EVIDENCE)
+
+    created = await service.document_create(collection=COLLECTION, slug=SLUG, body=body)
+
+    assert (root / COLLECTION / f"{SLUG}.md").read_text(encoding="utf-8") == body
+    assert created.indexed is True
+
+
+async def test_a_local_locator_is_refused_naming_the_setting_and_writes_nothing(
+    root: Path,
+) -> None:
+    """Off by default, and the refusal says which setting turns it on."""
+    service = await service_for(settings_for(root))
+
+    with pytest.raises(ValueError, match=r"authoring\.local_evidence") as refused:
+        await service.document_create(
+            collection=COLLECTION, slug=SLUG, body=memory(evidence=SESSION_EVIDENCE)
+        )
+
+    assert "'claude-session'" in str(refused.value)
+    assert written_under(root) == []
+
+
+async def test_enabling_one_local_scheme_does_not_enable_the_other(root: Path) -> None:
+    service = await service_for(settings_for(root, local_evidence=("git",)))
+
+    with pytest.raises(ValueError, match="'claude-session' scheme"):
+        await service.document_create(
+            collection=COLLECTION, slug=SLUG, body=memory(evidence=SESSION_EVIDENCE)
+        )
 
     assert written_under(root) == []
 
