@@ -6,9 +6,9 @@ How manicule indexes a [Trilium Notes](https://triliumnotes.org) server (the mai
 the problem is the same, and the mbox connector ([`mbox.md`](mbox.md)), whose sensitivity
 reasoning it follows.
 
-> **Status: implemented.** §11 names the code for each section. The connector is built and tested
-> against a synthetic server, not a live one: §9 lists every statement here that rests on ETAPI's
-> published description and not on an observed response.
+> **Status: implemented.** §11 names the code for each section. The connector is tested against a
+> synthetic server and was run against a live TriliumNext 0.107.0; §9 lists what was observed and
+> what was not.
 
 A person who keeps notes in Trilium has a tree of notes in one SQLite database, reachable only
 through the app. The notes are hierarchical, a note can sit under several parents, and every
@@ -35,7 +35,7 @@ enabled = true
 base_url = "https://notes.example.org"   # required; may carry a context path (§2)
 token_env = "TRILIUM_ETAPI_TOKEN"        # the default; or `token = "..."` (§2)
 root_note_ids = []                       # notes whose subtrees are indexed; empty means all (§5)
-exclude_labels = ["manicule-skip"]       # a note carrying one, and its subtree, is never read (§5)
+exclude_labels = ["manicule_skip"]       # a note carrying one, and its subtree, is never read (§5)
 include_archived = false                 # notes labeled #archived (§5)
 max_notes = 100_000                      # a sweep this large is presumed cut off and refused (§6.1)
 ```
@@ -173,9 +173,12 @@ Two settings narrow what is read, and a third governs one kind of note.
 - **`root_note_ids`** admits a note when **any** of its paths to the top passes through one of
   them. Empty admits everything not excluded below.
 - **`exclude_labels`** removes a note when it carries one of the labels, or when **any** of its
-  paths passes through a note that does. The label is matched by the connector over each note's
-  own attributes; it does not depend on Trilium's attribute inheritance (§9), because a privacy
-  boundary that depends on a server feature being configured a certain way is not one.
+  paths passes through a note that does. Names are written without the `#` and are normalized the
+  way Trilium stores them: every character that is not a letter, a digit, `_` or `:` becomes `_`,
+  so `manicule-skip` and `manicule_skip` are the same label (§9). The label is matched by the
+  connector over the attributes each note reports and walked up the tree by the connector; it does
+  not depend on Trilium's attribute inheritance, because a privacy boundary that depends on a
+  server feature being configured a certain way is not one.
 - **`include_archived`** governs notes labeled `#archived`, handled as an exclude label that
   can be switched off: the note and its subtree. The default leaves them out, because archiving
   is how a person says "not part of what I look at".
@@ -325,25 +328,48 @@ reconciliation, and a truncated sweep deletes nothing.
 
 ---
 
-## 9. Not yet verified against a live server
+## 9. What was checked against a live server, and what was not
 
-The connector is built and tested against ETAPI's published description (the OpenAPI document in
-the Trilium repository and the ETAPI user guide), not against a response from a running server.
-Check these first when one is available:
+The connector was run end to end against a throwaway TriliumNext **0.107.0** server (database
+version 242) holding its default 179-note demo vault, plus notes created over ETAPI for the cases
+below. The real connector discovered 143 notes in scope, reconciled the same 143, and fetched all of
+them with no failure (103 `text/html`, 40 `text/plain`).
+
+**Confirmed:**
+
+| Assumption | Observed |
+|---|---|
+| `note.noteId != ''` matches every note | 179 results for the 179-note vault |
+| `limit` is honored | `limit=1` returned 1 and `limit=10` returned 10, so a response of exactly `limit` is rightly presumed truncated |
+| `includeArchivedNotes=true` returns archived notes, with their `archived` label in `attributes` | Both held; the connector then leaves them out or in by `include_archived` |
+| The hidden subtree appears in search with an id beginning `_` | `_hidden` was in the results, with `root` |
+| `blobId` changes on a content edit and `utcDateModified` advances on one | Both changed on an edit. A rename moved `utcDateModified` of the renamed note and **not** `blobId`, which is why the title and the breadcrumb are in the version token |
+| A note's content comes back with its `mime` as `Content-Type` | `text/html; charset=utf-8` for text notes; the 143 fetches passed the check in §2 |
+| `Authorization: Bearer` is accepted | Yes, on 0.107.0 |
+| Trilium does not redirect an ETAPI request | No redirect in any of the 143 fetches or the sweeps |
+
+**Found, and fixed here:**
+
+- **Trilium rewrites a label name.** Every character that is not a letter, a digit, `_` or `:`
+  becomes `_`, so `#manicule-skip` is stored as `manicule_skip`. A name matched as typed would never
+  match a label on the server, and an exclusion would silently exclude nothing. The setting is now
+  normalized the same way, the default is `manicule_skip`, and a name configured as
+  `manicule-skip` works (§5).
+- **`Note.attributes` includes inherited labels.** A child of a parent labeled
+  `#manicule_skip(inheritable)` lists the label itself. Exclusion already walks the tree and does
+  not depend on this, but `trilium_labels` records labels a note inherits as well as those it
+  carries.
+- **ETAPI returns two types its published list omits**, `canvas` and `mindMap`. Both are drawings
+  and are not indexed; they are known and not reported as a newer Trilium.
+
+**Not checked:**
 
 | Assumption | What to check | If it is wrong |
 |---|---|---|
-| **The expression `note.noteId != ''` matches every note** | Run the sweep against a vault of a few thousand notes | The sweep returns nothing or errors. `SWEEP_EXPRESSION` is the one place to change |
-| **`limit` is honored, and a response shorter than `limit` is complete** | Ask for `limit=10` on a vault of 50 | Truncation detection fails open: a short response is trusted. This is the row that matters most, since reconcile deletes on absence |
-| **`includeArchivedNotes=true` returns archived notes**, with their `#archived` label in `attributes` | Archive a note and sweep | The connector judges archiving itself from the label. If archived notes never arrive, `include_archived` has no effect and they are simply absent |
-| **The hidden subtree and system notes appear in search**, with ids beginning `_` | Run the sweep and list ids starting `_` | If they do not appear, the rule in §3 is harmless. If other system notes appear without the prefix, it needs widening |
-| **`Note.attributes` lists a note's own labels and not inherited ones** | Label a parent `#manicule-skip(inheritable)`, read a child | §5 already walks the tree itself and does not depend on this; if inherited labels *are* listed the metadata would record labels the child does not carry |
-| **`blobId` changes whenever content changes, and `utcDateModified` advances on an edit** | Edit a note, read both; rename it, read both | Both are in the token, so one holding is enough. If neither moves on a content edit the edit is missed |
-| **`GET /notes/{id}/content` returns the note's `mime` as its `Content-Type`**, and the editor's HTML for a text note | Fetch a text note, a code note and a Markdown note | The check in §2 refuses every note whose type it does not recognize, loudly. It would need to compare the media type's base only, or the note's type |
-| **A bare `#root/<noteId>` opens the note in the web app** | Open one | The `uri` needs the full path, which the breadcrumb walk already computes |
-| **A protected note's content request fails `400 NOTE_IS_PROTECTED`**, and `isProtected` is true in the sweep | Fetch one | §5 skips before asking, so this is harmless unless `isProtected` is *absent*, which fails the sweep loudly rather than putting ciphertext in the index |
-| **`Authorization: Bearer` is accepted** by the TriliumNext line from v0.93.0 | Call any endpoint with it | Send the bare token as `Authorization`, which older servers take |
-| **Trilium does not redirect an ETAPI request** | Run a full sync | A same-origin redirect is refused (§2). It would be the connector refusing a normal answer |
+| A bare `#root/<noteId>` opens the note in the web app | Open one in a browser. The fragment never reaches the server, so a request cannot tell | The `uri` needs the full path, which the breadcrumb walk already computes |
+| A protected note is swept with `isProtected: true`, its content request fails `400 NOTE_IS_PROTECTED`, and its title is `[protected]` | Protect a note in the app (ETAPI cannot) and sweep | §5 skips before asking, so this is harmless unless `isProtected` is *absent*, which fails the sweep loudly rather than putting ciphertext in the index |
+| A sweep of a very large vault finishes within `request_timeout_seconds` and its memory is acceptable | Sweep a vault of tens of thousands of notes | Raise `request_timeout_seconds`; there is no cursor to split the response with |
+| A server older than 0.93.0 | Call any endpoint | Send the bare token as `Authorization`, which older servers take |
 
 ---
 

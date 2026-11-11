@@ -81,9 +81,11 @@ _KNOWN_TYPES: Final = frozenset(
     {
         "text", "code", "render", "file", "image", "search", "relationMap", "book", "noteMap",
         "mermaid", "webView", "shortcut", "doc", "contentWidget", "launcher",
+        "canvas", "mindMap",
     }
 )  # fmt: skip
-"""Every ``Note.type`` ETAPI's published description lists. A type outside it is a Trilium newer
+"""Every ``Note.type`` this connector has seen: ETAPI's published list, plus ``canvas`` and
+``mindMap``, which a live server returns and the list omits. A type outside it is a Trilium newer
 than this connector, and it is reported rather than quietly left out (§3)."""
 
 INVENTORY_MAX_AGE_SECONDS: Final = 600.0

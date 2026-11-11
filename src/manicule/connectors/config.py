@@ -427,7 +427,7 @@ class TriliumConfig(BaseModel):
         "to the root passes through one of them. Empty means every note not excluded.",
     )
     exclude_labels: tuple[str, ...] = Field(
-        default=("manicule-skip",),
+        default=("manicule_skip",),
         max_length=256,
         description="Label names (without the ``#``). A note carrying one, and every note "
         "beneath it, is never read. Exclusion wins over ``root_note_ids`` and is judged on every "
@@ -468,12 +468,28 @@ class TriliumConfig(BaseModel):
     def _base_url(cls, value: str) -> str:
         return normalize_base_url(value)
 
-    @field_validator("root_note_ids", "exclude_labels")
+    @field_validator("root_note_ids")
     @classmethod
-    def _names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        cleaned = tuple(dict.fromkeys(value.strip().lstrip("#") for value in values))
+    def _ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(dict.fromkeys(value.strip() for value in values))
         if any(not value for value in cleaned):
-            msg = "a note id or label name must not be blank"
+            msg = "a note id must not be blank"
+            raise ValueError(msg)
+        return cleaned
+
+    @field_validator("exclude_labels")
+    @classmethod
+    def _labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        """Label names as Trilium stores them.
+
+        Trilium rewrites every character of a label name that is not a letter, a digit, ``_`` or
+        ``:`` to ``_`` (``#manicule-skip`` is stored as ``manicule_skip``), so a name configured
+        the way a person would type it would otherwise never match the label on the server and
+        an exclusion would silently exclude nothing (``docs/connectors/trilium.md`` §5).
+        """
+        cleaned = tuple(dict.fromkeys(_trilium_label(value) for value in values))
+        if any(not value for value in cleaned):
+            msg = "a label name must not be blank"
             raise ValueError(msg)
         return cleaned
 
@@ -1391,6 +1407,12 @@ def resolve_trilium_token(
         )
         raise ConfigError(msg)
     return config.model_copy(update={"token": token})
+
+
+def _trilium_label(value: str) -> str:
+    """``value`` as Trilium would store it as a label name, without the ``#``."""
+    name = value.strip().lstrip("#")
+    return "".join(c if c.isalnum() or c in "_:" else "_" for c in name)
 
 
 def _secret(value: str | None) -> SecretStr | None:

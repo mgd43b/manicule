@@ -135,6 +135,18 @@ def test_a_base_url_that_is_not_a_plain_http_origin_is_refused(url: str) -> None
         TriliumConfig(base_url=url)
 
 
+def test_a_label_is_matched_by_the_name_trilium_stores_it_under() -> None:
+    """Trilium stores ``#manicule-skip`` as ``manicule_skip``. Matched as typed, an exclusion would
+    exclude nothing: this was found against a live server."""
+    assert TriliumConfig(base_url=BASE).exclude_labels == ("manicule_skip",)
+    assert TriliumConfig(
+        base_url=BASE, exclude_labels=("#manicule-skip", "a b:c")
+    ).exclude_labels == (
+        "manicule_skip",
+        "a_b:c",
+    )
+
+
 def test_labels_are_written_without_the_hash_and_blank_names_are_refused() -> None:
     assert TriliumConfig(base_url=BASE, exclude_labels=("#private", "x")).exclude_labels == (
         "private",

@@ -231,7 +231,7 @@ async def test_root_note_ids_leave_out_everything_elsewhere() -> None:
 
 async def test_a_label_excludes_the_note_and_everything_beneath_it() -> None:
     server = vault()
-    server.notes["work"].labels = {"manicule-skip": ""}
+    server.notes["work"].labels = {"manicule_skip": ""}
 
     found = await discovered(connector_for(server))
 
@@ -240,7 +240,7 @@ async def test_a_label_excludes_the_note_and_everything_beneath_it() -> None:
 
 async def test_exclusion_is_judged_on_every_path_so_a_clone_cannot_escape_it() -> None:
     server = vault()
-    server.notes["work"].labels = {"manicule-skip": ""}
+    server.notes["work"].labels = {"manicule_skip": ""}
     server.notes["plan"].parents = ("work", "home")  # also under an unmarked parent
 
     found = await discovered(connector_for(server))
@@ -250,7 +250,7 @@ async def test_exclusion_is_judged_on_every_path_so_a_clone_cannot_escape_it() -
 
 async def test_exclusion_wins_over_a_root_note_id() -> None:
     server = vault()
-    server.notes["plan"].labels = {"manicule-skip": ""}
+    server.notes["plan"].labels = {"manicule_skip": ""}
 
     found = await discovered(connector_for(server, config(root_note_ids=["work"])))
 
@@ -380,7 +380,7 @@ async def test_fetching_reads_content_only_for_the_notes_asked_for() -> None:
 
 async def test_a_note_outside_scope_is_not_served_even_if_a_ref_names_it() -> None:
     server = vault()
-    server.add(FakeNote("private", "Private", parents=("work",), labels={"manicule-skip": ""}))
+    server.add(FakeNote("private", "Private", parents=("work",), labels={"manicule_skip": ""}))
     connector = connector_for(server)
     found = await discovered(connector)
     ref = found["plan"].ref.model_copy(update={"source_id": "private"})
@@ -524,7 +524,7 @@ async def test_a_read_is_judged_on_a_sweep_no_older_than_the_limit() -> None:
     connector = connector_for(server, clock=clock)
     found = await discovered(connector)
 
-    server.notes["plan"].labels = {"manicule-skip": ""}
+    server.notes["plan"].labels = {"manicule_skip": ""}
     await connector.fetch(found["plan"].ref)  # still inside the age limit: served from the sweep
 
     clock.now = INVENTORY_MAX_AGE_SECONDS + 1
