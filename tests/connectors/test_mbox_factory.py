@@ -69,7 +69,7 @@ def test_an_unsafe_exclude_pattern_is_refused_at_load() -> None:
         MboxConfig(root="/srv/mail", exclude=("../elsewhere",))
 
 
-def test_the_other_mail_sources_are_the_other_gmail_and_mbox_instances(
+def test_the_other_mail_sources_are_the_other_gmail_outlook_and_mbox_instances(
     settings: Settings, tmp_path: Path
 ) -> None:
     configured = settings.model_copy(
@@ -78,6 +78,7 @@ def test_the_other_mail_sources_are_the_other_gmail_and_mbox_instances(
                 "old": ConnectorSettings(type="mbox"),
                 "other-archive": ConnectorSettings(type="mbox", enabled=False),
                 "mail": ConnectorSettings(type="gmail"),
+                "work": ConnectorSettings(type="outlook"),
                 "wiki": ConnectorSettings(type="confluence"),
                 "files": ConnectorSettings(type="filesystem"),
             }
@@ -86,7 +87,7 @@ def test_the_other_mail_sources_are_the_other_gmail_and_mbox_instances(
     connector = build_mbox(context(configured, tmp_path, MboxConfig(root=str(tmp_path))))
     assert isinstance(connector, MboxConnector)
     assert connector.name == "old"
-    assert connector.other_sources == ("mail", "other-archive")
+    assert connector.other_sources == ("mail", "other-archive", "work")
 
 
 def test_every_option_that_changes_what_is_yielded_changes_the_scope(tmp_path: Path) -> None:

@@ -29,7 +29,7 @@ from manicule.connectors.gmail_login import (
     GMAIL_READONLY_SCOPE,
     FileSink,
     StreamSink,
-    _challenge,  # pyright: ignore[reportPrivateUsage]
+    pkce_challenge,
 )
 from manicule.core.errors import ConfigError
 from tests.app.fakes import FakeBackend
@@ -136,7 +136,7 @@ async def test_the_whole_flow_writes_the_token_to_a_private_file(
 def test_the_pkce_challenge_is_the_s256_of_the_verifier() -> None:
     """The worked example in RFC 7636, appendix B."""
     verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-    assert _challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    assert pkce_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
 
 async def test_a_redirect_with_the_wrong_state_is_refused_and_nothing_is_exchanged(

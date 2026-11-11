@@ -307,6 +307,7 @@ server and the built command tree.
 | `connector_reconcile_resolve` | ✓ | `connector reconcile NAME --confirm` / `--discard` | the same counts, for the proposal the deletion ceiling refused |
 | `connector_login` | — | `connector login` | who a captured browser session belongs to |
 | `connector_login_gmail` | — | `connector login` (a Gmail source) | where a refresh token was written, never the token |
+| `connector_login_outlook` | — | `connector login` (an Outlook source) | where a refresh token was written, never the token |
 | `config_get` | ✓ | `config get` / `config show` | configuration, redacted |
 | `config_set` | ✓ | `config set` | the key, before and after |
 | `workspace_list` | ✓ | `workspace list` | workspaces, active marked |
@@ -393,7 +394,7 @@ incremental walk, and is not the same claim as `false`. Absent `enumeration_offs
 ### Operations with no MCP tool, and why
 
 `reset_index`, `backup`, `restore`, `import`, `upgrade`, `start`, `stop`, `connector_login`,
-`connector_login_gmail`, `connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
+`connector_login_gmail`, `connector_login_outlook`, `connector_sidecar`, `collection_orphans`, `document_reindex_stale`, `document_reembed`, the
 five mutating or corpus-scanning `reembed` operations, `rebuild_run`, and the `auth` verbs — keys
 and people alike — have no tool; the `auth` verbs are on the HTTP surface for an administrator
 too (§9.2). Each of them either destroys data, mints a credential, writes into the
@@ -963,7 +964,8 @@ release whether or not anything changed.
 Checks, in the order `doctor` emits them: `configuration`, `transport`, `sign_in`, `plugins`,
 `storage`, `permissions`, `index`, `vector_integrity`, `vector_backend`, `glossary`,
 `connectors`, `reconciliation-overdue`, `reconciliation-proposals`, `authoring`,
-`collection-membership`, `sessions`, `gmail-credential`, `security_alerts`, `document-identity`,
+`collection-membership`, `sessions`, `gmail-credential`, `outlook-credential`, `security_alerts`,
+`document-identity`,
 `document-content`, `extractable-text`, `wiki-provenance`, `grammars`, `vocabularies`, `models`,
 and
 `component:<kind>:<name>` for anything already constructed.
@@ -1076,6 +1078,16 @@ question — a collection nobody has created yet is one `collection_create` away
 reported "no exposure" until somebody made it would go quiet exactly while an operator was
 setting the thing up.
 
+`outlook-credential` is the same question of Microsoft for each enabled `outlook` source: it resolves
+the refresh token (from the configuration, `refresh_token_file` or the environment), refreshes an
+access token and calls `GET /me` once, and compares the mailbox that answered with the configured
+`account` by the rule (`identity_mismatch`) the connector applies at setup and at the start of every
+run ([`connectors/outlook.md`](connectors/outlook.md) §1.4, §10). It is `ok` when no enabled source
+is of that type, `failing` for a missing token, a revoked grant, a refused app registration or a
+token for another mailbox, and `degraded` when Microsoft did not answer. **It never writes a
+rotated token**: `doctor` is a read. Like `gmail-credential` it reports source names and a fixed word
+per outcome, never an address.
+
 `gmail-credential` asks Google whether each enabled `gmail` source's credential works for the
 mailbox it names. It is `ok` when no enabled source is of that type, so a corpus without Gmail
 never sees it fail. For each enabled source it resolves the client secret and refresh token,
@@ -1115,7 +1127,7 @@ shortest actionable instruction. `remedy` is empty on a healthy check, and on on
 depends on how the state was reached rather than on a step that can be named: an empty `remedy`
 means manicule has nothing specific to suggest, never that the check is fine.
 
-**`component:*` checks, and `gmail-credential` for a configured Gmail source, are the only parts
+**`component:*` checks, and `gmail-credential` and `outlook-credential` for a configured mail source, are the only parts
 of a diagnosis that leave the machine**, and `component:*` is bounded twice because of it. Components are asked concurrently rather than in turn, so a
 diagnosis costs the slowest remote check instead of the sum of all of them; one that does not
 answer within its own timeout is `degraded` with a detail saying so, and the whole sweep has a
@@ -1169,7 +1181,7 @@ vocabularies every search measures a context with
 ([`retrieval.md`](retrieval.md#72-two-token-counters-and-using-the-wrong-one-is-a-category-error) §7.2), each from an offline
 bundle if one is installed and from its upstream otherwise — and then reports the state that
 resulted. They are the only parts of this command that write to the machine, and with
-`component:*` and `gmail-credential` the only ones that use the network. The flag is passed by **the command line alone**: the MCP tool and `GET /api/v1/health`
+`component:*`, `gmail-credential` and `outlook-credential` the only ones that use the network. The flag is passed by **the command line alone**: the MCP tool and `GET /api/v1/health`
 call the report, because a diagnostic an assistant can reach should not be able to start a
 download. `manicule init` runs the same repairs, which is how a fresh install ends up able to
 parse code and answer a question rather than discovering at first index, or at first search,

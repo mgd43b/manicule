@@ -22,7 +22,14 @@ from manicule.connectors import (
     resolve_credentials,
 )
 from manicule.connectors.config import GitSiteConfig, GmailConfig
-from manicule.connectors.plugin import PLUGIN, build_confluence, build_git_site, build_gmail
+from manicule.connectors.outlook_config import OutlookConfig
+from manicule.connectors.plugin import (
+    PLUGIN,
+    build_confluence,
+    build_git_site,
+    build_gmail,
+    build_outlook,
+)
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.core.protocols import (
@@ -35,7 +42,11 @@ from manicule.plugins.manifest import ComponentKind
 from manicule.plugins.registry import BuildContext
 from manicule.testing import assert_connector_contract, assert_protocol_signatures
 from tests.connectors.fake_confluence import FakeAttachment, FakeConfluence, FakePage
+from tests.connectors.fake_graph import FakeEvent
+from tests.connectors.fake_graph import mail as graph_mail
 from tests.connectors.gmail_support import mail, mailbox, opened
+from tests.connectors.outlook_support import opened as outlook_opened
+from tests.connectors.outlook_support import tenant
 from tests.connectors.support import Waits, cloud_config, connected
 
 
@@ -66,6 +77,22 @@ async def test_the_gmail_connector_satisfies_the_connector_contract() -> None:
     for number in range(3):
         server.add_message(mail(f"Message {number}"))
     async with opened(server, time) as connector:
+        await assert_connector_contract(connector)
+        assert_protocol_signatures(connector, Connector)
+        assert isinstance(connector, BatchedDiscoveryConnector)
+        assert isinstance(connector, BatchedReconciliationConnector)
+
+
+@pytest.mark.contract
+async def test_the_outlook_connector_satisfies_the_connector_contract() -> None:
+    """Including that ``reconcile`` reports every item ``discover`` just returned, messages and
+    events alike, and that an abandoned walk does not move the watermark."""
+    server, time = tenant()
+    for number in range(3):
+        server.add_message(graph_mail(f"Message {number}"))
+    server.add_message(graph_mail("Filed"), "Archive")
+    server.add_event(FakeEvent("e1", "Planning", "2026-03-02T14:00:00", "2026-03-02T15:00:00"))
+    async with outlook_opened(server, time) as connector:
         await assert_connector_contract(connector)
         assert_protocol_signatures(connector, Connector)
         assert isinstance(connector, BatchedDiscoveryConnector)
@@ -110,6 +137,10 @@ def test_discovery_finds_the_connector_with_its_configuration_model() -> None:
     gmail = registry.record(keys.CONNECTOR.named("gmail"))
     assert gmail.config_model is GmailConfig
 
+    outlook = registry.record(keys.CONNECTOR.named("outlook"))
+    assert outlook.config_model is OutlookConfig
+    assert outlook.sensitive, "an installation holding mail is never served unauthenticated"
+
 
 @pytest.mark.contract
 def test_registering_the_connector_loads_no_http_client() -> None:
@@ -135,6 +166,9 @@ def test_registering_the_connector_loads_no_http_client() -> None:
     assert "manicule.connectors.git_site" not in loaded
     assert "manicule.connectors.gmail_client" not in loaded
     assert "manicule.connectors.gmail" not in loaded
+    assert "manicule.connectors.outlook_client" not in loaded
+    assert "manicule.connectors.outlook" not in loaded
+    assert "manicule.connectors.outlook_auth" not in loaded
 
 
 def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
@@ -156,11 +190,13 @@ def test_a_factory_handed_the_wrong_configuration_refuses_it() -> None:
         build_git_site(context)
     with pytest.raises(ConfigError, match="GmailConfig"):
         build_gmail(context)
+    with pytest.raises(ConfigError, match="OutlookConfig"):
+        build_outlook(context)
 
 
 def test_the_plugin_registers_the_sources_this_build_ships() -> None:
     """Confluence live, Confluence from disk, the local filesystem ``manicule index`` walks, the
-    pinned Git site, and Gmail.
+    pinned Git site, Gmail and Outlook.
 
     Asserted as an exact list rather than a membership check: a connector registered and
     never mentioned anywhere is a source nobody knows they can configure.
@@ -180,6 +216,7 @@ def test_the_plugin_registers_the_sources_this_build_ships() -> None:
         "git-site",
         "gmail",
         "mbox",
+        "outlook",
     ]
 
 

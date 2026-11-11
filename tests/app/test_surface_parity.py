@@ -160,6 +160,7 @@ def test_no_tool_opens_a_browser_or_captures_a_credential() -> None:
     # The Gmail flavor opens the same browser window and mints a longer-lived secret, so the
     # reasoning is the same and it is stated once.
     assert "connector_login_gmail" not in TOOL_NAMES
+    assert "connector_login_outlook" not in TOOL_NAMES
 
 
 def test_no_tool_re_parses_the_whole_corpus() -> None:

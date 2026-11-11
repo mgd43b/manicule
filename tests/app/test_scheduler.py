@@ -633,6 +633,7 @@ def test_a_scheduled_sync_can_never_launch_a_browser() -> None:
         "InstalledChromiumProvider",
         "connector_login(",
         "connector_login_gmail(",
+        "connector_login_outlook(",
         "mint_refresh_token",
         "launch_persistent_context",
         "_driver_for",

@@ -724,6 +724,7 @@ PAYLOADS: dict[str, type[Payload]] = {
     "browser_auth_install": r.MessagingHostInstalled,
     "connector_login": r.ConnectorSignedIn,
     "connector_login_gmail": r.ConnectorTokenIssued,
+    "connector_login_outlook": r.ConnectorTokenIssued,
     "connector_sidecar": r.SidecarReport,
     "connector_reconcile": r.ConnectorReconciled,
     "connector_reconcile_resolve": r.ConnectorReconciled,
@@ -845,8 +846,9 @@ def read_password(prompt: str, *, confirm: bool = False) -> str:
 
 
 GMAIL_FILE_OPTION_ON_ANOTHER_SOURCE = (
-    "--token-file writes the refresh token a Gmail source signs in with, and this is not a "
-    "Gmail source. A Confluence session is handed to the running server and written nowhere."
+    "--token-file writes the refresh token a Gmail or Outlook source signs in with, and this is "
+    "not a Gmail or Outlook source. A Confluence session is handed to the running server and "
+    "written nowhere."
 )
 OVERWRITE_WITHOUT_A_FILE = "--overwrite-token-file replaces --token-file, and none was given."
 
@@ -872,8 +874,9 @@ def _gmail_login(
     overwrite: bool,
     timeout: float | None,
     confluence_options: list[str],
+    outlook: bool = False,
 ) -> None:
-    """Mint a Gmail source's refresh token, and put it where the operator said.
+    """Mint a Gmail or Outlook source's refresh token, and put it where the operator said.
 
     Separate from the Confluence path because nothing about it is shared: it needs no server
     (the token goes to a person, not to a process), it takes no pasted secret, and its result is
@@ -889,8 +892,8 @@ def _gmail_login(
     if confluence_options:
         raise typer.BadParameter(
             f"{' and '.join(confluence_options)} capture a Confluence session, and {name!r} is "
-            f"a Gmail source: it signs in with a refresh token that goes to --token-file or "
-            f"to a pipe."
+            f"a {'Outlook' if outlook else 'Gmail'} source: it signs in with a refresh token "
+            f"that goes to --token-file or to a pipe."
         )
     if timeout is not None and timeout <= 0:
         raise typer.BadParameter(BROWSER_TIMEOUT_MUST_BE_POSITIVE)
@@ -904,14 +907,24 @@ def _gmail_login(
         if token_file is not None
         else StreamSink(sys.stdout)
     )
-    envelope = asyncio.run(
-        _execute(
-            "connector_login_gmail",
-            lambda service: service.connector_login_gmail(
-                name, sink=sink, timeout_seconds=timeout, announce=_say
-            ),
+    if outlook:
+        envelope = asyncio.run(
+            _execute(
+                "connector_login_outlook",
+                lambda service: service.connector_login_outlook(
+                    name, sink=sink, timeout_seconds=timeout, announce=_say
+                ),
+            )
         )
-    )
+    else:
+        envelope = asyncio.run(
+            _execute(
+                "connector_login_gmail",
+                lambda service: service.connector_login_gmail(
+                    name, sink=sink, timeout_seconds=timeout, announce=_say
+                ),
+            )
+        )
     if token_file is None and envelope.ok and envelope.data is not None:
         # Standard output is the token's. The result is for the person, so it goes to the stream
         # they are watching.
@@ -1955,7 +1968,7 @@ def connector_login(
         typer.Option(
             "--timeout",
             help="Seconds to wait for browser sign-in. Defaults to browser_timeout_seconds "
-            "for Confluence and to 300 for Gmail.",
+            "for Confluence and to 300 for Gmail and Outlook.",
         ),
     ] = None,
     allow_insecure_state: Annotated[
@@ -1972,19 +1985,27 @@ def connector_login(
         Path | None,
         typer.Option(
             "--token-file",
-            help="Gmail: write the refresh token to this new file, created readable only by "
-            "you. Without it the token goes to standard output, which must not be a terminal.",
+            help="Gmail or Outlook: write the refresh token to this new file, created readable "
+            "only by you. Without it the token goes to standard output, which must not be a "
+            "terminal.",
         ),
     ] = None,
     overwrite_token_file: Annotated[
         bool,
         typer.Option(
             "--overwrite-token-file",
-            help="Gmail: replace --token-file if it already exists.",
+            help="Gmail or Outlook: replace --token-file if it already exists.",
         ),
     ] = False,
 ) -> None:
-    """Sign in to a source: capture a Confluence session, or mint a Gmail refresh token.
+    """Sign in to a source: capture a Confluence session, or mint a Gmail or Outlook token.
+
+    **An Outlook source** (Microsoft 365) signs in the same way with Microsoft's authorization
+    code flow: your browser opens, you choose the account the source indexes, and the refresh token
+    comes back to a port opened on this machine for this one sign-in. It is checked against the
+    source's `account` before it is written, and goes where `--token-file` says (or to a pipe).
+    Microsoft rotates refresh tokens; name the same file as the source's `refresh_token_file` and
+    the server keeps it current.
 
     **A Gmail source** signs in with Google's installed-app flow: this opens your browser, you
     choose the account the source indexes, and the refresh token comes back to a port opened
@@ -2024,17 +2045,21 @@ def connector_login(
     if overwrite_token_file and token_file is None:
         raise typer.BadParameter(OVERWRITE_WITHOUT_A_FILE)
     from manicule.connectors.config import GMAIL_CONNECTOR_NAME  # noqa: PLC0415 - pydantic only
+    from manicule.connectors.outlook_config import OUTLOOK_CONNECTOR_NAME  # noqa: PLC0415
 
     kind = _configured_type(name)
     # A type that could not be told, with an option only a Gmail source takes, goes the Gmail way
     # too: the service then says what is actually wrong — configuration that will not load, or
     # no source by that name — where the Confluence path would call the source "not Gmail".
-    if kind == GMAIL_CONNECTOR_NAME or (kind is None and token_file is not None):
+    if kind in {GMAIL_CONNECTOR_NAME, OUTLOOK_CONNECTOR_NAME} or (
+        kind is None and token_file is not None
+    ):
         _gmail_login(
             name,
             token_file=token_file,
             overwrite=overwrite_token_file,
             timeout=timeout,
+            outlook=kind == OUTLOOK_CONNECTOR_NAME,
             confluence_options=[
                 label
                 for label, asked in (

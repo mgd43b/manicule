@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MAIL_MESSAGE_ID_KEY",
+    "MAIL_THREAD_ID_KEY",
     "message_id_from_link",
     "message_id_of",
     "normalize_message_id",
@@ -26,6 +27,13 @@ __all__ = [
 
 MAIL_MESSAGE_ID_KEY: Final = "mail_message_id"
 """The ``documents.metadata`` key a mail document records its normalized ``Message-ID`` under."""
+
+MAIL_THREAD_ID_KEY: Final = "mail_thread_id"
+"""The ``documents.metadata`` key a mail connector records its conversation under.
+
+Read by the ``collapse`` retrieval stage after its configured ``thread_key`` (``docs/retrieval.md``
+§5.5), so a source that is not Gmail still has its reply chains collapsed.
+"""
 
 MAX_MESSAGE_ID_LENGTH: Final = 512
 """A longer value is not a message id; RFC 5322 limits a line to 998 characters, id included."""

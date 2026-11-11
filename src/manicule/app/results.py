@@ -2708,7 +2708,8 @@ class Check(Payload):
     ``plugins``,
     ``storage``, ``permissions``, ``index``, ``vector_integrity``, ``glossary``, ``connectors``,
     ``authoring``, ``collection-membership``, ``reconciliation-overdue``,
-    ``reconciliation-proposals``, ``sessions``, ``gmail-credential``, ``security_alerts``,
+    ``reconciliation-proposals``, ``sessions``, ``gmail-credential``, ``outlook-credential``,
+    ``security_alerts``,
     ``document-identity``, ``document-content``, ``extractable-text``, ``wiki-provenance``,
     ``grammars``, ``vocabularies``, ``models``, and ``component:<kind>:<name>`` for anything
     already constructed. ``vector_backend`` is emitted too and had been missing from this list
@@ -2945,7 +2946,7 @@ class ConnectorSignedIn(Payload):
 
 
 class ConnectorTokenIssued(Payload):
-    """A Gmail refresh token minted for a source, verified against its mailbox, and put somewhere.
+    """A Gmail or Outlook refresh token minted for a source, verified against its mailbox, and put.
 
     Carries no part of the token and never will: it is a secret the caller has just been handed
     by another route (a file, a pipe), and a result that echoed any of it would put it in a
@@ -2956,7 +2957,7 @@ class ConnectorTokenIssued(Payload):
 
     name: str = Field(description="The configured source the token was minted for.")
     account: str = Field(description="The mailbox the source indexes, confirmed to be the token's.")
-    scope: str = Field(description="The one scope the token carries.")
+    scope: str = Field(description="The scope or scopes the token carries.")
     written_to: str = Field(description="Where the token was put, in words. Never the token.")
 
 

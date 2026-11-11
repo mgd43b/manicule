@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### The Outlook source reads a Microsoft 365 mailbox and calendar
+
+A `type = "outlook"` source syncs one Microsoft 365 mailbox and its calendar, read-only, through
+Microsoft Graph. **It is built and tested against a synthetic Graph and has never run against a live
+tenant**; [`connectors/outlook.md`](connectors/outlook.md) §11 lists what that leaves unverified,
+and you should run `manicule doctor` and a first sync against a mailbox you can afford to
+re-index before trusting it.
+
+- **Sign-in.** A delegated, read-only sign-in as a public client (an Entra app registration
+  someone in your directory creates; there is no client secret). Configuration takes the account, the
+  tenant's GUID and the registration's client id. `manicule connector login NAME` runs the browser
+  flow with PKCE and writes the refresh token to `--token-file` or a pipe, after checking it reads the
+  configured mailbox. Microsoft rotates refresh tokens, so name the same file as
+  `refresh_token_file` and the server keeps it current.
+- **Mail.** Graph's message delta is per folder, so the first sync walks every in-scope folder
+  once and later syncs follow one delta link per folder, costing what changed. Each message is
+  fetched once, as its whole MIME, through the existing mail parser. Junk Email, Deleted Items,
+  Drafts, Outbox and Sync Issues (with their subfolders) are never read; `exclude_folders` takes
+  folder paths. A deleted message, or one moved into an excluded folder, leaves the index at the
+  next reconciliation.
+- **Calendar.** Events in a window around now (90 days back and 180 ahead by default) are listed
+  afresh each sync and rendered as iCalendar for the existing calendar parser; an edited event is
+  fetched again, and an event that leaves the window is removed at reconciliation.
+- **Elsewhere.** `doctor` gained an `outlook-credential` check. An installation holding an Outlook
+  source refuses to be served without authentication, as with Gmail. The mbox source's
+  `skip_known_message_ids` now also skips a message an Outlook source holds, and the `collapse`
+  retrieval stage collapses Outlook conversations through a new `mail_thread_id` document field.
+
+Read [`connectors/outlook.md`](connectors/outlook.md) §9 before pointing this at a real mailbox:
+whoever can search the workspace reads every message, so keep an Outlook source in a workspace of
+its own. The two Gmail login helpers it shares (the loopback listener and the token sinks) are
+unchanged in behavior.
+
 ### Passwords for local people: a browser signs in with a handle and password
 
 Under `security.auth.mode = "api_key"` with a `security.auth.session_secret`, a person created

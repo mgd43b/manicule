@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     from manicule.connectors.enriched import EnrichedProfile
     from manicule.connectors.filesystem import FilesystemConnector
     from manicule.connectors.gmail_login import TokenSink
+    from manicule.connectors.outlook_config import OutlookConfig
     from manicule.connectors.sessions import SessionStore
     from manicule.core.acquisition import AcquisitionRun
     from manicule.core.ann import AnnIndexState
@@ -2189,6 +2190,7 @@ class ApplicationService:
             GMAIL_CONNECTOR_NAME,
             ConfluenceConfig,
         )
+        from manicule.connectors.outlook_config import OUTLOOK_CONNECTOR_NAME  # noqa: PLC0415
         from manicule.connectors.sessions import (  # noqa: PLC0415
             capture,
             capture_cookies,
@@ -2220,9 +2222,9 @@ class ApplicationService:
         configured = self._enabled_source(name)
         if configured.type != CONNECTOR_NAME:
             hint = (
-                " A Gmail source is signed in with a refresh token instead, which the command "
-                "line mints (`manicule connector login`)."
-                if configured.type == GMAIL_CONNECTOR_NAME
+                " A Gmail or Outlook source is signed in with a refresh token instead, which the "
+                "command line mints (`manicule connector login`)."
+                if configured.type in {GMAIL_CONNECTOR_NAME, OUTLOOK_CONNECTOR_NAME}
                 else ""
             )
             msg = (
@@ -2421,6 +2423,116 @@ class ApplicationService:
             name=name,
             account=config.account,
             scope=GMAIL_READONLY_SCOPE,
+            written_to=sink.describe(),
+        )
+
+    async def connector_login_outlook(
+        self,
+        name: str,
+        *,
+        sink: TokenSink,
+        timeout_seconds: float | None = None,
+        announce: Callable[[str], None] | None = None,
+        open_browser: Callable[[str], object] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> r.ConnectorTokenIssued:
+        """Mint a refresh token for an Outlook source, prove it reads the source's mailbox, put it.
+
+        Entra's authorization code flow with PKCE in a browser on this machine
+        (:func:`~manicule.connectors.outlook_login.mint_refresh_token`), then the same check
+        ``doctor`` makes (one refresh and one ``GET /me``) against the source's ``account``, then
+        the sink, in that order and no other:
+
+        - **The sink is checked first**, before the browser opens.
+        - **The mailbox is checked before anything is written.** A browser signed in to a
+          different account yields a perfectly good token for the wrong mailbox, and the instance
+          pins one (``docs/connectors/outlook.md`` §1.4). That token is refused and written
+          nowhere; neither address is printed.
+
+        **Nothing is stored by manicule.** The token goes where the caller said and the result
+        records where, never what. The configuration file is not touched.
+
+        Args:
+            name: The configured source. It must exist, be enabled and be an Outlook source.
+            sink: Where the token goes: a file created ``0600``, or a stream that is not a
+                terminal.
+            timeout_seconds: How long to wait for the sign-in. ``None`` waits five minutes.
+            announce: Receives the progress lines, which include the address to open by hand.
+            open_browser: Opens an address; the default browser when ``None``.
+            transport: Replaces the network, for the reason ``capture``'s parameter does.
+
+        Raises:
+            UnknownEntityError: Configuration has no connector by that name.
+            PolicyError: The source is configured ``enabled = false``.
+            ConfigError: Not an Outlook source, its options do not validate, the sink is
+                unusable, or the HTTP client is not installed.
+            CredentialError: The sign-in failed, or the token reads another mailbox.
+        """
+        from manicule.connectors.errors import MailboxMismatchError  # noqa: PLC0415
+        from manicule.connectors.outlook_auth import outlook_credential  # noqa: PLC0415
+        from manicule.connectors.outlook_config import (  # noqa: PLC0415 - no HTTP stack at import
+            OUTLOOK_CONNECTOR_NAME,
+            OutlookConfig,
+        )
+        from manicule.connectors.outlook_login import (  # noqa: PLC0415
+            DEFAULT_SIGN_IN_TIMEOUT_SECONDS,
+            mint_refresh_token,
+        )
+
+        configured = self._enabled_source(name)
+        if configured.type != OUTLOOK_CONNECTOR_NAME:
+            msg = (
+                f"{name!r} is a {configured.type!r} source. A refresh token is how an "
+                f"{OUTLOOK_CONNECTOR_NAME!r} source authenticates; nothing else has one to mint."
+            )
+            raise ConfigError(msg)
+        # The same merge `doctor` makes, so the two read one set of options.
+        options = {
+            **self.settings.component_config("connector", OUTLOOK_CONNECTOR_NAME),
+            **configured.options,
+        }
+        try:
+            config = OutlookConfig.model_validate(options)
+        except ValidationError as exc:
+            fields = ", ".join(sorted({".".join(map(str, e["loc"])) for e in exc.errors()}))
+            msg = (
+                f"the options of {name!r} are not valid ({fields}). Fix [connectors.{name}."
+                f"options] as docs/connectors/outlook.md §1.3 shows."
+            )
+            raise ConfigError(msg) from exc
+
+        sink.check()
+        token = await mint_refresh_token(
+            config,
+            announce=announce if announce is not None else (lambda _message: None),
+            open_browser=open_browser,
+            timeout_seconds=(
+                DEFAULT_SIGN_IN_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+            ),
+            transport=transport,
+        )
+        credential = outlook_credential(
+            config.model_copy(update={"refresh_token": token, "refresh_token_file": None}),
+            instance=name,
+            transport=transport,
+        )
+        try:
+            await credential.confirm_mailbox(config.account)
+        except MailboxMismatchError:
+            # Not the credential's own message, which says a *run* did not begin and points at
+            # `connector login` as the cure, which is circular here.
+            msg = (
+                "the account that signed in is not the mailbox this instance indexes, so the "
+                "token was discarded and nothing was written. Sign in as the configured "
+                "account (an alias of it counts as different). The extra grant can be removed "
+                "from that account's apps and permissions."
+            )
+            raise MailboxMismatchError(msg) from None
+        sink.write(token)
+        return r.ConnectorTokenIssued(
+            name=name,
+            account=config.account,
+            scope=" ".join(config.scopes),
             written_to=sink.describe(),
         )
 
@@ -3975,6 +4087,9 @@ class ApplicationService:
             await self._bounded(("gmail-credential",), self._gmail_credential_check(), deadline)
         )
         checks.extend(
+            await self._bounded(("outlook-credential",), self._outlook_credential_check(), deadline)
+        )
+        checks.extend(
             await self._bounded(("security_alerts",), self._security_alerts_check(), deadline)
         )
         checks.extend(
@@ -5046,6 +5161,105 @@ class ApplicationService:
             )
         return r.Check(
             name="gmail-credential",
+            state="degraded" if only_unreachable else "failing",
+            detail=f"{problems}. Nothing was read from any mailbox.{stale}",
+            facts=facts,
+            remedy=remedy,
+        )
+
+    async def _outlook_credential_check(self) -> r.Check:
+        """Whether every Outlook source has a credential that works for the mailbox it names.
+
+        The counterpart of ``gmail-credential`` and for the same reasons (see that check): a
+        revoked grant is invisible in configuration, so for each enabled Outlook source this
+        resolves the credential, refreshes it and compares the mailbox it reads with the
+        configured ``account``: the same
+        :meth:`~manicule.connectors.outlook_auth.OutlookCredential.confirm_mailbox` the connector
+        runs before it is handed out (``docs/connectors/outlook.md`` §1.2, §1.4).
+
+        **Its name is a contract**, as every check's is: monitors select on it.
+
+        **States.** ``failing`` when the next sync would stop on a credential: a token that is
+        absent, a grant that is revoked or now needs an interactive step, an app registration
+        Microsoft rejects, or a token for another mailbox. ``degraded`` when Microsoft could not
+        be asked, which says nothing about the credential. Neither the detail nor the facts
+        carries an address, a token or a secret: only source names and fixed outcome words.
+        """
+        from manicule.connectors.outlook_config import OUTLOOK_CONNECTOR_NAME  # noqa: PLC0415
+
+        defaults = self.settings.component_config("connector", OUTLOOK_CONNECTOR_NAME)
+        sources = sorted(
+            (name, {**defaults, **configured.options})
+            for name, configured in self.settings.connectors.items()
+            if configured.type == OUTLOOK_CONNECTOR_NAME and configured.enabled
+        )
+        found = await asyncio.gather(
+            *(_observed_outlook_outcome(name, options) for name, options in sources)
+        )
+        outcomes = {name: word for (name, _), (word, _) in zip(sources, found, strict=True)}
+        age = max((seen for _, seen in found), default=0.0)
+        fresh = age == 0.0
+        facts = cast(
+            "dict[str, JsonValue]",
+            {
+                "sources": dict(sorted(outcomes.items())),
+                "observed_seconds_ago": round(age, 3),
+                "freshly_measured": fresh,
+            },
+        )
+        stale = "" if fresh else f" (observed {age:.0f}s ago)"
+        if not outcomes:
+            return r.Check(
+                name="outlook-credential",
+                state="ok",
+                detail="no enabled source reads an Outlook mailbox",
+                facts=facts,
+            )
+        broken = {name: why for name, why in sorted(outcomes.items()) if why != "ok"}
+        if not broken:
+            return r.Check(
+                name="outlook-credential",
+                state="ok",
+                detail=(
+                    f"{_listed(outcomes)} refresh(es) a Graph access token and read the "
+                    f"configured mailbox{stale}"
+                ),
+                facts=facts,
+            )
+        first, why = next(iter(broken.items()))
+        sentences = {
+            "invalid_options": "has options that do not validate",
+            "dependency_missing": "cannot run because the HTTP client is not installed",
+            "missing_secret": "has no refresh token in its configuration, file or environment",
+            "different_mailbox": "holds a credential for a different mailbox than its account",
+            "grant_revoked": "has a refresh token Microsoft no longer honors",
+            "credential_rejected": "was refused by Microsoft (the app registration or the grant)",
+            "unreachable": "could not be checked because Microsoft did not answer",
+        }
+        problems = "; ".join(f"{name!r} {sentences[reason]}" for name, reason in broken.items())
+        only_unreachable = all(reason == "unreachable" for reason in broken.values())
+        if why == "dependency_missing":
+            remedy = "pip install 'manicule[connectors]'"
+        elif why == "invalid_options":
+            remedy = (
+                "fix the source's options: account, tenant_id and client_id are required, and a "
+                "key the connector does not define is refused (docs/connectors/outlook.md §1.3)"
+            )
+        elif why == "missing_secret":
+            remedy = (
+                "set refresh_token, refresh_token_file or the variable named in the source's "
+                "options (docs/connectors/outlook.md §1.3)"
+            )
+        elif why == "unreachable":
+            remedy = "check the machine can reach Microsoft, then run `manicule doctor` again"
+        else:
+            remedy = (
+                f"run `manicule connector login {first}` as the account it is configured for, "
+                f"then supply the token it writes as the source's refresh_token_file "
+                f"(docs/connectors/outlook.md §1.3)"
+            )
+        return r.Check(
+            name="outlook-credential",
             state="degraded" if only_unreachable else "failing",
             detail=f"{problems}. Nothing was read from any mailbox.{stale}",
             facts=facts,
@@ -10100,6 +10314,101 @@ async def _probe_gmail_source(name: str, resolved: GmailConfig) -> str:
     except ConnectorError as error:
         # Most specific first: each of these is a CredentialError, and anything that is not one
         # is Google failing to answer, which says nothing about the credential.
+        named = (
+            (MailboxMismatchError, "different_mailbox"),
+            (GrantRevokedError, "grant_revoked"),
+            (CredentialError, "credential_rejected"),
+        )
+        return next((word for kind, word in named if isinstance(error, kind)), "unreachable")
+    return "ok"
+
+
+OUTLOOK_PROBE_TTL_SECONDS = 30.0
+"""How long an Outlook source's probe result is reused, for the reason Gmail's is: ``doctor`` is
+asked for repeatedly by anything that renders it, and each probe is a token exchange and a Graph
+read."""
+
+OUTLOOK_PROBE_DEADLINE_SECONDS = 15.0
+"""How long ``doctor`` waits for one Outlook source's probe before calling it unreachable."""
+
+_outlook_clock: Callable[[], float] = time.monotonic
+_outlook_observations: dict[tuple[str, str], tuple[float, str]] = {}
+"""``(source, digest of its options and token)`` to ``(when, outcome)``."""
+
+
+def _resolve_outlook_source(name: str, options: Mapping[str, Any]) -> OutlookConfig | str:
+    """The source's settings with its token resolved, or the fixed word for what is wrong.
+
+    Done on every call, ahead of any reuse of an earlier probe: a token removed from the
+    environment a moment ago must not be reported as a working credential. Nothing here asks
+    Microsoft.
+    """
+    from manicule.connectors.outlook_config import (  # noqa: PLC0415 - no HTTP stack at import
+        OutlookConfig,
+        resolve_outlook_credentials,
+    )
+
+    try:
+        config = OutlookConfig.model_validate(options)
+    except ValidationError:
+        return "invalid_options"
+    try:
+        return resolve_outlook_credentials(config, instance=name)
+    except ConfigError:
+        return "missing_secret"
+
+
+async def _observed_outlook_outcome(name: str, options: Mapping[str, Any]) -> tuple[str, float]:
+    """A source's outcome and how many seconds old it is (``0.0`` when measured just now)."""
+    resolved = _resolve_outlook_source(name, options)
+    if isinstance(resolved, str):
+        return resolved, 0.0
+    material = json.dumps(
+        [
+            resolved.model_dump(mode="json"),
+            resolved.refresh_token.get_secret_value() if resolved.refresh_token else "",
+        ],
+        sort_keys=True,
+    )
+    key = (name, hashlib.blake2b(material.encode(), digest_size=16).hexdigest())
+    now = _outlook_clock()
+    held = _outlook_observations.get(key)
+    if held is not None and now - held[0] < OUTLOOK_PROBE_TTL_SECONDS:
+        return held[1], now - held[0]
+    word = await _probe_outlook_source(name, resolved)
+    if word == "dependency_missing":
+        _outlook_observations.pop(key, None)
+    else:
+        _outlook_observations[key] = (_outlook_clock(), word)
+    return word, 0.0
+
+
+async def _probe_outlook_source(name: str, resolved: OutlookConfig) -> str:
+    """One refresh and one ``GET /me`` for a source, as a word from a closed set.
+
+    **The probe never writes a token.** A rotated refresh token is held in memory and dropped with
+    the credential, because ``doctor`` is a read and a read that rewrote the stored secret would
+    race the server for it. The previous token is not revoked by use, so nothing is lost.
+    """
+    from manicule.connectors.errors import (  # noqa: PLC0415
+        ConnectorError,
+        CredentialError,
+        GrantRevokedError,
+        MailboxMismatchError,
+    )
+    from manicule.connectors.outlook_auth import outlook_credential  # noqa: PLC0415
+
+    credential = outlook_credential(
+        resolved.model_copy(update={"refresh_token_file": None}), instance=name
+    )
+    try:
+        async with asyncio.timeout(OUTLOOK_PROBE_DEADLINE_SECONDS):
+            await credential.confirm_mailbox(resolved.account)
+    except TimeoutError:
+        return "unreachable"
+    except ConfigError:
+        return "dependency_missing"
+    except ConnectorError as error:
         named = (
             (MailboxMismatchError, "different_mailbox"),
             (GrantRevokedError, "grant_revoked"),

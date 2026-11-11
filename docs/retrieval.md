@@ -1066,12 +1066,13 @@ replies and no single earlier chunk holds exactly what a later one quotes.
   containment.
 
 - **Within one conversation only.** The conversation is a document metadata field,
-  `thread_key` — `gmail_thread_id` by default, which the Gmail connector records — taken
+  `thread_key` — `gmail_thread_id` by default, which the Gmail connector records, and failing
+  that `mail_thread_id`, which the Outlook connector records as Graph's `conversationId` — taken
   together with the document's source, since a thread id is unique only within the mailbox
   that issued it. Two documents from different threads are never compared, however alike
   their text: a repeat there is not a quotation and may be the difference a question is about.
   A document with no conversation passes through untouched, so the stage changes nothing for a
-  source that does not record one. **Only Gmail records one today**: `.eml` files read from a
+  source that does not record one. **Only Gmail and Outlook record one today**: `.eml` files read from a
   filesystem source carry no thread key, so their quoted chains are not collapsed.
 - **After fusion, or refused.** It walks its input best first, and before fusion the input is
   one leg's list followed by the other's, so `rag.pipeline` naming it before `rrf` is refused

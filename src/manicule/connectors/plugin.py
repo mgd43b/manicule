@@ -31,6 +31,11 @@ from manicule.connectors.config import (
     resolve_credentials,
     resolve_gmail_credentials,
 )
+from manicule.connectors.outlook_config import (
+    OUTLOOK_CONNECTOR_NAME,
+    OutlookConfig,
+    resolve_outlook_credentials,
+)
 from manicule.container import keys
 from manicule.core.errors import ConfigError
 from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginManifest
@@ -47,6 +52,7 @@ __all__ = [
     "build_git_site",
     "build_gmail",
     "build_mbox",
+    "build_outlook",
 ]
 
 
@@ -269,6 +275,39 @@ def build_gmail(context: BuildContext) -> Connector:
     )
 
 
+def build_outlook(context: BuildContext) -> Connector:
+    """Construct the Outlook connector from validated configuration.
+
+    The refresh token is resolved here, so a source missing it fails at startup naming every
+    place it looked. **No network here**, for the reason :func:`build_gmail` gives: the refresh and
+    the mailbox check are the connector's ``setup()``, which the container awaits before the
+    connector is handed to anyone.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, or the refresh token
+            is absent.
+    """
+    from manicule.connectors.outlook import OutlookConnector  # noqa: PLC0415
+    from manicule.connectors.outlook_auth import outlook_credential  # noqa: PLC0415
+    from manicule.connectors.outlook_client import OutlookClient  # noqa: PLC0415
+
+    settings = context.config
+    if not isinstance(settings, OutlookConfig):
+        msg = (
+            f"connector {OUTLOOK_CONNECTOR_NAME!r} was built with {type(settings).__name__} "
+            f"where it declares OutlookConfig. Configuration reaching a factory is validated "
+            f"against the model the component registered; a factory called outside the "
+            f"container has to supply that model itself."
+        )
+        raise ConfigError(msg)
+    name = _source_name(context, OUTLOOK_CONNECTOR_NAME)
+    resolved = resolve_outlook_credentials(settings, instance=context.instance)
+    credential = outlook_credential(resolved, instance=name)
+    return OutlookConnector(
+        resolved, OutlookClient(resolved, credential), name=name, renewal=credential.renewal()
+    )
+
+
 def build_mbox(context: BuildContext) -> Connector:
     """Construct the mbox-archive connector from validated configuration.
 
@@ -300,7 +339,7 @@ def build_mbox(context: BuildContext) -> Connector:
             )
         )
     name = _source_name(context, MBOX_CONNECTOR_NAME)
-    mail_types = {GMAIL_CONNECTOR_NAME, MBOX_CONNECTOR_NAME}
+    mail_types = {GMAIL_CONNECTOR_NAME, MBOX_CONNECTOR_NAME, OUTLOOK_CONNECTOR_NAME}
     others = sorted(
         other
         for other, configured in context.settings.connectors.items()
@@ -323,7 +362,8 @@ class ConnectorsPlugin:
         name="connectors",
         version="0.1.0",
         core_version=">=0.1,<0.3",
-        summary="Sources manicule ingests from: files, Git sites, Confluence, Gmail, mbox.",
+        summary="Sources manicule ingests from: files, Git sites, Confluence, Gmail, Outlook, "
+        "mbox.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -359,6 +399,17 @@ class ConnectorsPlugin:
             "scoped by label id, with deletions removed by complete reconciliation.",
             # The index is not permission-aware, so an installation holding mail must never be
             # served without authentication (`docs/connectors/gmail.md` §10).
+            sensitive=True,
+        )
+        registry.add(
+            keys.CONNECTOR.named(OUTLOOK_CONNECTOR_NAME),
+            build_outlook,
+            config_model=OutlookConfig,
+            summary="A Microsoft 365 mailbox and calendar, read-only through Graph: per-folder "
+            "delta sync, MIME messages, the calendar window listed afresh, with deletions "
+            "removed by complete reconciliation.",
+            # The index is not permission-aware, so an installation holding mail must never be
+            # served without authentication (`docs/connectors/outlook.md` §9).
             sensitive=True,
         )
         registry.add(

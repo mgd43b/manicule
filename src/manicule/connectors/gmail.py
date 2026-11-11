@@ -23,19 +23,13 @@ counts and operation names; a record about one message belongs to that message's
 
 from __future__ import annotations
 
-import email.errors
-import email.parser
-import email.policy
 import logging
-import re
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
 from urllib.parse import quote
-
-from pydantic import JsonValue
 
 from manicule.connectors import config as gmail_settings
 from manicule.connectors.config import (
@@ -47,9 +41,10 @@ from manicule.connectors.config import (
 from manicule.connectors.credentials import mailbox_mismatch
 from manicule.connectors.errors import ConnectorError, CursorExpiredError, NotFoundError
 from manicule.connectors.gmail_client import GmailClient, HistoryPage, Profile
+from manicule.connectors.mail_headers import message_provenance, read_headers
 from manicule.core.content import Metadata, RawDocument
 from manicule.core.lifecycle import HealthReport, Metric
-from manicule.core.provenance import PROVENANCE_KEY, Provenance, SourceMetadata
+from manicule.core.provenance import PROVENANCE_KEY
 from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 
 __all__ = [
@@ -427,9 +422,16 @@ class GmailConnector:
         if message.internal_date_ms is not None:
             arrived = _arrival(message.internal_date_ms)
             metadata["internal_date"] = arrived.isoformat()
-        subject, rfc822_id = _headers(message.raw)
+        subject, rfc822_id = read_headers(message.raw)
         link = self._link(ref.source_id, rfc822_id)
-        metadata[PROVENANCE_KEY] = self._provenance(ref.source_id, subject, link, arrived)
+        metadata[PROVENANCE_KEY] = message_provenance(
+            source_id=ref.source_id,
+            subject=subject,
+            link=link,
+            version=gmail_settings.REPRESENTATION_VERSION,
+            media_type=MESSAGE_MEDIA_TYPE,
+            arrived=arrived,
+        )
         return RawDocument(
             source_id=ref.source_id,
             # The address discovery gave, not the search link: a retained fetch is reusable only
@@ -441,33 +443,6 @@ class GmailConnector:
             content=message.raw,
             metadata=metadata,
         )
-
-    @staticmethod
-    def _provenance(
-        message_id: str, subject: str, link: str, arrived: datetime | None
-    ) -> JsonValue:
-        """What a citation says about the message: its subject, its link, when it arrived.
-
-        A subject Gmail delivers with a control character cannot be a title. The message is
-        still cited by its link, and the record keeps that link; only if the link too is refused
-        does it say, in words that do not quote the subject, that it could not be described.
-        """
-        for title in (subject, ""):
-            try:
-                source = SourceMetadata(
-                    title=title,
-                    canonical_uri=link,
-                    source_id=message_id,
-                    version=gmail_settings.REPRESENTATION_VERSION,
-                    created_at=arrived,
-                    content_type=MESSAGE_MEDIA_TYPE,
-                )
-            except ValueError:
-                continue
-            return Provenance(source=source).as_metadata_value()
-        return Provenance(
-            unavailable_reason="the message could not be described by a title and a link"
-        ).as_metadata_value()
 
     # --- reconciliation ------------------------------------------------------------------
 
@@ -502,35 +477,6 @@ class GmailConnector:
             f"{_VIEW}?authuser={quote(self._config.account, safe='')}"
             f"#search/rfc822msgid:{quote(rfc822_id, safe='')}"
         )
-
-
-_HEADER_END: Final = re.compile(rb"\r?\n\r?\n")
-_HEADER_LIMIT: Final = 1 << 20
-"""Headers are read from the front of the message and never past this, so a 25 MB message with a
-huge attachment costs a header's worth of parsing, not a second copy of the bytes."""
-
-
-def _headers(raw: bytes) -> tuple[str, str | None]:
-    """The ``Subject`` and the ``Message-ID`` (without its angle brackets) of a message.
-
-    Both are read from the headers only and neither is ever logged. An unreadable or absent
-    header is an empty subject or no id, never an error: the message is still indexed.
-    """
-    end = _HEADER_END.search(raw, 0, _HEADER_LIMIT)
-    head = raw[: end.start()] if end is not None else raw[:_HEADER_LIMIT]
-    try:
-        headers = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(head)
-        subject = headers.get("Subject")
-        message_id = headers.get("Message-ID")
-        subject_text = " ".join(str(subject).split()) if subject is not None else ""
-        cleaned = (
-            str(message_id).strip().removeprefix("<").removesuffix(">").strip()
-            if message_id is not None
-            else ""
-        )
-    except (ValueError, TypeError, IndexError, email.errors.MessageError):
-        return "", None
-    return subject_text, cleaned or None
 
 
 def _arrival(milliseconds: int) -> datetime:
