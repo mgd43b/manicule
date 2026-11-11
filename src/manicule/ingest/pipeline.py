@@ -159,7 +159,15 @@ from manicule.storage.ledger import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        Awaitable,
+        Callable,
+        Collection,
+        Coroutine,
+        Mapping,
+        Sequence,
+    )
     from collections.abc import Set as AbstractSet
 
     from manicule.core.content import Chunk, Metadata
@@ -1132,7 +1140,7 @@ class IngestPipeline:
         expected_reset_epoch: int | None = None,
         sensitive_sources: AbstractSet[str] = frozenset(),
         shared_vectors: SharedVectors | None = None,
-        local_evidence: AbstractSet[str] = frozenset(),
+        local_evidence: Collection[str] = (),
     ) -> None:
         derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
         if any(component is None for component in derived) and not all(

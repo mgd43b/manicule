@@ -34,6 +34,7 @@ a repository.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Final
 
 from manicule.core.provenance import require_citable_uri, require_printable
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 __all__ = [
     "LOCAL_SCHEMES",
     "SETTING",
+    "evidence_identity",
     "local_scheme",
     "refuse_disabled_scheme",
     "require_evidence_locator",
@@ -62,24 +64,53 @@ LOCAL_SCHEMES: Final[tuple[str, ...]] = (CLAUDE_SESSION, GIT)
 """Every scheme an operator can turn on, and the only ones evidence may use besides the web."""
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_UUID_RE = re.compile(_UUID)
 _SESSION = re.compile(rf"(?P<session>{_UUID})#(?P<message>{_UUID})")
+_INVISIBLE = frozenset({"Cf", "Zl", "Zp"})
+"""Format and line-separator characters, refused in a local locator.
+
+Bidirectional overrides and zero-width characters are not control characters, so
+:func:`~manicule.core.provenance.require_printable` lets them through, and in a path — the one
+locator part that is not constrained to ASCII by its grammar — they reorder or hide what a terminal
+prints."""
 _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _LINES = re.compile(r"L(?P<start>[0-9]{1,9})(?:-L(?P<end>[0-9]{1,9}))?")
 
 
-def local_scheme(locator: str) -> str | None:
-    """The local scheme ``locator`` claims, or ``None`` when it claims none.
+def _claim(locator: str) -> tuple[str, str] | None:
+    """The local scheme ``locator`` claims and what follows its colon, or ``None``.
 
     A scheme is recognized **case-insensitively** so that ``Claude-Session:`` is refused as a
     malformed local locator rather than falling through to the web rule and being reported as an
     unknown scheme, which would send its author looking for the wrong fix.
+
+    ``git://host/repo`` is a network address, not a git locator, so it claims nothing and gets the
+    web rule's refusal ("cite an http or https address") rather than a grammar lesson.
     """
-    scheme, separator, _ = locator.partition(":")
-    if not separator:
-        return None
+    scheme, separator, body = locator.partition(":")
     lowered = scheme.lower()
-    return lowered if lowered in LOCAL_SCHEMES else None
+    if not separator or lowered not in LOCAL_SCHEMES or body.startswith("//"):
+        return None
+    return lowered, body
+
+
+def local_scheme(locator: str) -> str | None:
+    """The local scheme ``locator`` claims, or ``None`` when it claims none."""
+    claim = _claim(locator)
+    return claim[0] if claim else None
+
+
+def evidence_identity(locator: str) -> str:
+    """What makes two locators the same place, for counting independent sources.
+
+    The locator itself, except that a ``git:`` locator drops its line range: two ranges of one file
+    at one commit are one source said twice, not two places. A web address is compared as written,
+    as it always was.
+    """
+    if local_scheme(locator) == GIT:
+        return locator.partition("#")[0]
+    return locator
 
 
 def require_evidence_locator(value: str, *, field: str, web_hint: str = "") -> None:
@@ -94,12 +125,19 @@ def require_evidence_locator(value: str, *, field: str, web_hint: str = "") -> N
     Raises:
         ValueError: Naming ``field`` and what was wrong with the locator.
     """
-    scheme = local_scheme(value)
-    if scheme is None:
+    claim = _claim(value)
+    if claim is None:
         require_citable_uri(value, field=field, hint=web_hint)
         return
+    scheme, body = claim
     require_printable(value, field=field)
-    body = value.partition(":")[2]
+    for character in value:
+        if unicodedata.category(character) in _INVISIBLE:
+            msg = (
+                f"{field} contains the invisible formatting character U+{ord(character):04X}, "
+                f"which could make a locator print as something it is not"
+            )
+            raise ValueError(msg)
     if value[: len(scheme)] != scheme:
         msg = f"{field} {value!r} must spell its scheme in lowercase: '{scheme}:'"
         raise ValueError(msg)
@@ -188,4 +226,4 @@ def _require_repository_path(path: str, refuse: Callable[[str], ValueError]) -> 
 
 
 def _is_uuid(text: str) -> bool:
-    return re.fullmatch(_UUID, text) is not None
+    return _UUID_RE.fullmatch(text) is not None

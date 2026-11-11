@@ -557,7 +557,9 @@ or a short commit, is refused naming `evidence[n].locator` and the form it shoul
 sentence as before: a path on one machine is not a citation. A local locator is shown as text and
 never as a link, and it is attested, never verified: nothing opens the transcript or the repository,
 so the quote is still what survives. Distinct locators count as before for `evidence_status`, web or
-local. A stored memory is never re-checked against the setting when it is read, so turning a scheme
+local, except that two line ranges of one file at one commit are one source. A `git://` network
+address is not a `git:` locator and gets the web refusal. A local locator may not contain
+invisible formatting characters (bidirectional overrides, zero-width characters). A stored memory is never re-checked against the setting when it is read, so turning a scheme
 off does not make existing memories lose their evidence; it only refuses new ones. The converse
 holds too: turning a scheme **on** does not re-read a file that was already ingested and refused,
 because an unchanged document is skipped. Run `manicule document reindex <id>` for it (it re-parses from retained source

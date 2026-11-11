@@ -1133,7 +1133,7 @@ class Runtime:
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
             sensitive_sources=self.sensitive_instances(),
-            local_evidence=frozenset(settings.authoring.local_evidence),
+            local_evidence=settings.authoring.local_evidence,
         )
 
     async def _build_pipeline(self) -> IngestPipeline:
@@ -1235,7 +1235,7 @@ class Runtime:
             mutation_guard=self.derived_mutation_guard,
             expected_reset_epoch=expected_reset_epoch,
             sensitive_sources=self.sensitive_instances(),
-            local_evidence=frozenset(settings.authoring.local_evidence),
+            local_evidence=settings.authoring.local_evidence,
             # Passed rather than defaulted, which it had been since the setting shipped. The
             # field is documented as the switch an operator throws while investigating a
             # detector that is producing rubbish, and nothing outside `settings.py` read it: a

@@ -58,7 +58,11 @@ from pydantic import (
     model_validator,
 )
 
-from manicule.core.evidence_locator import refuse_disabled_scheme, require_evidence_locator
+from manicule.core.evidence_locator import (
+    evidence_identity,
+    refuse_disabled_scheme,
+    require_evidence_locator,
+)
 from manicule.core.provenance import require_aware, require_printable
 
 KNOWLEDGE_KEY: Final = "structured_memory"
@@ -288,7 +292,7 @@ class KnowledgeRecord(BaseModel):
     @property
     def independent_sources(self) -> int:
         """How many distinct places the evidence points at."""
-        return len({source.locator for source in self.evidence})
+        return len({evidence_identity(source.locator) for source in self.evidence})
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
@@ -366,7 +370,7 @@ def _derived_status(evidence: object) -> str:
     # Only string locators are counted. A list or mapping here is unhashable, and the model's own
     # validation is what refuses it, with a sentence; counting it would raise first.
     places = {
-        locator
+        evidence_identity(locator)
         for item in items
         if isinstance(item, Mapping)
         and isinstance(locator := cast("Mapping[str, object]", item).get("locator"), str)

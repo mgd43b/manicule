@@ -277,6 +277,47 @@ def test_a_local_and_a_web_source_count_as_two_places() -> None:
     assert found.record.independent_sources == 2
 
 
+def test_two_line_ranges_of_one_file_at_one_commit_are_one_source() -> None:
+    other = GIT_LOCATOR.replace("#L10-L24", "#L40-L50")
+    twice = EVIDENCE.replace(LOCATOR, GIT_LOCATOR) + SECOND_SOURCE.replace(
+        "https://jira.example.com/browse/OPS-12", other
+    )
+    found = read(memory(evidence=twice), local_evidence={"git"})
+
+    assert found is not None
+    assert found.record is not None, found.unavailable_reason
+    assert found.record.independent_sources == 1
+
+
+def test_the_same_path_at_two_commits_is_two_sources() -> None:
+    other = GIT_LOCATOR.replace(COMMIT, "f" * 40)
+    twice = EVIDENCE.replace(LOCATOR, GIT_LOCATOR) + SECOND_SOURCE.replace(
+        "https://jira.example.com/browse/OPS-12", other
+    )
+    found = read(
+        memory(evidence=twice, front="evidence_status: corroborated\n"), local_evidence={"git"}
+    )
+
+    assert found is not None
+    assert found.record is not None, found.unavailable_reason
+    assert found.record.independent_sources == 2
+
+
+@pytest.mark.parametrize("hidden", ["\u202e", "\u200b"])
+def test_a_local_locator_with_an_invisible_formatting_character_is_refused(hidden: str) -> None:
+    locator = f"git:handbook@{COMMIT}:docs/a{hidden}b.md"
+    reason = _refusal(memory(evidence=EVIDENCE.replace(LOCATOR, f'"{locator}"')))
+
+    assert "invisible formatting character" in reason
+
+
+def test_a_git_network_address_gets_the_web_refusal_not_a_grammar_lesson() -> None:
+    reason = _refusal(memory(evidence=EVIDENCE.replace(LOCATOR, "git://example.org/repo.git")))
+
+    assert "a citable address is one of ['http', 'https']" in reason
+    assert "git locator" not in reason
+
+
 def test_the_same_local_message_cited_twice_is_one_source() -> None:
     twice = EVIDENCE.replace(LOCATOR, SESSION_LOCATOR) + SECOND_SOURCE.replace(
         "https://jira.example.com/browse/OPS-12", SESSION_LOCATOR
