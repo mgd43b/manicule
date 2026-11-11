@@ -34,7 +34,7 @@ import base64
 import hashlib
 import re
 import zlib
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.policy import SMTP
@@ -146,7 +146,8 @@ class FakeCredential:
         self._token = server.issue_token()
         self.refreshes = 0
 
-    async def access_token(self, *, refresh: bool = False) -> str:
+    async def access_token(self, *, refresh: bool = False, rejected: str | None = None) -> str:
+        del rejected
         if refresh:
             self.refreshes += 1
             self._token = self._server.issue_token()
@@ -193,6 +194,13 @@ class FakeGraph:
     expiry_status: int = 410
     expiry_code: str = "syncStateNotFound"
     loop_pagination: bool = False
+    link_shape: str = "me"
+    """How the links Graph hands back name the user: ``me``, ``users-paren`` (``users('<id>')``),
+    ``users-slash`` (``users/<id>``) or ``other`` (another user's id)."""
+    value_chunk: int | None = None
+    """Serve ``$value`` as a chunked stream of this many bytes, with no ``Content-Length``."""
+    streamed: int = 0
+    """Bytes of a streamed ``$value`` the client actually pulled before it stopped."""
     fail_paging: tuple[int, str] | None = None
     """Answer every ``$skiptoken`` request of a delta round with this ``(status, code)``."""
     before_request: Callable[[httpx.Request], None] | None = None
@@ -427,7 +435,7 @@ class FakeGraph:
         bearer = request.headers.get("authorization", "").removeprefix("Bearer ")
         if bearer not in self._tokens:
             return httpx.Response(401, json=_error(401, "InvalidAuthenticationToken"))
-        path = unquote(request.url.path).removeprefix(PREFIX)
+        path = _as_me(unquote(request.url.path).removeprefix(PREFIX))
         if path != "/me" and 'IdType="ImmutableId"' not in request.headers.get("prefer", ""):
             return httpx.Response(400, json=_error(400, "ImmutableIdRequired"))
         params = _params(request)
@@ -538,7 +546,9 @@ class FakeGraph:
         head = self._seq
         size = self.page_size
         page = rows[offset : offset + size]
-        base = f"https://{HOST}{PREFIX}/me/mailFolders('{folder_id}')/messages/delta"
+        base = (
+            f"https://{HOST}{PREFIX}{self._owner_path()}/mailFolders('{folder_id}')/messages/delta"
+        )
         if offset + size < len(rows):
             following = offset if self.loop_pagination else offset + size
             return httpx.Response(
@@ -549,12 +559,31 @@ class FakeGraph:
             200, json={"value": page, "@odata.deltaLink": f"{base}?$deltatoken=D-{head}-0"}
         )
 
+    def _owner_path(self) -> str:
+        """How a link names the signed-in user, per :attr:`link_shape`."""
+        owner = {
+            "me": "/me",
+            "users-paren": f"/users('{self.object_id}')",
+            "users-slash": f"/users/{self.object_id}",
+            "other": "/users('99999999-0000-0000-0000-000000000000')",
+        }
+        return owner[self.link_shape]
+
     def _value(self, params: dict[str, str], message_id: str) -> httpx.Response:
         del params
         message = self._messages.get(message_id)
         if message is None or message.deleted:
             return httpx.Response(404, json=_error(404, "ErrorItemNotFound"))
-        return httpx.Response(200, content=message.raw, headers={"Content-Type": "text/plain"})
+        if self.value_chunk is None:
+            return httpx.Response(200, content=message.raw, headers={"Content-Type": "text/plain"})
+        raw, size = message.raw, self.value_chunk
+
+        async def chunks() -> AsyncIterator[bytes]:
+            for start in range(0, len(raw), size):
+                self.streamed += len(raw[start : start + size])
+                yield raw[start : start + size]
+
+        return httpx.Response(200, content=chunks(), headers={"Content-Type": "text/plain"})
 
     def _message(self, params: dict[str, str], message_id: str) -> httpx.Response:
         del params
@@ -619,8 +648,15 @@ class FakeGraph:
             query = "&".join(
                 f"{k}={quote(v, safe='')}" for k, v in {**extra, "$skiptoken": token}.items()
             )
-            body["@odata.nextLink"] = f"https://{HOST}{PREFIX}{path}?{query}"
+            body["@odata.nextLink"] = (
+                f"https://{HOST}{PREFIX}{self._owner_path()}{path.removeprefix('/me')}?{query}"
+            )
         return httpx.Response(200, json=body)
+
+
+def _as_me(path: str) -> str:
+    """A request path naming the user as ``me``, whichever of Graph's spellings it used."""
+    return re.sub(r"^/users(?:\('[^']*'\)|/[^/]+)", "/me", path)
 
 
 def _params(request: httpx.Request) -> dict[str, str]:

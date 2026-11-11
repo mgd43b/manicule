@@ -185,6 +185,9 @@ class OutlookCredential:
 
     rotations: int = field(default=0, init=False)
     """How many times Microsoft replaced the refresh token during this process's life."""
+    unstored_rotations: int = field(default=0, init=False)
+    """How many of those went nowhere durable: no file, or a write that failed."""
+    _warned: bool = field(default=False, init=False)
 
     _access: SecretStr | None = field(default=None, init=False)
     _expires_at: float = field(default=0.0, init=False)
@@ -207,11 +210,14 @@ class OutlookCredential:
             "may have lost a scope, or a conditional-access policy now blocks it. " + self.renewal()
         )
 
-    async def access_token(self, *, refresh: bool = False) -> str:
+    async def access_token(self, *, refresh: bool = False, rejected: str | None = None) -> str:
         """The bare access token, minted if none is fresh.
 
-        ``refresh=True`` is for a caller that has just been answered 401: it mints a new token
-        whatever the cache holds.
+        ``refresh=True`` is for a caller that has just been answered 401. ``rejected`` is the
+        token that was refused: if the cache already holds a *different* fresh one, another
+        request answered 401 on the same expired token has already replaced it, and that
+        replacement is returned without a second exchange. So N concurrent 401s are one exchange.
+        Without ``rejected`` a forced refresh always mints.
 
         Raises:
             GrantRevokedError: Microsoft no longer honors the refresh token.
@@ -220,6 +226,13 @@ class OutlookCredential:
         """
         if refresh:
             async with self._lock:
+                current = self._fresh()
+                if (
+                    rejected is not None
+                    and current is not None
+                    and current.get_secret_value() != rejected
+                ):
+                    return current.get_secret_value()
                 self._access = None
                 return (await self._refresh()).get_secret_value()
         cached = self._fresh()
@@ -335,25 +348,44 @@ class OutlookCredential:
         raise RemoteError(msg, response.status_code)
 
     def _adopt(self, replacement: object) -> None:
-        """Keep a rotated refresh token: in memory at once, and where the instance says."""
+        """Keep a rotated refresh token: in memory at once, and where the instance says.
+
+        **A rotation that is not stored is counted, and said once.** Microsoft's refresh token has
+        a sliding lifetime that only a refresh extends, and the new token is the one whose lifetime
+        was extended; a replacement that lives only in memory is lost when the process stops, and
+        the stored token then expires on its original clock, silently, about three months after
+        login. So ``unstored_rotations`` counts every rotation that went nowhere durable, whether
+        the instance has no ``refresh_token_file`` or the write failed (a read-only secret volume
+        is the usual cause), the connector reports it as a metric, and ``doctor`` reports the
+        configuration that causes it. The warning is logged the first time only: a sync every
+        hour must not write the same line every hour.
+        """
         if not isinstance(replacement, str) or not replacement:
             return
         if replacement == self.refresh_token.get_secret_value():
             return
         self.refresh_token = SecretStr(replacement)
         self.rotations += 1
-        if self.persist is None:
-            return
-        try:
-            self.persist(self.refresh_token)
-        except Exception as exc:  # noqa: BLE001 - the token is in memory; the old one still works
-            # The type only: the message of an OSError names the path, and nothing here may name
-            # the token. The old token is not revoked by use, so this costs lifetime, not access.
+        reason = "no refresh_token_file is configured"
+        if self.persist is not None:
+            try:
+                self.persist(self.refresh_token)
+            except Exception as exc:  # noqa: BLE001 - the token is in memory; the old one still works
+                # The type only: the message of an OSError names the path, and nothing here may
+                # name the token. The old token is not revoked by use, so this costs lifetime.
+                reason = f"it could not be written ({type(exc).__name__})"
+            else:
+                return
+        self.unstored_rotations += 1
+        if not self._warned:
+            self._warned = True
             logging.getLogger(__name__).warning(
-                "Outlook instance %s could not store its rotated refresh token (%s); the previous "
-                "token remains valid and the new one is held in memory",
+                "Outlook instance %s rotated its refresh token and %s, so the new token is held "
+                "in memory only; the stored one keeps its original lifetime and will stop "
+                "working when that ends. Give the instance a writable refresh_token_file. "
+                "This is logged once per process.",
                 self.connector,
-                type(exc).__name__,
+                reason,
             )
 
     def _refused(self, error: object) -> CredentialError:

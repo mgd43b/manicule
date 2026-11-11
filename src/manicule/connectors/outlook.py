@@ -29,6 +29,8 @@ counts and operation names; a record about one message belongs to that message's
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -40,7 +42,12 @@ from urllib.parse import quote
 
 from pydantic import JsonValue
 
-from manicule.connectors.errors import ConnectorError, CursorExpiredError, NotFoundError
+from manicule.connectors.errors import (
+    ConnectorError,
+    CursorExpiredError,
+    MailboxMismatchError,
+    NotFoundError,
+)
 from manicule.connectors.mail_headers import message_provenance, read_headers
 from manicule.connectors.outlook_auth import identity_mismatch
 from manicule.connectors.outlook_client import (
@@ -90,6 +97,11 @@ _FINGERPRINT_KEY: Final = "scope_fingerprint"
 _IDENTITY_KEY: Final = "pinned_identity"
 _VERSION_KEY: Final = "version_token"
 
+_TREE_FRESH_SECONDS: Final = 60.0
+"""How long the folder tree read at setup stays good for the first run that follows it."""
+
+_OBJECT_KEY: Final = "object_identity"
+
 _RECHECK_SECONDS: Final = 60.0
 """How long a confirmation that the credential reads the configured mailbox stays fresh."""
 
@@ -127,6 +139,8 @@ class OutlookConnector:
         renewal: str = "",
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
+        max_message_bytes: int | None = None,
+        unstored_rotations: Callable[[], int] | None = None,
     ) -> None:
         """Args:
         config: The validated Outlook settings.
@@ -135,6 +149,11 @@ class OutlookConnector:
         renewal: What a person does about a token for the wrong mailbox, appended to that refusal.
         clock: A monotonic clock, for how long a mailbox check stays fresh.
         now: The wall clock, for the calendar window.
+        max_message_bytes: ``ingest.max_fetch_bytes``. A message is downloaded as a stream and
+            abandoned once it passes this, so one that the pipeline would refuse is never held
+            whole in memory first.
+        unstored_rotations: How many times the credential's rotated refresh token went nowhere
+            durable, reported as a metric (``outlook.md`` §1.2).
         """
         self.name = name
         self._config = config
@@ -142,6 +161,12 @@ class OutlookConnector:
         self._renewal = renewal
         self._clock = clock
         self._now = now
+        self._max_message_bytes = max_message_bytes
+        self._unstored_rotations = unstored_rotations
+        self._object: str | None = None
+        """Digest of the directory object ``/me`` reported, held for the life of the process."""
+        self._tree: tuple[float, _Run] | None = None
+        """The folder tree the last ``_begin`` read, and when, so setup's read is not repeated."""
         self._user_excluded: tuple[str, ...] = ()
         self._resolved = not config.exclude_folders
         self._checked_at: float | None = None
@@ -245,17 +270,54 @@ class OutlookConnector:
             Metric(name="outlook_requests", value=float(self._client.requests)),
             Metric(name="outlook_throttled", value=float(self._client.throttled)),
             Metric(name="outlook_items_fetched", value=float(self._fetched)),
+            Metric(
+                name="outlook_token_rotations_unstored",
+                value=float(self._unstored_rotations() if self._unstored_rotations else 0),
+            ),
         )
 
     async def _check_mailbox(self) -> Profile:
-        """Read ``/me`` and refuse a token that belongs to another mailbox."""
+        """Read ``/me``; refuse a token for another mailbox, or another account at the address.
+
+        Two checks, one message. The address check is configuration's (``identity_mismatch``). The
+        object check is the directory's own: the first object id this process sees for the
+        instance is held, and a later different one is refused, as is one that differs from the
+        object the stored watermark was recorded under (:meth:`_refuse_other_object`). An address
+        can be reassigned to a different account (a departed colleague's, say); the object id
+        cannot. Neither value, nor either digest, is in the message.
+        """
         profile = await self._client.get_me()
         mismatch = identity_mismatch(profile.addresses, self._config.account, self._renewal)
+        if mismatch is None:
+            digest = self._object_digest(profile.object_id)
+            if self._object is not None and self._object != digest:
+                mismatch = _other_object(self._renewal)
+            elif self._object is None:
+                self._object = digest
         if mismatch is not None:
             self._checked_at = None
             raise mismatch
         self._checked_at = self._clock()
         return profile
+
+    def _object_digest(self, object_id: str) -> str:
+        """A digest of the object id and the tenant; the id itself is never stored or printed."""
+        return hashlib.blake2b(
+            f"outlook-object:{self._config.tenant_id}:{object_id.casefold()}".encode(),
+            digest_size=20,
+        ).hexdigest()
+
+    def _refuse_other_object(self, watermark: Watermark | None) -> None:
+        """Refuse a stored watermark recorded for a different directory object.
+
+        A watermark from before the object was recorded carries none and is accepted: the
+        config-only pin (tenant and account) is what holds until the first completed sync.
+        """
+        if watermark is None or self._object is None:
+            return
+        recorded = watermark.metadata.get(_OBJECT_KEY)
+        if isinstance(recorded, str) and recorded != self._object:
+            raise _other_object(self._renewal)
 
     async def _recheck_mailbox(self) -> None:
         """Re-confirm the mailbox before a fetch if the last confirmation is not recent.
@@ -268,7 +330,12 @@ class OutlookConnector:
             await self._check_mailbox()
 
     async def _begin(self) -> _Run:
-        """Start of a run: the mailbox pin, then the folder tree, afresh.
+        """Start of a run: the mailbox pin, then the folder tree.
+
+        The tree read at setup is reused by the first run that starts within
+        :data:`_TREE_FRESH_SECONDS`, so a sync does not read it twice back to back; a later run
+        reads it afresh, because a folder created or deleted since is exactly what scope depends
+        on. The mailbox check is never skipped.
 
         Raises:
             MailboxMismatchError: The token reads another mailbox. Nothing has been read.
@@ -279,18 +346,26 @@ class OutlookConnector:
             self._user_excluded = ()
             self._resolved = True
             return _Run(folders=(), excluded_user_ids=())
+        held = self._tree
+        if held is not None and self._clock() - held[0] < _TREE_FRESH_SECONDS:
+            self._tree = None  # consumed: a second run in the window reads its own
+            return held[1]
         folders = [folder async for folder in self._client.list_folders()]
         user_ids = resolve_folder_ids(
             self._config.exclude_folders, {folder.path: folder.id for folder in folders}
         )
         excluded = set(user_ids)
-        for well_known in ALWAYS_EXCLUDED_FOLDERS:
-            folder_id = await self._client.well_known_folder_id(well_known)
-            if folder_id is not None:
-                excluded.add(folder_id)
+        # Concurrently, within the client's own cap of four in flight: five small lookups that
+        # would otherwise be five round trips on every run.
+        found = await asyncio.gather(
+            *(self._client.well_known_folder_id(name) for name in ALWAYS_EXCLUDED_FOLDERS)
+        )
+        excluded.update(folder_id for folder_id in found if folder_id is not None)
         self._user_excluded = user_ids
         self._resolved = True
-        return _Run(folders=_in_scope(folders, excluded), excluded_user_ids=user_ids)
+        run = _Run(folders=_in_scope(folders, excluded), excluded_user_ids=user_ids)
+        self._tree = (self._clock(), run)
+        return run
 
     # --- watermark -----------------------------------------------------------------------
 
@@ -310,6 +385,7 @@ class OutlookConnector:
             metadata={
                 _FINGERPRINT_KEY: self.scope_fingerprint,
                 _IDENTITY_KEY: self.pinned_identity,
+                **({_OBJECT_KEY: self._object} if self._object is not None else {}),
             },
         )
 
@@ -339,6 +415,7 @@ class OutlookConnector:
         self._walked_full = False
         self._links = None
         run = await self._begin()
+        self._refuse_other_object(watermark)
         stored = self._resume_links(watermark)
         links: dict[str, str] = {}
         from_scratch = True
@@ -476,7 +553,7 @@ class OutlookConnector:
 
     async def _fetch_message(self, ref: DocRef) -> RawDocument:
         graph_id = ref.source_id.removeprefix(MESSAGE_PREFIX)
-        raw = await self._client.get_message_mime(graph_id)
+        raw = await self._client.get_message_mime(graph_id, max_bytes=self._max_message_bytes)
         self._fetched += 1
         meta = ref.metadata
         web_link = _meta_text(meta, "web_link")
@@ -562,6 +639,17 @@ class OutlookConnector:
             async for events in self._client.list_events(*self._window()):
                 if events:
                     yield [EVENT_PREFIX + stub.event_id for stub in events]
+
+
+def _other_object(renewal: str) -> MailboxMismatchError:
+    """The refusal for an address that now belongs to a different directory object."""
+    return MailboxMismatchError(
+        (
+            "the account at the configured address is not the one this instance synced as: the "
+            "directory object behind it changed. Indexing another account is a different "
+            "instance under a new name, so the run did not begin. " + renewal
+        ).rstrip()
+    )
 
 
 def _parse_links(value: str) -> dict[str, str]:

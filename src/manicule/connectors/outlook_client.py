@@ -56,6 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
 
 __all__ = [
     "GRAPH_BASE",
+    "LIST_PAGE_SIZE",
     "PAGE_SIZE",
     "DeltaPage",
     "EventDetail",
@@ -70,10 +71,17 @@ __all__ = [
 
 _ORIGIN: Final = "https://graph.microsoft.com"
 _ALLOWED_PATH: Final = "/v1.0/me/"
+_OWNER_PATH: Final = re.compile(r"/v1\.0/users(?:\('([^']+)'\)|/([^/(]+))/", re.IGNORECASE)
+"""The two ways Graph writes a named user: ``/v1.0/users('<id>')/`` and ``/v1.0/users/<id>/``."""
 
 PAGE_SIZE: Final = 100
-"""Items a page asks for: the most a folder listing returns, and a size every list accepts."""
+"""Items a page asks for: the most a folder listing returns, and delta's ``maxpagesize``."""
 
+LIST_PAGE_SIZE: Final = 1_000
+"""Ids a message *listing* asks for per page. Microsoft's List messages documentation gives
+``$top`` a range of 1 to 1000 (default 10), and an id-only ``$select`` is the cheapest page there
+is, so reconciliation, which lists every message in scope, takes the largest. Delta keeps
+:data:`PAGE_SIZE`: its page size is a ``Prefer`` header, documented without a maximum."""
 _HTTPX_LOGGER: Final = "httpx"
 _SAFE_CODE: Final = re.compile(r"[A-Za-z_]{1,64}")
 """What a Graph ``error.code`` must look like to be quoted: a token, never free text."""
@@ -130,7 +138,7 @@ class OutlookSettings(Protocol):
 class OutlookCredentialLike(Protocol):
     """Whatever mints the access tokens. Consulted per request; may refuse."""
 
-    async def access_token(self, *, refresh: bool = False) -> str: ...
+    async def access_token(self, *, refresh: bool = False, rejected: str | None = None) -> str: ...
 
     def rejected(self) -> Exception: ...
 
@@ -225,6 +233,8 @@ class OutlookClient:
         self._sleep = sleep if sleep is not None else asyncio.sleep
         self._client: httpx.AsyncClient | None = None
         self._slots = asyncio.Semaphore(settings.max_concurrent_requests)
+        self._owner: str | None = None
+        """The object id ``GET /me`` last reported: the only user a link may name."""
         self.requests = 0
         """Requests sent, retries included."""
         self.throttled = 0
@@ -251,13 +261,17 @@ class OutlookClient:
 
     # --- identity ----------------------------------------------------------------------
 
+    def _trusted(self, link: str, operation: str) -> str:
+        return _trusted(link, operation, self._owner)
+
     async def get_me(self) -> Profile:
         """``GET /me``: the mailbox's object id, sign-in name and primary address."""
         payload = await self._get_json(
             "me.get", _url("/me", {"$select": "id,userPrincipalName,mail"})
         )
+        self._owner = _text(payload, "id", "me.get")
         return Profile(
-            object_id=_text(payload, "id", "me.get"),
+            object_id=self._owner,
             user_principal_name=_optional_text(payload.get("userPrincipalName")),
             mail=_optional_text(payload.get("mail")),
         )
@@ -309,7 +323,7 @@ class OutlookClient:
         operation = "messages.list"
         url = _url(
             f"/me/mailFolders/{quote(folder_id, safe='')}/messages",
-            {"$select": "id", "$top": str(PAGE_SIZE)},
+            {"$select": "id", "$top": str(LIST_PAGE_SIZE)},
         )
         async for payload in self._pages(operation, url):
             yield tuple(
@@ -334,7 +348,7 @@ class OutlookClient:
         """
         operation = "messages.delta"
         if delta_link is not None:
-            url = _trusted(delta_link, operation)
+            url = self._trusted(delta_link, operation)
         else:
             url = _url(
                 f"/me/mailFolders/{quote(folder_id, safe='')}/messages/delta",
@@ -370,28 +384,32 @@ class OutlookClient:
                     )
                     raise ConnectorError(msg)
                 seen.add(following)
-                url = _trusted(following, operation)
+                url = self._trusted(following, operation)
                 continue
             if isinstance(final, str) and final:
-                yield DeltaPage(tuple(messages), removed, _trusted(final, operation))
+                yield DeltaPage(tuple(messages), removed, self._trusted(final, operation))
                 return
             msg = f"Graph {operation} ended without a next link or a delta link"
             raise ConnectorError(msg)
 
-    async def get_message_mime(self, message_id: str) -> bytes:
+    async def get_message_mime(self, message_id: str, *, max_bytes: int | None = None) -> bytes:
         """``GET /me/messages/{id}/$value``: the whole MIME message, attachments inline.
+
+        The body is read as a stream and abandoned the moment it passes ``max_bytes``, so a 150 MB
+        message never has to fit in memory only to be refused afterwards.
 
         Raises:
             NotFoundError: The message was deleted or moved out of the mailbox since discovery.
+            ConnectorError: The message is larger than ``max_bytes``. The size is not in the
+                message beyond the cap, and no id is.
         """
         operation = "messages.value"
         _require_id(message_id, operation)
-        response = await self._request(
+        return await self._download(
             operation,
             _url(f"/me/messages/{quote(message_id, safe='')}/$value", {}),
-            accept="*/*",
+            max_bytes=max_bytes,
         )
-        return response.content
 
     async def get_message_stub(self, message_id: str) -> MessageStub:
         """The link, conversation and arrival time of one message, for a fetch that lacks them."""
@@ -479,7 +497,7 @@ class OutlookClient:
                 )
                 raise ConnectorError(msg)
             seen.add(following)
-            current = _trusted(following, operation)
+            current = self._trusted(following, operation)
 
     async def _get_json(
         self,
@@ -500,6 +518,27 @@ class OutlookClient:
             raise ConnectorError(msg)
         return cast("Json", body)
 
+    async def _download(self, operation: str, url: str, *, max_bytes: int | None) -> bytes:
+        """A bounded GET: the body, or a refusal once it is longer than ``max_bytes``."""
+        collected = bytearray()
+
+        async def take(response: httpx.Response) -> None:
+            declared = response.headers.get("content-length")
+            if (
+                max_bytes is not None
+                and declared is not None
+                and declared.isdigit()
+                and int(declared) > max_bytes
+            ):
+                raise _too_large(operation, max_bytes)
+            async for chunk in response.aiter_bytes():
+                collected.extend(chunk)
+                if max_bytes is not None and len(collected) > max_bytes:
+                    raise _too_large(operation, max_bytes)
+
+        await self._request(operation, url, accept="*/*", consume=take)
+        return bytes(collected)
+
     async def _request(
         self,
         operation: str,
@@ -508,8 +547,13 @@ class OutlookClient:
         prefer: str = "",
         accept: str = "application/json",
         expired: bool = False,
+        consume: Callable[[httpx.Response], Awaitable[None]] | None = None,
     ) -> httpx.Response:
-        """One retried GET. ``expired`` says a 404 or 410 means the delta state is gone."""
+        """One retried GET. ``expired`` says a 404 or 410 means the delta state is gone.
+
+        With ``consume`` the body is streamed to it, and only for an answer that is usable: an
+        error answer is judged without reading its body into the caller's buffer.
+        """
         client = self._require_client()
         import httpx  # noqa: PLC0415 - see setup()
 
@@ -517,20 +561,30 @@ class OutlookClient:
         attempt = 0
         refresh = False
         refreshed = False
+        token = ""
         while True:
-            token = await self._credential.access_token(refresh=refresh)
+            # The rejected token is passed back, so concurrent requests all answered 401 on the
+            # same expired token share one exchange instead of each making their own.
+            token = await self._credential.access_token(
+                refresh=refresh, rejected=token if refresh else None
+            )
             refresh = False
             self.requests += 1
             try:
                 async with self._slots:
-                    response = await client.get(
-                        url,
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Accept": accept,
-                            "Prefer": preferences,
-                        },
-                    )
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Accept": accept,
+                        "Prefer": preferences,
+                    }
+                    if consume is None:
+                        response = await client.get(url, headers=headers)
+                    else:
+                        async with client.stream("GET", url, headers=headers) as response:
+                            if response.status_code == HTTPStatus.OK:
+                                await consume(response)
+                            else:
+                                await response.aread()
             except httpx.TransportError as exc:
                 await self._sleep(self._transport_wait(operation, exc, attempt))
                 attempt += 1
@@ -565,7 +619,9 @@ class OutlookClient:
     ) -> float | None:
         """Type a non-401 answer: ``None`` if it is usable, else the pause before retrying."""
         status = response.status_code
-        code = _error_code(response)
+        # Only an error answer has a body worth reading, and a streamed answer that was consumed
+        # has none left: asking a 200 for its code raised ``ResponseNotRead``.
+        code = _error_code(response) if status >= HTTPStatus.BAD_REQUEST else None
         if status == HTTPStatus.TOO_MANY_REQUESTS:
             return self._throttle_wait(operation, response.headers, attempt)
         if status >= HTTPStatus.INTERNAL_SERVER_ERROR:
@@ -628,28 +684,50 @@ def _url(path: str, params: Mapping[str, str]) -> str:
     return f"{GRAPH_BASE}{path}" + (f"?{query}" if query else "")
 
 
-def _trusted(link: str, operation: str) -> str:
-    """``link`` if it is on Graph's origin under ``/v1.0/me/``; otherwise refuse it.
+def _trusted(link: str, operation: str, owner: str | None = None) -> str:
+    """``link`` if it is on Graph's origin and under the signed-in user's own path; else refuse it.
+
+    Graph writes the same mailbox as ``/v1.0/me/...`` and, when a request named the user,
+    ``/v1.0/users('<id>')/...`` or ``/v1.0/users/<id>/...``. The user forms are accepted only for
+    ``owner``, the object id ``GET /me`` reported, compared without regard to case: a link into
+    another user's mailbox would make this connector read it with the signed-in user's token.
+    The scheme, host and port are checked first and a link with user information is refused.
 
     Raises:
-        UntrustedLinkError: The link is not Graph's. The link is not in the message: it came from
-            a stored watermark or a response, and is exactly what must not be echoed.
+        UntrustedLinkError: The link is not Graph's own for this user. The link is not in the
+            message: it came from a stored watermark or a response, and is exactly what must not
+            be echoed.
     """
     parts = urlsplit(link)
+    path = parts.path
     ok = (
         parts.scheme == "https"
         and parts.hostname == "graph.microsoft.com"
         and parts.port in (None, 443)
         and parts.username is None
-        and parts.path.casefold().startswith(_ALLOWED_PATH)
+        and parts.password is None
     )
+    if ok:
+        named = _OWNER_PATH.match(path)
+        if named is not None:
+            who = named.group(1) or named.group(2)
+            ok = owner is not None and who.casefold() == owner.casefold()
+        else:
+            ok = path.casefold().startswith(_ALLOWED_PATH)
     if not ok:
         msg = (
-            f"Graph {operation} was given a link that is not on Graph's origin under "
-            f"{_ALLOWED_PATH}; it was not followed, so no credential was sent to it"
+            f"Graph {operation} was given a link that is not on Graph's origin under this "
+            f"user's own path; it was not followed, so no credential was sent to it"
         )
         raise UntrustedLinkError(msg)
     return link
+
+
+def _too_large(operation: str, max_bytes: int) -> ConnectorError:
+    return ConnectorError(
+        f"Graph {operation} is above the {max_bytes}-byte fetch cap and was not read whole. "
+        f"Raise ingest.max_fetch_bytes to index it"
+    )
 
 
 def _instant(value: datetime) -> str:

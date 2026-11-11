@@ -5420,11 +5420,28 @@ class ApplicationService:
             "grant_revoked": "has a refresh token Microsoft no longer honors",
             "credential_rejected": "was refused by Microsoft (the app registration or the grant)",
             "unreachable": "could not be checked because Microsoft did not answer",
+            "token_not_persisted": (
+                "has no refresh_token_file, so a rotated refresh token is lost when the process "
+                "stops and the stored one expires on its original clock"
+            ),
+            "token_file_unwritable": (
+                "names a refresh_token_file whose directory cannot be written, so a rotated "
+                "refresh token cannot be kept and the stored one expires on its original clock"
+            ),
         }
         problems = "; ".join(f"{name!r} {sentences[reason]}" for name, reason in broken.items())
-        only_unreachable = all(reason == "unreachable" for reason in broken.values())
+        only_unreachable = all(
+            reason in {"unreachable", "token_not_persisted", "token_file_unwritable"}
+            for reason in broken.values()
+        )
         if why == "dependency_missing":
             remedy = "pip install 'manicule[connectors]'"
+        elif why in {"token_not_persisted", "token_file_unwritable"}:
+            remedy = (
+                "give the source a refresh_token_file in a directory the server can write (a "
+                "Kubernetes Secret volume is read-only: mount a writable volume for the token), "
+                "then run `manicule connector login` into it (docs/connectors/outlook.md §1.2)"
+            )
         elif why == "invalid_options":
             remedy = (
                 "fix the source's options: account, tenant_id and client_id are required, and a "
@@ -11111,6 +11128,22 @@ async def _probe_outlook_source(name: str, resolved: OutlookConfig) -> str:
             (CredentialError, "credential_rejected"),
         )
         return next((word for kind, word in named if isinstance(error, kind)), "unreachable")
+    return _outlook_persistence(resolved)
+
+
+def _outlook_persistence(resolved: OutlookConfig) -> str:
+    """Whether a rotated refresh token would be kept: ``ok``, or the fixed word for why not.
+
+    Static, because ``doctor`` is a read and a probe that rotated a token onto disk would race the
+    server for it. Microsoft rotates the token on every refresh; one that is not kept leaves the
+    stored token on its original lifetime, so the grant silently ends about three months after
+    login (``docs/connectors/outlook.md`` §1.2).
+    """
+    if resolved.refresh_token_file is None:
+        return "token_not_persisted"
+    folder = Path(resolved.refresh_token_file).parent
+    if not (folder.is_dir() and os.access(folder, os.W_OK | os.X_OK)):
+        return "token_file_unwritable"
     return "ok"
 
 

@@ -21,6 +21,7 @@ from manicule.connectors.errors import (
     RemoteError,
 )
 from manicule.connectors.outlook_auth import OutlookCredential, outlook_credential, token_url
+from manicule.connectors.outlook_config import resolve_outlook_credentials
 from manicule.core.errors import ConfigError
 from tests.connectors.fake_graph import (
     ADDRESS,
@@ -173,7 +174,7 @@ async def test_a_file_instance_writes_the_rotated_token_back_readable_only_by_it
     folder.mkdir()
     target = folder / "outlook-token"
     target.write_text(REFRESH_TOKEN + "\n")
-    config = outlook_config(refresh_token_file=str(target))
+    config = resolve_outlook_credentials(outlook_config(refresh_token_file=str(target)), {})
     cred = outlook_credential(config, instance="work", transport=server.transport())
     await cred.access_token()
 

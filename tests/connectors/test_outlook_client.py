@@ -144,7 +144,8 @@ async def test_a_second_401_is_the_credentials_rejection_not_a_retry_loop(
 
     class Hopeless(FakeCredential):
         @override
-        async def access_token(self, *, refresh: bool = False) -> str:
+        async def access_token(self, *, refresh: bool = False, rejected: str | None = None) -> str:
+            del refresh, rejected
             return "never-valid"
 
         @override

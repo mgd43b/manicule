@@ -20,6 +20,7 @@ valid calendar.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Final, cast
 
@@ -28,6 +29,9 @@ __all__ = ["render_event"]
 type Json = Mapping[str, object]
 
 _LOCAL: Final = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z?$")
+_ADDRESS: Final = re.compile(r"[^\s<>\",;:\\\x00-\x1f\x7f]+")
+"""What a ``mailto:`` value may be: no whitespace, no controls, none of the characters that end or
+quote an iCalendar value. Anything else is not an address, and the attendee keeps only its name."""
 _FOLD: Final = 75
 """Octets a content line may hold before it is folded."""
 
@@ -35,16 +39,16 @@ _FOLD: Final = 75
 def render_event(event: Json) -> bytes:
     """The event as a one-event ``VCALENDAR``, UTF-8 with CRLF line ends."""
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//manicule//outlook//EN", "BEGIN:VEVENT"]
-    uid = _text(event.get("iCalUId")) or _text(event.get("id"))
+    uid = _line(_text(event.get("iCalUId")) or _text(event.get("id")))
     if uid:
         lines.append(f"UID:{_escape(uid)}")
-    lines.append(f"SUMMARY:{_escape(_text(event.get('subject')))}")
+    lines.append(f"SUMMARY:{_escape(_line(_text(event.get('subject'))))}")
     all_day = event.get("isAllDay") is True
     for name, key in (("DTSTART", "start"), ("DTEND", "end")):
         rendered = _when(name, event.get(key), all_day=all_day)
         if rendered:
             lines.append(rendered)
-    where = _name(event.get("location"), "displayName")
+    where = _line(_name(event.get("location"), "displayName"))
     if where:
         lines.append(f"LOCATION:{_escape(where)}")
     organizer = _person("ORGANIZER", _mapping(event.get("organizer")))
@@ -55,7 +59,9 @@ def render_event(event: Json) -> bytes:
         if rendered:
             lines.append(rendered)
     lines.append("STATUS:CANCELLED" if event.get("isCancelled") is True else "STATUS:CONFIRMED")
-    categories = [c for c in _sequence(event.get("categories")) if isinstance(c, str) and c]
+    categories = [
+        _line(c) for c in _sequence(event.get("categories")) if isinstance(c, str) and _line(c)
+    ]
     if categories:
         lines.append("CATEGORIES:" + ",".join(_escape(c) for c in categories))
     body = _mapping(event.get("body"))
@@ -82,20 +88,37 @@ def _person(prop: str, holder: Json | None) -> str:
     address = _mapping(holder.get("emailAddress")) if holder is not None else None
     if address is None:
         return ""
-    mail = _text(address.get("address"))
-    name = _text(address.get("name"))
+    raw = _text(address.get("address")).strip()
+    mail = raw if _ADDRESS.fullmatch(raw) else ""
+    name = _param(_text(address.get("name")))
     if not mail and not name:
         return ""
-    common = f';CN="{_param(name)}"' if name else ""
+    common = f';CN="{name}"' if name else ""
     return f"{prop}{common}:mailto:{mail}" if mail else f"{prop}{common}:"
 
 
 def _param(value: str) -> str:
-    """A parameter value: quoted by the caller, so only the quote and controls are removed."""
-    return "".join(c for c in value if c != '"' and c.isprintable())
+    """A parameter value: quoted by the caller, so the quote and every control are removed."""
+    return "".join(c for c in value if c != '"' and not _control(c)).strip()
+
+
+def _control(char: str) -> bool:
+    return unicodedata.category(char) in {"Cc", "Zl", "Zp"}
+
+
+def _line(value: str) -> str:
+    """One line of text: every control character, line separators included, becomes a space.
+
+    Graph's values are data a sender controls, and a line break inside one would start a line of
+    its own in the calendar, which is how an attendee address forges another property. Spaces
+    collapse, so a value is never padded by what was removed from it.
+    """
+    return " ".join("".join(" " if _control(c) else c for c in value).split())
 
 
 def _escape(value: str) -> str:
+    """RFC 5545 TEXT escaping: line breaks become ``\\n``, other control characters are dropped."""
+    value = "".join(c for c in value if c in "\r\n\t" or not _control(c))
     return (
         value.replace("\\", "\\\\")
         .replace(";", "\\;")

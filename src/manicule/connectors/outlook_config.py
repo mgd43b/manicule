@@ -131,8 +131,9 @@ class OutlookConfig(BaseModel):
 
     refresh_token: SecretStr | None = Field(
         default=None,
-        description="The refresh token `manicule connector login` mints. Resolved from "
-        "`refresh_token_file`, then the environment, when unset.",
+        description="The refresh token `manicule connector login` mints. Mutually exclusive with "
+        "`refresh_token_file`. Resolved from `refresh_token_file`, then the environment, when "
+        "unset.",
     )
 
     refresh_token_env: str = Field(
@@ -281,6 +282,15 @@ class OutlookConfig(BaseModel):
             msg = (
                 f"refresh_token is set to an empty string. Leave it unset to read "
                 f"${self.refresh_token_env}, or give it a value."
+            )
+            raise ValueError(msg)
+        if self.refresh_token is not None and self.refresh_token_file is not None:
+            msg = (
+                "refresh_token and refresh_token_file are both set. Microsoft rotates the token, "
+                "and the file is where the rotated one is kept, so an inline copy goes stale and "
+                "would be preferred over it (or ignored, and read as if it were in force). Keep "
+                "the token in refresh_token_file alone, or inline with no file if you accept that "
+                "a rotation is lost when the process stops"
             )
             raise ValueError(msg)
         if self.calendar and self.calendar_days_back + self.calendar_days_forward < 1:

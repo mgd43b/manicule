@@ -234,6 +234,35 @@ async def test_an_event_edited_between_discovery_and_fetch_is_indexed_and_does_n
     assert harness.fetches("/me/events/") == settled, "it settles: no loop of retried enumerations"
 
 
+async def test_a_message_moved_mid_walk_is_one_document_one_fetch_and_one_inventory_entry(
+    harness: Harness,
+) -> None:
+    """Named by two folders in one walk, it is admitted once by the journal, fetched once, and
+    counted once in the reconciliation inventory (``outlook.md`` §4.3)."""
+    server = harness.server
+    moved = server.add_message(mail("Moves"), "Inbox")
+
+    def move_before_old_mail_is_walked(request: httpx.Request) -> None:
+        if request.url.path.endswith("/messages/delta") and "/archive-old/" in request.url.path:
+            server.before_request = None
+            server.move(moved, "Old Mail")
+
+    connector = await harness.connector(calendar=False)
+    try:
+        server.before_request = move_before_old_mail_is_walked
+        report = await harness.sync(connector)
+        result = await reconcile(connector, harness.store, max_delete_fraction=1.0)
+    finally:
+        await connector.teardown()
+
+    assert report.error == ""
+    assert report.indexed == 1
+    assert harness.fetches("/$value") == 1
+    assert set(await harness.live()) == {MESSAGE_PREFIX + moved}
+    assert result.clean
+    assert result.applied_count == 0, "present once in the inventory, so nothing is removed"
+
+
 async def test_a_new_message_in_a_second_sync_is_the_only_one_fetched(harness: Harness) -> None:
     server = harness.server
     server.add_message(mail("Old"))

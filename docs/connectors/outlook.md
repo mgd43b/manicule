@@ -94,6 +94,26 @@ So the recommended arrangement is a file, `connector login --token-file PATH`, a
 disk: it keeps working until Microsoft expires it, which is a lifetime this connector cannot
 observe (§11).
 
+**A rotation that is not stored is a silent end date, so it is counted and reported.** The refresh
+token's lifetime is *sliding*: a refresh extends the new token, not the old one. A replacement that
+lives only in memory is lost when the process stops, and the stored token then expires on its
+original clock, about three months after login, with nothing failing in between. So:
+
+- the credential counts every rotation that went nowhere durable (`unstored_rotations`): no
+  `refresh_token_file`, or a write that failed;
+- the connector reports it as the metric `outlook_token_rotations_unstored`;
+- **the warning is logged once per process**, never hourly, and names the cause by type and no path;
+- `doctor`'s `outlook-credential` check is `degraded` with the word `token_not_persisted` (no file)
+  or `token_file_unwritable` (the file's directory cannot be written), decided statically because
+  `doctor` is a read, with a remedy that names the fix.
+
+**A read-only Secret volume is the usual way to get this wrong.** A Kubernetes Secret mounted as a
+volume is read-only, so `refresh_token_file = "/run/secrets/outlook-token"` reads fine, rotates, and
+cannot be written back. Mount the Secret only to *seed* the first token and point
+`refresh_token_file` at a small writable volume (an `emptyDir` is lost on a restart; a persistent
+volume claim is not), then copy the seeded token there once. `doctor` reports
+`token_file_unwritable` until it is fixed.
+
 **`doctor` never writes a token.** Its probe holds a rotated token in memory and drops it, because
 a diagnostic that rewrote the stored secret would race the server for it.
 
@@ -118,7 +138,7 @@ calendar_days_forward = 180
 | `account` | required; compared with both `userPrincipalName` and `mail` (§1.4) |
 | `tenant_id` | required; a **GUID**. `common`, `organizations` and `consumers` are refused by name |
 | `client_id` | required; a GUID |
-| `refresh_token`, `refresh_token_env`, `refresh_token_file` | where the token comes from (§1.2) |
+| `refresh_token`, `refresh_token_env`, `refresh_token_file` | where the token comes from (§1.2). **`refresh_token` and `refresh_token_file` together are refused**: the file holds the rotated token, so an inline copy would go stale and be read as if it were in force. Order otherwise: the file, then the environment |
 | `mail`, `calendar` | what to index; at least one |
 | `exclude_folders` | folder **paths** with slashes, `Archive/2019`, excluded with everything below them |
 | `calendar_days_back`, `calendar_days_forward` | the window around now (§7.1) |
@@ -166,6 +186,13 @@ So the mailbox is configuration, and it is checked against `GET /me`:
   equals either one, ignoring case. An alias is not accepted. This is a choice: the alternative,
   pinning the directory object id, is stable across renames, but it is not something an operator
   can read off their own mailbox, and the tenant is already pinned by the token endpoint.
+- **The directory object is pinned too, as a digest.** An address can be reassigned to a different
+  account (a departed colleague's, say); the object id behind it cannot. The first object id
+  `GET /me` reports is held for the life of the process and recorded, as a digest of the tenant and
+  the id, in the watermark (`object_identity`). A later different object, in the same process or
+  against a stored watermark, is refused as `MailboxMismatchError` without printing either value.
+  Before the first completed sync nothing is recorded and the configuration-only pin (tenant and
+  account) is what holds; a watermark from before this field existed carries none and is accepted.
 - **The pinned identity is a digest of the tenant and the account**
   (`OutlookConfig.pinned_identity`), stored beside the instance's run metadata, which status
   surfaces read. The pipeline refuses an instance that has synced and is pointed at another.
@@ -212,9 +239,12 @@ descend into subfolders, so scope has to be a set of folders the walk can enumer
 can test.
 
 1. The mailbox's folder tree is read (`/me/mailFolders` and each folder's `/childFolders`, hidden
-   folders included) at the start of every run.
+   folders included) at the start of every run, **except that the tree read at `setup()` is reused
+   by the first run that starts within a minute of it**, so a sync does not read it twice back to
+   back. A later run reads it afresh, because a folder created or deleted since is what scope
+   depends on.
 2. **Always excluded**, whatever the configuration says: Junk Email, Deleted Items, Drafts, Outbox
-   and Sync Issues, resolved through Graph's well-known names (`junkemail`, `deleteditems`,
+   and Sync Issues (the five lookups run concurrently, inside the client's cap of four in flight), resolved through Graph's well-known names (`junkemail`, `deleteditems`,
    `drafts`, `outbox`, `syncissues`) so a localized mailbox is handled, and every folder below any
    of them.
 3. **`exclude_folders`** paths are matched exactly per segment, ignoring case, and resolved to ids.
@@ -271,10 +301,23 @@ For each in-scope folder:
   and the incremental ones are the same call, so there is no separate listing to keep in step.
 
 **Links are checked before they are followed.** A `@odata.nextLink` or `@odata.deltaLink` is a full
-URL, and a stored one is replayed with a bearer token days later. Both must be `https`, on
-`graph.microsoft.com`, under `/v1.0/me/`; anything else raises `UntrustedLinkError` and the access
-token is never sent to it, so a poisoned watermark cannot exfiltrate it. A link seen twice in one
-round is a loop and is refused.
+URL, and a stored one is replayed with a bearer token days later. Each must be `https`, on
+`graph.microsoft.com`, with no user information and no port but 443, and under **the signed-in
+user's own path**: `/v1.0/me/`, or `/v1.0/users('<id>')/` or `/v1.0/users/<id>/` **only for the
+object id `GET /me` reported**, compared without regard to case. Microsoft's examples show `me`
+links, and its request forms also name `/users/{id}`, so a response may spell the same mailbox either
+way. A link into any other user's path is refused, because following it would read that mailbox with
+this user's token. Anything refused raises `UntrustedLinkError`, the access token is never sent to
+it, and the link is not in the message, so a poisoned watermark cannot exfiltrate it. A link seen
+twice in one round is a loop and is refused.
+
+**A message can be named twice in one walk**, once in each of two folders when it moves between them
+after the first was walked and before the second. The connector does not hold the inventory in
+memory to prevent it, because that would be the size of the mailbox. The durable journal absorbs
+it instead, in both places: discovery admits each source id once per run
+(`ON CONFLICT DO NOTHING` on `(run, source id)`), and the reconciliation inventory is
+deduplicated in SQLite (`append_reconciliation_inventory_page`). The message is fetched once and
+counted once; `tests/connectors/test_outlook_pipeline.py` drives it through both.
 
 **A folder that was deleted between the tree read and its walk** is skipped with a warning, and
 reconciliation is what removes its mail. Only a first request answered "no such folder" means that:
@@ -310,6 +353,11 @@ sends attachments through the parser chain. The headers are read from the front 
 and never past a megabyte, so a 25 MB message with a large attachment costs a header's worth of
 parsing.
 
+**The download is bounded.** The body is read as a stream and abandoned once it passes
+`ingest.max_fetch_bytes` (the same cap the pipeline enforces afterwards, and the one the mbox
+connector applies), or as soon as a `Content-Length` says it will, so a 150 MB message is refused
+without being held whole first. The error names the cap and no message.
+
 Discovery carries the three facts that are not in the MIME (`webLink`, `conversationId`,
 `receivedDateTime`) in the document reference, so a fetch is one request. A fetch without them (a
 resumed run) asks Graph once. The reference's address, not the fetched link, is the envelope's, so a
@@ -325,7 +373,10 @@ typed acquisition retry and not a failed run.
 A deleted message simply stops appearing in a delta, so without a reconciliation pass the index
 serves deleted mail forever. `reconcile()` lists the ids of every message in every in-scope folder
 (`/messages?$select=id`, no bodies) and, when the calendar is on, every event in the window, and the
-pipeline diffs that against what it holds ([`ingest.md`](../ingest.md) §11).
+pipeline diffs that against what it holds ([`ingest.md`](../ingest.md) §11). The listing asks for
+**1,000 ids a page**, the maximum Microsoft documents for `$top` on List messages (default 10), since an id-only
+`$select` is the cheapest page there is; delta keeps `Prefer: odata.maxpagesize=100`, which
+is documented without a maximum.
 
 - **It is built from the same folders the walk covers**, so the three paths (full walk, incremental
   walk, reconciliation) agree about scope.
@@ -435,7 +486,8 @@ one message belongs to that message's document.
 
 `doctor`'s `outlook-credential` check carries source names and a closed set of outcome words
 (`ok`, `invalid_options`, `missing_secret`, `dependency_missing`, `different_mailbox`,
-`grant_revoked`, `credential_rejected`, `unreachable`) and nothing else. **Its name is a contract**:
+`grant_revoked`, `credential_rejected`, `unreachable`, `token_not_persisted`,
+`token_file_unwritable`) and nothing else. **Its name is a contract**:
 monitors select on it.
 
 ---
@@ -475,6 +527,13 @@ it:
 - How long a refresh token that is never rotated on disk survives, and what a conditional-access
   policy does to a refresh from a different address than the sign-in.
 - Whether Microsoft's `Retry-After` is sent on every 429 from the Outlook service.
+- **Whether a delta or next link ever names the user as `/users/<id>` rather than `/me`.** Both are
+  accepted for the signed-in user's own object id (§4.3), but Microsoft's examples only show `me`;
+  a link spelled with the user's *sign-in name* (`/users/pat@example.org/`) would be refused as
+  untrusted and stop the run, and nothing here has seen one.
+- That `$top=1000` is honored on a message listing in every mailbox (documented range 1 to 1000;
+  a community report of a mailbox returning fewer than asked is anecdotal and unconfirmed).
+- That a `Content-Length` is sent on `$value`; without it the cap still holds, by counting.
 - **The whole sign-in against a directory whose consent and conditional-access policies are not
   yours.**
 

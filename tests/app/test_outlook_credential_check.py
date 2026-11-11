@@ -79,8 +79,23 @@ async def outlook_check(**connectors: dict[str, Any]) -> r.Check:
     raise AssertionError(message)
 
 
+TOKEN_FILE: list[str] = []
+"""The writable token file a test's sources keep their rotated token in, set per test."""
+
+
+@pytest.fixture(autouse=True)
+def _a_writable_token_file(tmp_path: Path) -> None:
+    folder = tmp_path / "tokens"
+    folder.mkdir()
+    token = folder / "token"
+    token.write_text(REFRESH_TOKEN + "\n")
+    TOKEN_FILE[:] = [str(token)]
+
+
 def work(**options: object) -> dict[str, Any]:
-    return {"type": "outlook", "options": {**OPTIONS, **options}}
+    """A source keeping its rotated token in a writable file."""
+    files: dict[str, object] = {"refresh_token_file": TOKEN_FILE[0]} if TOKEN_FILE else {}
+    return {"type": "outlook", "options": {**OPTIONS, **files, **options}}
 
 
 async def test_a_corpus_without_outlook_sees_the_check_pass(graph: FakeGraph) -> None:
@@ -122,8 +137,9 @@ async def test_a_missing_token_fails_naming_the_source_and_asks_nothing_of_micro
     graph: FakeGraph, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("OUTLOOK_REFRESH_TOKEN")
+    absent = str(Path(TOKEN_FILE[0]).parent / "never-written")
 
-    check = await outlook_check(work=work())
+    check = await outlook_check(work=work(refresh_token_file=absent))
 
     assert check.state == "failing"
     assert check.facts["sources"] == {"work": "missing_secret"}
@@ -258,3 +274,72 @@ async def test_a_result_reused_from_a_moment_ago_says_how_old_it_is(graph: FakeG
 
     assert second.facts["freshly_measured"] is False
     assert graph.refreshes == 1, "reused, not asked again"
+
+
+# --- a rotated token that would not be kept (outlook.md §1.2) --------------------------------
+
+
+async def test_a_source_with_no_token_file_is_degraded_because_a_rotation_would_be_lost(
+    graph: FakeGraph,
+) -> None:
+    source = work()
+    del source["options"]["refresh_token_file"]
+
+    check = await outlook_check(work=source)
+
+    assert check.state == "degraded"
+    assert check.facts["sources"] == {"work": "token_not_persisted"}
+    assert "refresh_token_file" in check.remedy
+    assert "read-only" in check.remedy, "the Kubernetes Secret case is named"
+    assert graph.refreshes == 1, "the credential itself was still probed"
+
+
+async def test_a_token_file_in_a_directory_that_cannot_be_written_is_degraded(
+    graph: FakeGraph, tmp_path: Path
+) -> None:
+    readable = tmp_path / "readonly"
+    readable.mkdir()
+    (readable / "token").write_text(REFRESH_TOKEN + "\n")
+    readable.chmod(0o500)
+    try:
+        check = await outlook_check(work=work(refresh_token_file=str(readable / "token")))
+    finally:
+        readable.chmod(0o700)
+
+    assert check.state == "degraded"
+    assert check.facts["sources"] == {"work": "token_file_unwritable"}
+
+
+async def test_a_token_file_whose_directory_does_not_exist_is_degraded(
+    graph: FakeGraph, tmp_path: Path
+) -> None:
+    check = await outlook_check(
+        work=work(refresh_token_file=str(tmp_path / "no-such-dir" / "token")),
+    )
+
+    assert check.facts["sources"] in (
+        {"work": "token_file_unwritable"},
+        {"work": "missing_secret"},
+    )
+
+
+async def test_a_failing_credential_outranks_a_persistence_warning(graph: FakeGraph) -> None:
+    graph.refresh_failure = (400, "invalid_grant")
+    source = work()
+    del source["options"]["refresh_token_file"]
+
+    check = await outlook_check(work=source)
+
+    assert check.state == "failing"
+    assert check.facts["sources"] == {"work": "grant_revoked"}
+
+
+async def test_the_persistence_words_carry_no_path_and_no_token(graph: FakeGraph) -> None:
+    source = work()
+    del source["options"]["refresh_token_file"]
+
+    check = await outlook_check(work=source)
+
+    payload = check.model_dump_json()
+    assert REFRESH_TOKEN not in payload
+    assert "/" not in check.detail.replace("docs/", "")

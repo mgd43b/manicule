@@ -1086,7 +1086,8 @@ access token and calls `GET /me` once, and compares the mailbox that answered wi
 `account` by the rule (`identity_mismatch`) the connector applies at setup and at the start of every
 run ([`connectors/outlook.md`](connectors/outlook.md) §1.4, §10). It is `ok` when no enabled source
 is of that type, `failing` for a missing token, a revoked grant, a refused app registration or a
-token for another mailbox, and `degraded` when Microsoft did not answer. **It never writes a
+token for another mailbox, and `degraded` when Microsoft did not answer or when a rotated token
+would not be kept (`token_not_persisted`, `token_file_unwritable`). **It never writes a
 rotated token**: `doctor` is a read. Like `gmail-credential` it reports source names and a fixed word
 per outcome, never an address.
 

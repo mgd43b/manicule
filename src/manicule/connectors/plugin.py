@@ -308,7 +308,12 @@ def build_outlook(context: BuildContext) -> Connector:
     resolved = resolve_outlook_credentials(settings, instance=context.instance)
     credential = outlook_credential(resolved, instance=name)
     return OutlookConnector(
-        resolved, OutlookClient(resolved, credential), name=name, renewal=credential.renewal()
+        resolved,
+        OutlookClient(resolved, credential),
+        name=name,
+        renewal=credential.renewal(),
+        max_message_bytes=context.settings.ingest.max_fetch_bytes,
+        unstored_rotations=lambda: credential.unstored_rotations,
     )
 
 

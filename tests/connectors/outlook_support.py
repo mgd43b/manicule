@@ -52,9 +52,10 @@ def outlook_config(**options: Any) -> OutlookConfig:
         "account": ADDRESS,
         "tenant_id": TENANT,
         "client_id": CLIENT_ID,
-        "refresh_token": SecretStr("refresh-token-sentinel-7730"),
         **options,
     }
+    if "refresh_token_file" not in options:
+        values.setdefault("refresh_token", SecretStr("refresh-token-sentinel-7730"))
     return OutlookConfig.model_validate(values)
 
 
