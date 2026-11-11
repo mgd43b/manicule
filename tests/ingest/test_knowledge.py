@@ -165,3 +165,27 @@ async def test_a_non_markdown_document_that_never_had_a_record_gains_no_key() ->
     await pipeline.run(a_connector("plain\n", media_type=MEDIA_TYPE))
 
     assert KNOWLEDGE_KEY not in (await stored(store)).metadata
+
+
+SESSION_LOCATOR = (
+    "claude-session:0f1e2d3c-4b5a-4968-8776-655443322110#a1b2c3d4-e5f6-4789-8abc-def012345678"
+)
+
+
+async def test_a_local_locator_is_stored_only_where_its_scheme_is_enabled() -> None:
+    """A file that arrives by a sync cannot cite what the authoring door would refuse."""
+    text = memory(evidence=EVIDENCE.replace(LOCATOR, SESSION_LOCATOR))
+
+    refused, store, _ = build()
+    await refused.run(a_connector(text))
+    held = (await stored(store)).knowledge
+    assert held is not None
+    assert held.record is None
+    assert "authoring.local_evidence" in held.unavailable_reason
+
+    allowed, store, _ = build(local_evidence=frozenset({"claude-session"}))
+    await allowed.run(a_connector(text))
+    kept = (await stored(store)).knowledge
+    assert kept is not None
+    assert kept.record is not None
+    assert kept.record.evidence[0].locator == SESSION_LOCATOR

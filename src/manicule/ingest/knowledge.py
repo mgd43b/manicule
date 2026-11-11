@@ -43,6 +43,7 @@ from manicule.parsers.front_matter import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from collections.abc import Set as AbstractSet
 
 SECTIONS: Final = ("Problem", "Answer", "Applicability")
 """The sections a structured memory's body carries, under its ``# Title``.
@@ -82,11 +83,16 @@ def _lines_of(text: str) -> list[str]:
     return text[: MAX_FRONT_MATTER_CHARS + _READ_BEYOND_BLOCK].splitlines()
 
 
-def read(text: str) -> Knowledge | None:
+def read(text: str, *, local_evidence: AbstractSet[str] = frozenset()) -> Knowledge | None:
     """The structured memory ``text`` declares, or ``None`` when it does not declare one.
 
     Never raises. A declared record that cannot be stored comes back as a
     :class:`~manicule.core.knowledge.Knowledge` holding the reason.
+
+    ``local_evidence`` is the set of local evidence schemes this installation has turned on
+    (``authoring.local_evidence``). A memory citing one that is not in it is stored as a refusal
+    naming the setting, rather than as a record, so a file that arrives by a sync cannot put in a
+    memory's evidence what the operator has not allowed at the authoring door.
     """
     lines = _lines_of(text)
     if MARKER not in _top_level_keys(front_matter_lines(lines)):
@@ -94,12 +100,13 @@ def read(text: str) -> Knowledge | None:
     try:
         declared = read_front_matter(lines)
         record = KnowledgeRecord.from_declared({k: declared[k] for k in FIELDS if k in declared})
+        record.require_enabled(local_evidence)
     except (FrontMatterError, KnowledgeError) as exc:
         return Knowledge(unavailable_reason=bounded_reason(str(exc)))
     return Knowledge(record=record)
 
 
-def check(text: str, *, slug: str) -> None:
+def check(text: str, *, slug: str, local_evidence: AbstractSet[str] = frozenset()) -> None:
     """Refuse ``text`` if it is a structured memory that would not be read as one.
 
     Silent on an ordinary document, including one with no front matter at all: nothing here
@@ -132,7 +139,7 @@ def check(text: str, *, slug: str) -> None:
             f"under evidence, each with kind, locator, said_at and quote"
         )
         raise KnowledgeError(msg)
-    parsed = read(text)
+    parsed = read(text, local_evidence=local_evidence)
     if parsed is None or parsed.record is None:
         raise KnowledgeError(
             parsed.unavailable_reason

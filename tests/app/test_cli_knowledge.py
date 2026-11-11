@@ -74,6 +74,27 @@ def test_a_memorys_evidence_is_printed_under_the_passage_that_matched(
     assert "supersedes reference_old" in out
 
 
+@pytest.mark.parametrize(
+    "locator",
+    [
+        "claude-session:0f1e2d3c-4b5a-4968-8776-655443322110#a1b2c3d4-e5f6-4789-8abc-def012345678",
+        "git:handbook@0123456789abcdef0123456789abcdef01234567:docs/[red]a[/red].md#L10-L24",
+    ],
+    ids=["claude-session", "git"],
+)
+def test_a_local_locator_is_printed_as_plain_text(
+    capsys: pytest.CaptureFixture[str], locator: str
+) -> None:
+    """Brackets in a git path are a path, not a style, and nothing is emitted as a hyperlink."""
+    knowledge = _knowledge()
+    source = knowledge.evidence[0].model_copy(update={"locator": locator})
+    out = _search(capsys, knowledge.model_copy(update={"evidence": (source,)}))
+
+    # The terminal wraps a long token mid-word, so compare with the wrapping removed.
+    assert locator in out.replace(" ", "")
+    assert "\x1b]8" not in out
+
+
 def test_the_word_is_attested_and_never_verified(capsys: pytest.CaptureFixture[str]) -> None:
     """``verified`` is what an answer's citation column says of a quotation that resolved.
 

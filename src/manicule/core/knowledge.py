@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from datetime import datetime
 from enum import StrEnum
 from typing import Final, Self, cast
@@ -57,7 +58,8 @@ from pydantic import (
     model_validator,
 )
 
-from manicule.core.provenance import require_aware, require_citable_uri, require_printable
+from manicule.core.evidence_locator import refuse_disabled_scheme, require_evidence_locator
+from manicule.core.provenance import require_aware, require_printable
 
 KNOWLEDGE_KEY: Final = "structured_memory"
 """The ``documents.metadata`` key the record is stored under.
@@ -178,7 +180,11 @@ class EvidenceSource(BaseModel):
         "web. Lowercase, one token.",
     )
     locator: str = Field(
-        strict=True, description="Where a reader goes to see it. An http or https address."
+        strict=True,
+        description="Where a reader goes to see it. An http or https address, or a local "
+        "locator the operator has enabled: claude-session:<session-uuid>#<message-uuid>, or "
+        "git:<repo>@<commit>:<path>#L<first>-L<last>. Never a file: address or a path on a "
+        "machine.",
     )
     said_at: datetime = Field(
         description="When the source said it, as a full timestamp with a UTC offset."
@@ -217,10 +223,11 @@ class EvidenceSource(BaseModel):
                 f"(for example {', '.join(KIND_EXAMPLES)})"
             )
             raise ValueError(msg)
-        require_citable_uri(
+        require_evidence_locator(
             self.locator,
             field="locator",
-            hint="Cite the permalink, not a path on a machine: a reader has to be able to open it.",
+            web_hint="Cite the permalink, not a path on a machine: a reader has to be able to "
+            "open it.",
         )
         require_aware(self.said_at, field="said_at")
         if not self.quote.strip():
@@ -312,6 +319,25 @@ class KnowledgeRecord(BaseModel):
             msg = "relationships names the same relation to the same memory more than once"
             raise ValueError(msg)
         return self
+
+    def require_enabled(self, enabled: AbstractSet[str]) -> None:
+        """Refuse this record if any source cites a local scheme the installation has not enabled.
+
+        Separate from validation, which has no configuration and runs on every read: this is
+        called where the operator's choice is in hand — the authoring door and ingest — and never
+        when a stored record is loaded, so switching a scheme off cannot make a stored memory
+        silently lose its evidence.
+
+        Raises:
+            KnowledgeError: Naming the source, the scheme and the setting that turns it on.
+        """
+        for index, source in enumerate(self.evidence):
+            try:
+                refuse_disabled_scheme(
+                    source.locator, field=f"evidence[{index}].locator", enabled=enabled
+                )
+            except ValueError as exc:
+                raise KnowledgeError(str(exc)) from exc
 
     @classmethod
     def from_declared(cls, declared: Mapping[str, object]) -> Self:

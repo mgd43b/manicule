@@ -57,6 +57,7 @@ def build(
     sensitive_sources: frozenset[str] = frozenset(),
     workspace: str = "default",
     shared_vectors: SharedVectors | None = None,
+    local_evidence: frozenset[str] = frozenset(),
 ) -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
     """A pipeline over in-memory everything, plus the store and vectors to assert against.
 
@@ -87,6 +88,7 @@ def build(
         sensitive_sources=sensitive_sources,
         workspace=workspace,
         shared_vectors=shared_vectors,
+        local_evidence=local_evidence,
     )
     return pipeline, store, vectors
 

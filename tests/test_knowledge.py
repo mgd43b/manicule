@@ -25,6 +25,7 @@ from manicule.core.knowledge import (
     KnowledgeType,
     RelationKind,
 )
+from manicule.core.provenance import SourceMetadata
 from manicule.ingest.knowledge import check, read
 from tests.knowledge_samples import (
     BODY,
@@ -152,6 +153,145 @@ def test_a_source_that_cannot_be_cited_is_refused_with_what_to_change(
     assert was in EVIDENCE, "the sample no longer contains what this case breaks"
 
     assert says in _refusal(memory(evidence=EVIDENCE.replace(was, becomes)))
+
+
+# --- local evidence: a closed set of schemes, each with its own grammar ------------------------
+
+SESSION = "0f1e2d3c-4b5a-4968-8776-655443322110"
+MESSAGE = "a1b2c3d4-e5f6-4789-8abc-def012345678"
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+SESSION_LOCATOR = f"claude-session:{SESSION}#{MESSAGE}"
+GIT_LOCATOR = f"git:handbook@{COMMIT}:docs/runbooks/failover.md#L10-L24"
+
+
+@pytest.mark.parametrize(
+    "locator",
+    [
+        SESSION_LOCATOR,
+        GIT_LOCATOR,
+        f"git:handbook@{COMMIT}:docs/runbooks/failover.md#L7",
+        f"git:handbook@{COMMIT}:README.md",
+        f"git:team.docs-2@{COMMIT * 1}:a b/c.md",
+        f"git:handbook@{COMMIT}{'0' * 24}:x.md",
+    ],
+)
+def test_a_well_formed_local_locator_is_a_valid_source(locator: str) -> None:
+    found = read(
+        memory(evidence=EVIDENCE.replace(LOCATOR, locator)),
+        local_evidence={"claude-session", "git"},
+    )
+
+    assert found is not None
+    assert found.record is not None, found.unavailable_reason
+    assert found.record.evidence[0].locator == locator
+
+
+@pytest.mark.parametrize(
+    ("locator", "says"),
+    [
+        (f"claude-session:{SESSION}", "names no message"),
+        (f"claude-session:{SESSION}#", "names no message"),
+        (f"claude-session:not-a-uuid#{MESSAGE}", "session id is not a lowercase UUID"),
+        (f"claude-session:{SESSION}#nope", "message id is not a lowercase UUID"),
+        (f"claude-session:{SESSION.upper()}#{MESSAGE}", "session id is not a lowercase UUID"),
+        (f"Claude-Session:{SESSION}#{MESSAGE}", "lowercase"),
+        ("git:handbook@abc123:docs/a.md", "40- or 64-character"),
+        (f"git:handbook@{COMMIT.upper()}:docs/a.md", "40- or 64-character"),
+        ("git:handbook:docs/a.md", "repository must be a name"),
+        (f"git:@{COMMIT}:docs/a.md", "repository must be a name"),
+        (f"git:a/../b@{COMMIT}:docs/a.md", "repository must be a name"),
+        (f"git:a//b@{COMMIT}:docs/a.md", "repository must be a name"),
+        (f"git:handbook@{COMMIT}:#L3", "path is empty"),
+        (f"git:handbook@{COMMIT}", "40- or 64-character"),
+        (f"git:handbook@{COMMIT}:/etc/passwd", "relative to the repository root"),
+        (f"git:handbook@{COMMIT}:../secrets.md", "relative to the repository root"),
+        (f"git:handbook@{COMMIT}:a//b.md", "relative to the repository root"),
+        (f"git:handbook@{COMMIT}:docs\\a.md", "relative to the repository root"),
+        (f"git:handbook@{COMMIT}:a.md#10", "not a line range"),
+        (f"git:handbook@{COMMIT}:a.md#L0", "starts at line 1"),
+        (f"git:handbook@{COMMIT}:a.md#L9-L3", "does not end before it starts"),
+    ],
+)
+def test_a_malformed_local_locator_is_refused_naming_the_field(locator: str, says: str) -> None:
+    reason = _refusal(memory(evidence=EVIDENCE.replace(LOCATOR, locator)))
+
+    assert "evidence[0]: locator" in reason
+    assert says in reason
+
+
+@pytest.mark.parametrize(
+    "scheme",
+    ["file:///etc/passwd", "javascript:alert(1)", "data:text/html,x", "/Users/me/notes.md"],
+)
+def test_a_scheme_outside_the_closed_set_keeps_the_web_refusal(scheme: str) -> None:
+    """Enabling local evidence does not open the door to ``file:`` or a raw path."""
+    found = read(
+        memory(evidence=EVIDENCE.replace(LOCATOR, scheme)), local_evidence={"claude-session", "git"}
+    )
+
+    assert found is not None
+    assert found.record is None
+    assert "a citable address is one of ['http', 'https']" in found.unavailable_reason
+    assert "Cite the permalink, not a path on a machine" in found.unavailable_reason
+
+
+def test_a_scheme_that_is_not_enabled_is_refused_naming_it_and_the_setting() -> None:
+    body = memory(evidence=EVIDENCE.replace(LOCATOR, SESSION_LOCATOR))
+
+    found = read(body)
+    assert found is not None
+    assert found.record is None
+    assert "'claude-session'" in found.unavailable_reason
+    assert "authoring.local_evidence" in found.unavailable_reason
+
+    only_git = read(body, local_evidence={"git"})
+    assert only_git is not None
+    assert only_git.record is None
+
+
+def test_enabling_is_not_checked_when_a_stored_record_is_read_back() -> None:
+    """Switching a scheme off must not make a stored memory silently lose its evidence."""
+    accepted = read(
+        memory(evidence=EVIDENCE.replace(LOCATOR, SESSION_LOCATOR)),
+        local_evidence={"claude-session"},
+    )
+    assert accepted is not None
+    assert accepted.record is not None
+
+    reloaded = Knowledge.from_metadata({KNOWLEDGE_KEY: accepted.as_metadata_value()})
+
+    assert reloaded is not None
+    assert reloaded.record is not None
+    assert reloaded.record.evidence[0].locator == SESSION_LOCATOR
+
+
+def test_a_local_and_a_web_source_count_as_two_places() -> None:
+    second = SECOND_SOURCE.replace("https://jira.example.com/browse/OPS-12", SESSION_LOCATOR)
+    found = read(
+        memory(evidence=EVIDENCE + second, front="evidence_status: corroborated\n"),
+        local_evidence={"claude-session"},
+    )
+
+    assert found is not None
+    assert found.record is not None, found.unavailable_reason
+    assert found.record.independent_sources == 2
+
+
+def test_the_same_local_message_cited_twice_is_one_source() -> None:
+    twice = EVIDENCE.replace(LOCATOR, SESSION_LOCATOR) + SECOND_SOURCE.replace(
+        "https://jira.example.com/browse/OPS-12", SESSION_LOCATOR
+    )
+    found = read(memory(evidence=twice), local_evidence={"claude-session"})
+
+    assert found is not None
+    assert found.record is not None, found.unavailable_reason
+    assert found.record.independent_sources == 1
+
+
+def test_a_documents_canonical_address_still_refuses_a_local_locator() -> None:
+    for locator in (SESSION_LOCATOR, GIT_LOCATOR, "file:///etc/passwd"):
+        with pytest.raises(ValueError, match="canonical_uri"):
+            SourceMetadata(title="t", canonical_uri=locator)
 
 
 def test_a_quote_is_required_because_a_permalink_is_all_that_dies() -> None:

@@ -50,6 +50,7 @@ from manicule.core.acquisition import SnapshotPromotionPolicy
 from manicule.core.ann import MINIMUM_ANN_INDEX_THRESHOLD
 from manicule.core.embedding import PrefixScheme
 from manicule.core.errors import PolicyError
+from manicule.core.evidence_locator import LOCAL_SCHEMES
 from manicule.core.retrieval import RetrievalProfile
 
 ENV_PREFIX = "MANICULE_"
@@ -1771,6 +1772,27 @@ class AuthoringSettings(Section):
         "``CollectionRule`` prefix saying so, or only the documents `document_create` wrote "
         "are in it. `manicule doctor` reports a collection named here that has neither.",
     )
+    local_evidence: tuple[str, ...] = Field(
+        default=(),
+        description="The local schemes a structured memory's evidence may cite, besides http "
+        "and https: ``claude-session`` (one message in a Claude Code transcript) and ``git`` "
+        "(a file in a repository at a commit). Empty by default, so evidence is a web address "
+        "until an operator says otherwise. Applies to authored memories and to memories "
+        "ingested from files; a scheme left out is refused naming this setting. ``file:`` "
+        "addresses and raw paths are never accepted, whatever this says.",
+    )
+
+    @field_validator("local_evidence")
+    @classmethod
+    def _known_local_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        unknown = sorted(set(value) - set(LOCAL_SCHEMES))
+        if unknown:
+            msg = (
+                f"authoring.local_evidence names {unknown}, which are not local evidence "
+                f"schemes; the choices are {sorted(LOCAL_SCHEMES)}"
+            )
+            raise ValueError(msg)
+        return value
 
     @property
     def configured(self) -> bool:

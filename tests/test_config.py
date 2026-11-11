@@ -891,3 +891,11 @@ def test_an_ann_threshold_of_zero_or_the_floor_is_accepted(threshold: int) -> No
     settings = Settings.model_validate({"storage": {"ann_index_threshold": threshold}})
 
     assert settings.storage.ann_index_threshold == threshold
+
+
+def test_local_evidence_is_off_by_default_and_names_only_known_schemes() -> None:
+    assert Settings().authoring.local_evidence == ()
+    both = Settings(authoring={"local_evidence": ["claude-session", "git"]})  # pyright: ignore[reportArgumentType]
+    assert both.authoring.local_evidence == ("claude-session", "git")
+    with pytest.raises(ValidationError, match="not local evidence schemes"):
+        Settings(authoring={"local_evidence": ["file"]})  # pyright: ignore[reportArgumentType]

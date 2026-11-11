@@ -498,7 +498,7 @@ Production only, since March 2026. The staging pair still fails over on its own.
 | answer | body `## Answer` | the knowledge |
 | applicability | body `## Applicability` | where and when it holds, and where it does not |
 | knowledge type | `knowledge_type` | `procedure`, `constraint`, `fact`, `decision`, `known_issue` or `ownership` |
-| evidence | `evidence[]` | `kind`, `locator`, `said_at`, `quote`, optional `author` |
+| evidence | `evidence[]` | `kind`, `locator` (§6.3.1), `said_at`, `quote`, optional `author` |
 | evidence status | `evidence_status` | `single_source`, `corroborated`, `disputed` or `superseded` |
 | source dates | `evidence[].said_at` | when each *source* said it; oldest and newest are reported |
 | relationships | `relationships[]` | `relation` (`supersedes`, `superseded_by`, `contradicts`, `depends_on`, `relates_to`) and a `target` slug |
@@ -530,6 +530,45 @@ full timestamp with a UTC offset: a bare date is a claim about *when* the author
 number is worse. When the memory was written down is in the file's history; when manicule read it is
 `indexed_at`. `newest_said_at` is the only age reported, because it dates the **evidence** — a memory
 written last week from a message sent three years ago is three years old.
+
+#### 6.3.1 Locators that are not web addresses
+
+A `locator` is an `http` or `https` address, which needs no setting. Some places have no permalink:
+reasoning said in a Claude Code session, or written in a file under version control. Two local
+schemes cover them, and **each is off until the operator names it** in `authoring.local_evidence`:
+
+| Scheme | Form | Points at |
+|---|---|---|
+| `claude-session` | `claude-session:<session-uuid>#<message-uuid>` | one message in a Claude Code transcript; both ids are lowercase UUIDs |
+| `git` | `git:<repo>@<commit>:<path>#L<first>-L<last>` | a file at a commit; `<repo>` is a name for the repository (the connector instance that indexes it is the natural choice; it is checked for shape only, never against the configured connectors), `<commit>` a full 40- or 64-character lowercase object id, `<path>` relative to the repository root, and the line range optional (`#L10` is one line) |
+
+```toml
+[authoring]
+local_evidence = ["claude-session", "git"]
+```
+
+A scheme that is not enabled is refused, naming the scheme and this setting, and nothing is written.
+The setting applies to a memory that arrives in a file as well as to one authored, so a synced file
+cannot cite what the authoring door would refuse. A malformed locator, such as a missing message id
+or a short commit, is refused naming `evidence[n].locator` and the form it should take.
+
+**What did not change.** A document's own canonical address is still http or https with a host.
+`file:`, `javascript:`, `data:` and a raw path are still refused as evidence, with the same
+sentence as before: a path on one machine is not a citation. A local locator is shown as text and
+never as a link, and it is attested, never verified: nothing opens the transcript or the repository,
+so the quote is still what survives. Distinct locators count as before for `evidence_status`, web or
+local. A stored memory is never re-checked against the setting when it is read, so turning a scheme
+off does not make existing memories lose their evidence; it only refuses new ones. The converse
+holds too: turning a scheme **on** does not re-read a file that was already ingested and refused,
+because an unchanged document is skipped. Run `manicule document reindex <id>` for it (it re-parses from retained source
+bytes, so it needs them retained), or change the file. `kind` does not constrain the scheme: `kind: session` may cite a web address, and a
+`claude-session:` locator may carry any `kind`.
+
+**Not built.** A `git:` locator is not matched to the document the repository's connector indexed,
+and a hit does not say that the evidence resolves in this corpus. Where the repository has a web
+forge, cite the forge's own address, which is a valid locator; `git:` is for a repository that has none. In team mode a local locator is allowed when the
+setting enables it, and is not labeled as local to the machine that recorded it, so a reader on
+another machine sees a pointer they cannot open and relies on the quote.
 
 ### 6.4 Evidence status
 
