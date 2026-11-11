@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import secrets
 import shutil
@@ -119,6 +120,7 @@ if TYPE_CHECKING:
         RelationSweep,
         StaleSweep,
     )
+    from manicule.ingest.shared_vectors import Donor
     from manicule.ingest.sweeps import SweepResult
     from manicule.plugins.registry import Discovery
     from manicule.storage.backup_lock import MaintenanceHold
@@ -131,6 +133,8 @@ if TYPE_CHECKING:
     from manicule.storage.source_lifecycle import ResetPreparation
     from manicule.storage.vector_migration import VectorMigration
     from manicule.storage.vectors import LanceVectorStore, PublishedLanceVectorStore
+
+_LOG = logging.getLogger(__name__)
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -676,6 +680,27 @@ class Runtime:
         """
         return await self._workspaces.open(names)
 
+    async def vectors_from_other_workspaces(self) -> int:
+        """How many vectors this workspace copied from another one's store instead of embedding.
+
+        Satisfies :class:`~manicule.app.ports.CountsVectorReuse`. The ledger
+        :class:`_VectorReuseLedger` writes; zero for a workspace that has borrowed nothing.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+
+        await self.documents()
+        async with self.require_engine().connect() as connection:
+            counted = (
+                await connection.execute(
+                    select(models.VectorReuseLedger.vectors).where(
+                        models.VectorReuseLedger.workspace_id == self.workspace
+                    )
+                )
+            ).scalar_one_or_none()
+        return 0 if counted is None else int(counted)
+
     async def users(self) -> Users:
         """People, their memberships of this workspace, and their browser sessions."""
         return await self._once("users", self._build_users)
@@ -1117,6 +1142,7 @@ class Runtime:
         )
         from manicule.ingest.ports import FencedIngestStore  # noqa: PLC0415
         from manicule.ingest.refusals import check_before_run  # noqa: PLC0415
+        from manicule.ingest.shared_vectors import SharedVectors  # noqa: PLC0415
         from manicule.ingest.workers import WorkerPool, worker_config  # noqa: PLC0415
 
         settings = self._settings
@@ -1216,6 +1242,15 @@ class Runtime:
             # fingerprint that recorded a state configuration could not actually reach would be
             # a lie told in a column rather than a setting quietly doing nothing.
             detect_glossary=settings.rag.glossary.detect_on_ingest,
+            # Always on: no setting turns it off (`docs/storage.md` §6.2.6). What it costs a
+            # document that no other workspace holds is one read per other indexed workspace.
+            shared_vectors=SharedVectors(
+                _RuntimeDonors(
+                    self._workspaces, embedder.fingerprint, fingerprint.embed_text_middleware
+                ),
+                fingerprint=embedder.fingerprint,
+                ledger=_VectorReuseLedger(self),
+            ),
         )
 
     async def middleware(self) -> MiddlewareRunner:
@@ -2662,6 +2697,75 @@ class _Keys:
             return _key_summary(row)
 
 
+def _recorded_matches(recorded: str | None, fingerprint: EmbedFingerprint) -> bool:
+    """Whether a recorded embedding is ``fingerprint``'s. An unreadable record is not."""
+    from manicule.core.embedding import EmbedFingerprint as Fingerprint  # noqa: PLC0415
+
+    if recorded is None:
+        return False
+    try:
+        return Fingerprint.model_validate_json(recorded).matches(fingerprint)
+    except ValueError:
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeDonors:
+    """The other workspaces of this data directory that may lend vectors, asked when needed.
+
+    Satisfies :class:`~manicule.ingest.shared_vectors.Donors`. Resolved per question through
+    the registry, so a workspace indexed after this pipeline was built lends from then on.
+    """
+
+    registry: _Workspaces
+    fingerprint: EmbedFingerprint
+    middleware: Sequence[str]
+
+    async def donors(self, *, source: str, source_id: str) -> Sequence[Donor]:
+        return await self.registry.donors(
+            self.fingerprint, self.middleware, source=source, source_id=source_id
+        )
+
+
+class _VectorReuseLedger:
+    """The operator's count of vectors this workspace copied from another one.
+
+    Satisfies :class:`~manicule.ingest.shared_vectors.BorrowLedger`. One upsert per committed
+    document that borrowed anything, in the engine's writer queue like every other write here.
+    It names the receiving workspace and nothing else (``docs/storage.md`` §6.2.6).
+    """
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    async def record(self, vectors: int) -> None:
+        from sqlalchemy.dialects.sqlite import insert  # noqa: PLC0415
+
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory, writer_slot  # noqa: PLC0415
+        from manicule.storage.types import utcnow  # noqa: PLC0415
+
+        if vectors <= 0:
+            return
+        engine = self._runtime.require_engine()
+        now = utcnow()
+        statement = insert(models.VectorReuseLedger).values(
+            workspace_id=self._runtime.workspace, vectors=vectors, updated_at=now
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[models.VectorReuseLedger.workspace_id],
+            set_={
+                "vectors": models.VectorReuseLedger.vectors + statement.excluded.vectors,
+                "updated_at": now,
+            },
+        )
+        async with (
+            writer_slot(engine, "record_vector_reuse"),
+            session_factory(engine).begin() as session,
+        ):
+            await session.execute(statement)
+
+
 @dataclass(slots=True)
 class _OpenedVectors:
     """One other workspace's vector handle, and the index state it was opened against."""
@@ -2713,6 +2817,18 @@ class _Workspaces:
         self._runtime = runtime
         self._stores: dict[str, SqliteDocStore] = {}
         self._vectors: dict[str, _OpenedVectors] = {}
+        # Handles opened to lend vectors to this workspace's ingest (`docs/storage.md` §6.2.6),
+        # cached apart from the search handles above. They are prepared with this pipeline's
+        # middleware declaration, which a search never loads, and a shared slot would tear one
+        # kind down to open the other while a caller of the first was still using it.
+        self._donor_vectors: dict[str, _OpenedVectors] = {}
+        # Donor handles superseded by a newer index state. Closed with the registry rather than
+        # when superseded: several documents lend at once, and closing a handle under one of
+        # them would fail its read part-way and quietly send it to the model.
+        self._retired_donors: list[VectorStore] = []
+        # The index state each donor last failed to open under, so a workspace whose vectors are
+        # missing is tried once per state rather than once per document of every sync.
+        self._donor_failures: dict[str, tuple[str | None, str | None, int]] = {}
         self._lock = asyncio.Lock()
 
     async def open(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
@@ -2760,8 +2876,14 @@ class _Workspaces:
 
     async def aclose(self) -> None:
         """Release every vector handle this registry opened. The engine is the runtime's."""
-        opened = list(self._vectors.values())
+        opened = [
+            *self._vectors.values(),
+            *self._donor_vectors.values(),
+            *(_OpenedVectors(state=("", None, 0), vectors=old) for old in self._retired_donors),
+        ]
         self._vectors.clear()
+        self._donor_vectors.clear()
+        self._retired_donors.clear()
         failures: list[Exception] = []
         for handle in opened:
             teardown = getattr(handle.vectors, "teardown", None)
@@ -2784,6 +2906,21 @@ class _Workspaces:
         Raises:
             UnknownEntityError: A name is not a workspace here.
         """
+        known = await self._known_states()
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            named = ", ".join(repr(name) for name in unknown)
+            msg = (
+                f"no workspace {named} on this data directory. Workspaces here: "
+                f"{', '.join(sorted(known)) or 'none'}. Nothing was searched: a search that "
+                f"quietly skipped a workspace it was asked for would report a partial answer as "
+                f"a whole one."
+            )
+            raise UnknownEntityError(msg)
+        return {name: known[name] for name in names}
+
+    async def _known_states(self) -> dict[str, tuple[str | None, str | None, int]]:
+        """Every workspace's recorded embedding, vector namespace and reset epoch, in one read."""
         from sqlalchemy import select  # noqa: PLC0415
 
         from manicule.storage import models  # noqa: PLC0415
@@ -2804,7 +2941,7 @@ class _Workspaces:
                     )
                 )
             ).all()
-        known = {
+        return {
             str(row.id): (
                 None if row.embed_fingerprint is None else str(row.embed_fingerprint),
                 None if row.vector_namespace is None else str(row.vector_namespace),
@@ -2812,17 +2949,88 @@ class _Workspaces:
             )
             for row in rows
         }
-        unknown = [name for name in names if name not in known]
-        if unknown:
-            named = ", ".join(repr(name) for name in unknown)
-            msg = (
-                f"no workspace {named} on this data directory. Workspaces here: "
-                f"{', '.join(sorted(known)) or 'none'}. Nothing was searched: a search that "
-                f"quietly skipped a workspace it was asked for would report a partial answer as "
-                f"a whole one."
-            )
-            raise UnknownEntityError(msg)
-        return {name: known[name] for name in names}
+
+    async def donors(
+        self,
+        fingerprint: EmbedFingerprint,
+        middleware: Sequence[str],
+        *,
+        source: str,
+        source_id: str,
+    ) -> Sequence[Donor]:
+        """Read handles on every other workspace that could lend this one ``source_id``'s vectors.
+
+        ``docs/storage.md`` §6.2.6. A workspace qualifies when it has recorded an index built by
+        exactly ``fingerprint``'s model and holds a live document for the same
+        ``(source, source_id)``; anything else is **skipped, never refused**. That is the
+        difference from :meth:`open`: a search names its workspaces and a missing one makes the
+        answer partial, while a donor is an optimization nobody asked for by name, and a
+        workspace that cannot lend leaves the document to the model rather than failing it.
+
+        **The document check is what keeps a first sync cheap.** It is one primary-key read of
+        ``documents`` for every candidate at once, and it means a vector store is asked only by
+        the workspaces that could possibly answer. Without it, every document of every sync
+        would cost one identity lookup in every other indexed workspace's vectors, almost all of
+        them finding nothing. A document the check admits can still lend nothing: the vector
+        store's own verdict decides that.
+
+        Ordered by name, so which donor answers first does not depend on how rows came back.
+        """
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from manicule.core.ids import document_id  # noqa: PLC0415
+        from manicule.ingest.shared_vectors import Donor as Lending  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
+
+        runtime = self._runtime
+        # Both reads outside the registry lock: they are plain reads of the shared engine, and
+        # holding the lock across them would queue every document of a sync, and any spanning
+        # search, behind work that answers nothing for most of them. Only opening a handle,
+        # which mutates the cache, is serialized.
+        known = await self._known_states()
+        eligible = {
+            document_id(name, source, source_id): name
+            for name, (recorded, _namespace, _epoch) in known.items()
+            if name != runtime.workspace and _recorded_matches(recorded, fingerprint)
+        }
+        if not eligible:
+            return []
+        async with runtime.require_engine().connect() as connection:
+            holding = {
+                str(row.workspace_id)
+                for row in await connection.execute(
+                    select(models.Document.workspace_id).where(
+                        models.Document.id.in_(sorted(eligible)),
+                        models.Document.deleted_at.is_(None),
+                    )
+                )
+            }
+        found: list[Donor] = []
+        async with self._lock:
+            for name in sorted(holding & set(eligible.values())):
+                state = known[name]
+                if self._donor_failures.get(name) == state:
+                    continue
+                try:
+                    vectors = await self._vectors_for(
+                        name,
+                        state,
+                        fingerprint,
+                        middleware=middleware,
+                        cache=self._donor_vectors,
+                        retire=self._retired_donors,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a donor that cannot be opened lends nothing
+                    self._donor_failures[name] = state
+                    _LOG.warning(
+                        "skipped another workspace as a source of reusable vectors until its "
+                        "index changes: %s",
+                        type(exc).__name__,
+                    )
+                    continue
+                self._donor_failures.pop(name, None)
+                found.append(Lending(workspace=name, vectors=vectors))
+        return found
 
     @staticmethod
     def _require_searchable(
@@ -2879,8 +3087,19 @@ class _Workspaces:
         name: str,
         state: tuple[str | None, str | None, int],
         searching: EmbedFingerprint,
+        *,
+        middleware: Sequence[str] = (),
+        cache: dict[str, _OpenedVectors] | None = None,
+        retire: list[VectorStore] | None = None,
     ) -> VectorStore:
         """``name``'s vectors, opened for reading in ``searching``'s space.
+
+        ``middleware`` is the embed-text declaration a handle folds into every embedding-input
+        identity it derives. A search derives none and passes nothing; a lender's handle has
+        to derive the identities ``name``'s own ingest recorded, so it is given the declaration
+        this installation ingests under. ``cache`` is which slot the handle lives in, and
+        ``retire``, when given, is where a superseded handle goes instead of being closed now,
+        for a caller whose handles may still be in use when the state moves.
 
         The embedded backend opens the workspace's own directory, bound to its index identity
         and reset epoch as this runtime's own handle is. Any other backend is asked to open it,
@@ -2895,15 +3114,19 @@ class _Workspaces:
         """
         from manicule.core.protocols import MultiWorkspaceVectorStore  # noqa: PLC0415
 
+        opened = self._vectors if cache is None else cache
         key = (searching.canonical(), state[1], state[2])
-        cached = self._vectors.get(name)
+        cached = opened.get(name)
         if cached is not None and cached.state == key:
             return cached.vectors
         if cached is not None:
-            del self._vectors[name]
-            teardown = getattr(cached.vectors, "teardown", None)
-            if teardown is not None:
-                await teardown()
+            del opened[name]
+            if retire is not None:
+                retire.append(cached.vectors)
+            else:
+                teardown = getattr(cached.vectors, "teardown", None)
+                if teardown is not None:
+                    await teardown()
 
         configured = await self._runtime.container.aget(keys.VECTOR_STORE)
         vectors: VectorStore
@@ -2920,7 +3143,7 @@ class _Workspaces:
                 raise VectorStoreStateError(msg)
             try:
                 physical.require_match(searching)
-                await published.ensure_ready(searching)
+                await published.ensure_ready(searching, embed_text_middleware=middleware)
             except BaseException:
                 await published.teardown()
                 raise
@@ -2934,7 +3157,7 @@ class _Workspaces:
                 f"each workspace on its own."
             )
             raise ConfigError(msg)
-        self._vectors[name] = _OpenedVectors(state=key, vectors=vectors)
+        opened[name] = _OpenedVectors(state=key, vectors=vectors)
         return vectors
 
 

@@ -1508,7 +1508,7 @@ reports the parts separately, because the remedy differs:
 | `embedding.input_changed` | chunks sent to the model | the input is new or has moved — including a chunk whose id survived |
 | `embedding.repaired` | chunks sent to the model | the input was unchanged and the stored vector was missing or unusable |
 | `embedding.refreshed` | chunks sent to the model | the input was unchanged and the vector reusable, and `--re-embed` asked for it anyway |
-| `embedding.forward_calls` | batches the model was asked for | the number accelerator time is proportional to |
+| `embedding.forward_calls` | batches the chunks sent to the model take | the number accelerator time is proportional to |
 | `embedding.first_seen` | chunks sent to the model | the document held nothing to reuse — growth, not change |
 | `embedding.cache_hits` | chunks the embedder's warm cache served | the process-local layer, reported apart from durable reuse |
 | `embedding.vectors_backfilled` | rows whose identity was reconstructed | a `vectors/` directory predating the identity column, converting itself as it is swept |
@@ -1516,6 +1516,15 @@ reports the parts separately, because the remedy differs:
 A rising `repaired` on a corpus nobody edited is the one line here that asks for attention: it
 says vector rows are going missing or arriving damaged, which is a question about the data
 directory rather than about a parser.
+
+**"Sent to the model" includes chunks whose vector another workspace already held.** When a
+workspace on the same installation holds a readable vector for the exact embedding input, under
+the same fingerprint and for the same `(source, source_id)`, the vector is copied rather than
+computed (`storage.md` §6.2.6). The copied chunks are counted here exactly as embedded chunks
+are, and `forward_calls` is the number of batches they would have taken, because this report
+reaches callers scoped to one workspace and must not tell them what another holds. How many
+vectors were copied is the operator's number: `manicule index --stats` reports it as
+`vectors_from_other_workspaces` to the operator at this machine, and to nobody over the network.
 
 **There is deliberately no counter for reuse missed because the embedding fingerprint
 changed.** A changed fingerprint does not produce misses. It refuses the run before discovery

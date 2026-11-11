@@ -276,7 +276,7 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **49 relational tables**. The 37 outside the durable
+The authoritative SQLAlchemy model has **50 relational tables**. The 37 outside the durable
 re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`,
 `auth_sessions`, `blob_backlog_members`, `blob_backlog_totals`, `blobs`, `acquisition_markers`, `chunk_relations`, `chunks`,
 `collection_documents`, `collections`, `connectors`, `conversations`, `document_tags`,
@@ -300,9 +300,10 @@ Two content-addressed acquisition ledgers keep exact global backlog admission co
 and `blob_backlog_members`, holds the exact size of the retained blobs nothing has published yet,
 and which blobs it counts, which blob admission reads (§7).
 Three more carry team mode ([#13](https://github.com/mgd43b/manicule/issues/13)): `users`,
-`auth_sessions` and `security_alerts` (§4.8).
+`auth_sessions` and `security_alerts` (§4.8). One more, `vector_reuse_ledger`, is the operator's
+count of vectors each workspace copied from another instead of embedding them (§6.2.6).
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 49.
+included in the 50.
 
 ### 4.1 The pre-#187 additions
 
@@ -809,6 +810,14 @@ The same revision adds a nullable `context_documents JSON` to `messages`, by a p
 written with the answer. A stored answer is shown to a restricted reader only when they may read
 all of them; `NULL`, on every row written before the revision, is never shown to one.
 
+The next revision (`e7a3c5f19d42`, after `e7a3c9d14b52`) adds `vector_reuse_ledger`, bringing
+the modeled total to the 50 in §4. It has one row per receiving workspace, keyed by
+`workspace_id` (a foreign key to `workspaces.id` `ON DELETE CASCADE`), with a non-negative
+`vectors` count and `updated_at`. The workspace that lent the vectors is deliberately not a
+column (§6.2.6). No existing row is touched. The downgrade drops the table, and with it the
+count. It is on the retrieval cache's exemption list (`NON_CORPUS_TABLES`), because no query
+reads it.
+
 ---
 
 ## 5. Alembic
@@ -1080,6 +1089,9 @@ believed.
 
 Anything weaker than all three preserves a stale vector under current chunk text, silently, for
 as long as the index lives.
+
+The same three clauses decide whether a vector *another workspace* holds can stand in for a
+forward pass. §6.2.6 is how that question is asked without changing clause 2.
 
 **Why a digest is safe to compare, and what it assumes.** `embed_identity` is a SHA-256 over a
 canonical JSON array of five values — a version tag, the document id, the fingerprint's
@@ -1411,6 +1423,101 @@ and it is why the coverage report distinguishes "carries a checksum" from "was v
 the answer to *suspected* past corruption is a rebuild from retained source bytes rather than a
 backfill. A rebuild is the only operation that can establish integrity retroactively, and §7 is
 what makes it available without a re-crawl.
+
+#### 6.2.6 Reuse across workspaces
+
+A document's identity carries its workspace (`document_id(workspace, source, source_id)`), and
+so does every chunk id derived from it, which is the tenancy rule and is not relaxed here. The
+same source synced into two workspaces is two documents, two sets of chunks and two sets of
+vector rows; no row is shared between them, and every read is still scoped by the store handle
+and re-checked by `require_owned`. What is shared is the *work*: when a workspace is about to
+embed a chunk that another workspace on this installation already holds a readable vector for,
+under the same fingerprint and the same embedding input, it copies that vector into its own row
+instead of calling the model. This is always on. There is no setting.
+
+**The match is the reuse invariant above, asked in the other workspace's terms.** The stored
+identity folds in the document id (clause 2), so no identity one workspace computes for its own
+chunk can equal one another workspace stored, and a lookup keyed on it could never cross by
+accident. The lender (`manicule.ingest.shared_vectors.SharedVectors`) does not loosen that. For
+each other workspace *W* it re-addresses the chunk to the document the same `(source,
+source_id)` is in *W*, `document_id(W, source, source_id)`, and asks *W*'s own store
+`stored_vectors` about it. *W*'s store then applies the same rule it applies to itself
+(`classify_stored_vector`): its recorded identity must be the identity of this exact
+`embed_text` under that document, the row's two halves must agree, and the vector must be of
+the right dimension, finite, and match its recorded checksum. The lender takes a vector only
+from a verdict of `readable`, and only from a store whose recorded fingerprint `matches` the
+borrowing workspace's embedder (clause 1). It checks that clause itself rather than trusting
+whoever chose the donors, because a store classifies its rows against *its own* fingerprint, so
+a store built by another model would find every one of them readable. No store gains a method:
+the lender needs only `stored_vectors` and `fingerprint`. A backend can lend when the runtime can
+open another workspace's handle on it, which means the embedded backend's published directory or
+any store implementing `MultiWorkspaceVectorStore`, as Qdrant does. A plugin store that
+implements neither is never a donor, and its workspaces embed exactly as before.
+
+What follows from keying on the document in the other workspace's terms:
+
+- **The connector instance must have the same name in both workspaces**, because the name is the
+  `source` half of the document id. Two instances that read the same pages under different
+  names are two sources and lend each other nothing. That is the narrow case on purpose. It is
+  the case a shared source produces, and it needs no new column, payload index or backfill on
+  either backend. A row written before identities were recorded is not found by identity, so it
+  is not lent until its own workspace rewrites it.
+- **The same text in an unrelated document is not matched.** A chunk's `embed_text` carries its
+  document's title in the breadcrumb, so two different documents almost never share one anyway.
+
+**Where it runs.** `embed_or_reuse` consults the lender after this workspace's own store, for
+only the chunks that store could not supply. It does so only when reuse is on, so `reindex
+--re-embed` never borrows, and only after `require_within_context` has run over every chunk,
+including the tokenizer's own count where the embedder has one. A chunk the model would refuse is
+refused whether or not another workspace holds a vector for it. The connector sync and the
+re-parse sweeps go through the pipeline and borrow. `reindex --repair` and the offline rebuild
+call `embed_or_reuse` without a lender and do not. Before any vector store is read, the runtime
+keeps only the workspaces that hold a live document under the re-addressed id, which costs one
+primary-key read of `documents` for all of them together. An unrelated corpus therefore costs no
+read of another workspace's vectors. On the embedded backend the runtime opens
+each other workspace's published LanceDB generation read-only, as a spanning search does
+(`retrieval.md` §3.2), and prepares it with this installation's embed-text middleware
+declaration so the identities it derives are the ones that workspace recorded. On Qdrant it uses
+`open_workspace`, which shares the client and never prepares a collection. A workspace with no
+index, one built by another model, or one whose handle cannot be opened is skipped, never
+refused, and so is a workspace whose lookup fails for any reason. A failure is logged at
+warning on the operator's log and never becomes the borrowing document's status. The model is
+still there. The ledger counts a document's copied vectors only once that document commits
+successfully. A failed update of an already-indexed document, which leaves the previous revision
+served, adds nothing. The count is cumulative: it tallies forward passes that were not made, so a
+later reset of the workspace's index does not reduce it.
+
+**The copy is written as a fresh vector.** The borrowing workspace stores the vector through its
+own `upsert`, under its own chunk id, publication and identity, and computes its own checksum
+over what it persists. A stored vector is already canonical float32 at unit length, so
+`canonical_stored_vector` leaves it unchanged. The borrowed row therefore holds the donor's
+stored values exactly, and its checksum verifies under `checksum_coverage(recompute=True)` like
+any other row (`tests/app/test_shared_vectors_runtime.py`, and the real-server test in
+`tests/test_storage_qdrant.py`). Nothing else of the donor's row crosses: not its chunk, not
+its text, not its id.
+
+**Callers scoped to a workspace are not told.** The borrowed chunks are reported as embedded, in
+the same partition (`first_seen`, `input_changed`, `repaired`), and `forward_calls` is the number
+of batches they would have taken. A sweep report, a sync report or an MCP or HTTP payload reads
+the same whether or not another workspace held the text
+(`test_what_a_borrowing_workspace_reports_is_what_it_would_report_alone`). The number of vectors
+copied is written only to `vector_reuse_ledger`, one row per *receiving* workspace. The lending
+workspace is deliberately not recorded. `manicule index --stats` shows it as
+`vectors_from_other_workspaces` to the operator at this machine and to nobody else. A network
+caller, an administrator included, receives `null`.
+
+**What cannot be hidden, and is accepted.** With reuse always on, a document whose every vector
+was borrowed indexes faster than one whose vectors were embedded, and anyone who can time a sync
+of their own workspace can observe the difference. A workspace member who adds a document and
+times its ingest can therefore learn whether some other workspace on the installation already
+holds the same document under the same source name. This is a deliberate trade-off: the
+alternative was a per-installation or per-pair opt-in, and the owner chose always-on. Two
+smaller signals of the same kind already existed before this: the embedder's in-memory cache is
+shared by every workspace in a process, so `cache_hits` can rise for text another workspace
+embedded in the same process, and since borrowed chunks never reach that cache it can also read
+lower than it would have. An installation whose workspaces must not learn anything about one
+another's contents through timing should run them as separate installations with separate data
+directories.
 
 ### 6.3 Fingerprints, and the refusal
 

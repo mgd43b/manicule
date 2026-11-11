@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from manicule.core.content import Chunk, Document, DocumentRevision, ParsedBlock
     from manicule.core.glossary import GlossaryEntry
     from manicule.core.protocols import Chunker, Embedder, Middleware
+    from manicule.ingest.shared_vectors import SharedVectors
 
 
 def build(
@@ -54,6 +55,8 @@ def build(
     detect_glossary: bool = True,
     chunker: Chunker | None = None,
     sensitive_sources: frozenset[str] = frozenset(),
+    workspace: str = "default",
+    shared_vectors: SharedVectors | None = None,
 ) -> tuple[IngestPipeline, fakes.MemoryIngestStore, fakes.MemoryVectors]:
     """A pipeline over in-memory everything, plus the store and vectors to assert against.
 
@@ -82,6 +85,8 @@ def build(
         parse_fingerprints=parse_fingerprints,
         detect_glossary=detect_glossary,
         sensitive_sources=sensitive_sources,
+        workspace=workspace,
+        shared_vectors=shared_vectors,
     )
     return pipeline, store, vectors
 

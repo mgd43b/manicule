@@ -1191,7 +1191,12 @@ class EmbeddingCost(Payload):
     """Vectors taken from the store without a model call, because the embedding input matched."""
 
     embedded: int = Field(default=0, ge=0)
-    """Chunks handed to the embedder."""
+    """Chunks this workspace held no reusable vector for: the embedding work the operation cost.
+
+    Counted the same whether the model computed the vector or it was copied from another
+    workspace that already held the identical embedding input (``docs/storage.md`` §6.2.6), so
+    this number never says what another workspace holds.
+    """
 
     input_changed: int = Field(default=0, ge=0)
     """Of ``embedded``, those the index held an embedding input for and no longer matches.
@@ -1224,7 +1229,11 @@ class EmbeddingCost(Payload):
     """
 
     forward_calls: int = Field(default=0, ge=0)
-    """Batches the embedder was asked for. The number an accelerator's time is proportional to."""
+    """Batches ``embedded`` takes at the embedder. What an accelerator's time is proportional to.
+
+    Where vectors were copied from another workspace instead, this is the number of batches the
+    same chunks would have taken, for the reason ``embedded`` gives.
+    """
 
     cache_hits: int = Field(default=0, ge=0)
     """Chunks the embedder served from its in-memory cache rather than the model.
@@ -2740,6 +2749,15 @@ class Stats(Payload):
     by_source: dict[str, int] = Field(default_factory=dict)
     by_media_type: dict[str, int] = Field(default_factory=dict)
     by_status: dict[str, int] = Field(default_factory=dict)
+    vectors_from_other_workspaces: int | None = Field(default=None, ge=0)
+    """Vectors this workspace copied from another workspace's store instead of embedding them.
+
+    **The operator's number, and nobody else's** (``docs/storage.md`` §6.2.6). Filled only for
+    the operator at this machine, who holds every workspace already; ``None`` for every caller
+    reached over the network, administrators included, because a count that rose when another
+    tenant already held a text would tell a workspace-scoped caller that it did. ``0`` and
+    ``None`` are different answers: none borrowed, and not this caller's to know.
+    """
 
 
 class Check(Payload):

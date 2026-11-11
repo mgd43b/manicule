@@ -66,7 +66,12 @@ from manicule.app.people import (
     provider_for,
     serving_problems,
 )
-from manicule.app.ports import ReaderStore, RetrievingAcross, SpansWorkspaces
+from manicule.app.ports import (
+    CountsVectorReuse,
+    ReaderStore,
+    RetrievingAcross,
+    SpansWorkspaces,
+)
 from manicule.app.sensitive import UnreadableDatabaseError, sensitive_exposure
 from manicule.app.tenancy import (
     CrossWorkspaceError,
@@ -4165,12 +4170,21 @@ class ApplicationService:
                 by_status=dict(totals.by_status),
             )
         statistics = await store.document_statistics()
+        # Only for the operator at this machine (`docs/storage.md` §6.2.6). An administrator
+        # over the network is still scoped to this workspace, and the count is a measurement of
+        # what *other* workspaces held.
+        borrowed = (
+            await self._backend.vectors_from_other_workspaces()
+            if current().is_local and isinstance(self._backend, CountsVectorReuse)
+            else None
+        )
         return r.Stats(
             documents=await store.count_documents(),
             chunks=await store.count_chunks(),
             by_source=dict(statistics.get("by_source", {})),
             by_media_type=dict(statistics.get("by_media_type", {})),
             by_status=dict(statistics.get("by_status", {})),
+            vectors_from_other_workspaces=borrowed,
         )
 
     async def doctor(self, *, fix: bool = False) -> r.Diagnosis:
