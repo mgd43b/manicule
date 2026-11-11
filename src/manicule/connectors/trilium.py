@@ -347,7 +347,7 @@ class TriliumConnector:
                     title=title,
                     canonical_uri=self._uri(note.note_id),
                     source_id=note.note_id,
-                    version=note.blob_id,
+                    version=_version_token(note),
                     created_at=_parse_utc(note.created),
                     modified_at=_parse_utc(note.modified),
                     content_type=note.media_type,
@@ -450,44 +450,75 @@ class _Entry:
 def _read(item: Mapping[str, object]) -> _Entry:
     """One search result, read strictly: a shape this does not recognize raises.
 
-    Lenient reading would drop an entry and so hide a note from the inventory, which deletes it.
+    Lenient reading fails open in both directions. An entry dropped, or a note whose ``type`` is
+    missing and so reads as one that is not indexed, disappears from the inventory and is deleted;
+    a label that cannot be read cannot exclude, so a subtree someone marked private is indexed. So
+    every field a scope decision rests on must be present and the right shape, and anything else
+    fails the whole sweep (§6.1).
     """
-    note_id = _text(item, "noteId")
-    parents = item.get("parentNoteIds")
-    attributes = item.get("attributes", [])
     protected = item.get("isProtected")
+    parents = item.get("parentNoteIds")
+    attributes = item.get("attributes")
     if (
-        not note_id
+        not isinstance(protected, bool)
         or not isinstance(parents, list)
         or not isinstance(attributes, list)
-        or not isinstance(protected, bool)
     ):
-        msg = "the note search returned an entry that is not shaped like an ETAPI note"
-        raise ConnectorError(msg)
+        raise _malformed("isProtected, parentNoteIds or attributes is missing or of the wrong kind")
+    parent_ids: list[str] = []
+    for parent in cast("list[object]", parents):
+        if not isinstance(parent, str) or not parent:
+            raise _malformed("a parent note id is not a non-empty string")
+        parent_ids.append(parent)
     labels: list[tuple[str, str]] = []
     for attribute in cast("list[object]", attributes):
-        if isinstance(attribute, dict):
-            fields = cast("dict[str, object]", attribute)
-            name, value = fields.get("name"), fields.get("value", "")
-            if fields.get("type") == "label" and isinstance(name, str):
-                labels.append((name, value if isinstance(value, str) else ""))
+        if not isinstance(attribute, dict):
+            raise _malformed("an attribute is not an object")
+        fields = cast("dict[str, object]", attribute)
+        kind, name = fields.get("type"), fields.get("name")
+        if not isinstance(kind, str) or not isinstance(name, str) or not name:
+            raise _malformed("an attribute has no type or no name")
+        if kind == "label":
+            value = fields.get("value")
+            if not isinstance(value, str):
+                raise _malformed("a label has no string value")
+            labels.append((name, value))
     return _Entry(
-        note_id=note_id,
-        title=_text(item, "title"),
-        note_type=_text(item, "type"),
-        mime=_text(item, "mime"),
+        note_id=_required(item, "noteId"),
+        title=_optional(item, "title"),
+        note_type=_required(item, "type"),
+        mime=_optional(item, "mime"),
         protected=protected,
-        blob_id=_text(item, "blobId"),
-        created=_text(item, "utcDateCreated"),
-        modified=_text(item, "utcDateModified"),
-        parents=tuple(str(parent) for parent in cast("list[object]", parents)),
+        blob_id=_optional(item, "blobId"),
+        created=_optional(item, "utcDateCreated"),
+        modified=_optional(item, "utcDateModified"),
+        parents=tuple(parent_ids),
         labels=tuple(labels),
     )
 
 
-def _text(item: Mapping[str, object], key: str) -> str:
+def _malformed(what: str) -> ConnectorError:
+    return ConnectorError(
+        f"the note search returned an entry that is not shaped like an ETAPI note: {what}. The "
+        f"sweep stops, because an entry read leniently could drop a note from the inventory or "
+        f"admit one that is excluded"
+    )
+
+
+def _required(item: Mapping[str, object], key: str) -> str:
+    """A field that must be a non-empty string."""
+    value = item.get(key)
+    if not isinstance(value, str) or not value:
+        raise _malformed(f"{key} is missing or not a non-empty string")
+    return value
+
+
+def _optional(item: Mapping[str, object], key: str) -> str:
+    """A field that may be absent, and must be a string when it is there."""
     value = item.get(key, "")
-    return value if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        raise _malformed(f"{key} is not a string")
+    return value
 
 
 def _is_system(note_id: str) -> bool:

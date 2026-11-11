@@ -164,10 +164,10 @@ class FakeTrilium:
         if self.cap is not None:
             limit = min(limit, self.cap)
         ordered = sorted(self.notes.values(), key=lambda note: note.modified, reverse=True)
-        results = [self._json(note) for note in ordered[:limit]]
+        results = [self.serialize(note) for note in ordered[:limit]]
         return httpx.Response(200, json={"results": [*results, *self.extra_results]})
 
-    def _json(self, note: FakeNote) -> dict[str, object]:
+    def serialize(self, note: FakeNote) -> dict[str, object]:
         children = [other.note_id for other in self.notes.values() if note.note_id in other.parents]
         return {
             "noteId": note.note_id,

@@ -353,15 +353,61 @@ async def test_a_response_just_under_the_limit_is_trusted() -> None:
     assert await reconciled(connector) == ["garden", "plan"]
 
 
-@pytest.mark.parametrize("entry", [{"title": "no id"}, {"noteId": "x", "parentNoteIds": "root"}])
+def _entry(**changes: object) -> dict[str, object]:
+    """A well-formed ETAPI note entry, with ``changes`` applied (``None`` removes a key)."""
+    entry = FakeTrilium().serialize(FakeNote("x", "X"))
+    entry["attributes"] = [{"type": "label", "name": "tag", "value": "a"}]
+    for key, value in changes.items():
+        if value is None:
+            entry.pop(key)
+        else:
+            entry[key] = value
+    return entry
+
+
+MALFORMED: dict[str, dict[str, object]] = {
+    "no note id": _entry(noteId=None),
+    "empty note id": _entry(noteId=""),
+    "no type": _entry(type=None),
+    "empty type": _entry(type=""),
+    "type is a number": _entry(type=7),
+    "no isProtected": _entry(isProtected=None),
+    "isProtected is a string": _entry(isProtected="false"),
+    "parents is a string": _entry(parentNoteIds="root"),
+    "a parent is a number": _entry(parentNoteIds=["root", 5]),
+    "a parent is empty": _entry(parentNoteIds=[""]),
+    "no attributes": _entry(attributes=None),
+    "attributes is a string": _entry(attributes="label"),
+    "an attribute is a string": _entry(attributes=["manicule_skip"]),
+    "an attribute has no name": _entry(attributes=[{"type": "label", "value": ""}]),
+    "an attribute has no type": _entry(attributes=[{"name": "manicule_skip", "value": ""}]),
+    "a label has no value": _entry(attributes=[{"type": "label", "name": "manicule_skip"}]),
+    "a label value is a number": _entry(
+        attributes=[{"type": "label", "name": "manicule_skip", "value": 1}]
+    ),
+    "title is a number": _entry(title=3),
+    "blobId is a number": _entry(blobId=3),
+}
+
+
+@pytest.mark.parametrize("entry", MALFORMED.values(), ids=MALFORMED.keys())
 async def test_an_entry_that_is_not_shaped_like_a_note_fails_the_sweep(
     entry: dict[str, object],
 ) -> None:
+    """Each of these would otherwise fail open: a note vanishes from the inventory, or a label
+    that should have excluded a subtree is not read."""
     server = vault()
     server.extra_results.append(entry)
 
     with pytest.raises(ConnectorError, match="not shaped like an ETAPI note"):
         await reconciled(connector_for(server))
+
+
+async def test_a_well_formed_entry_is_accepted() -> None:
+    server = vault()
+    server.extra_results.append(_entry())
+
+    assert "x" in await reconciled(connector_for(server))
 
 
 # --- fetch (§6.3) ---------------------------------------------------------------------------

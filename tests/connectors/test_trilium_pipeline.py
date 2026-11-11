@@ -112,6 +112,25 @@ async def test_renaming_a_folder_re_reads_the_notes_inside_it_and_no_others() ->
     assert fetched == ["plan"]
 
 
+async def test_a_label_only_edit_refreshes_the_stored_labels() -> None:
+    """The content, its hash and the note's modification date are unchanged, so only the source
+    record can tell the pipeline the metadata moved."""
+    server = vault()
+    built, store = pipeline()
+    connector = connector_for(server)
+    fetched = counting(connector)
+    await built.run(connector, retain_source_bytes=False)
+    fetched.clear()
+
+    server.notes["plan"].labels = {"tag": "q3"}
+    await built.run(connector, retain_source_bytes=False)
+
+    document = await store.find_document(NAME, "plan")
+    assert document is not None
+    assert fetched == ["plan"]
+    assert document.metadata["trilium_labels"] == {"tag": ["q3"]}
+
+
 async def test_a_deleted_note_leaves_the_index_at_reconciliation() -> None:
     server = vault()
     built, store = pipeline()
