@@ -67,7 +67,7 @@ def _runtime(environment: Path) -> Runtime:
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
         llm={"generator": "scripted"},  # pyright: ignore[reportArgumentType]
         rag={"chunker": "block"},  # pyright: ignore[reportArgumentType]
-        security={"sharing": {"enabled": True}},  # pyright: ignore[reportArgumentType]
+        security={"sharing": {"enabled": True}, "auth": {"mode": "api_key"}},  # pyright: ignore[reportArgumentType]
     )
     assert settings.rag.cache.enabled, "the cache is part of what is under test"
     return Runtime(settings, discovery=found)
@@ -183,6 +183,19 @@ async def test_a_key_with_no_person_reads_only_what_carries_no_gate(
         found = await service.search(QUESTION, limit=5)
 
     assert _documents(found) == {OPEN_ID}
+
+
+async def test_a_key_minted_for_a_person_reads_what_that_person_reads(
+    service: ApplicationService, restricted: People
+) -> None:
+    """What `deployment.md` tells an operator to do for a program that must read a source."""
+    issued = await service.api_key_create("erins-agent", role="viewer", user="erin")
+    identity = await service.authenticate(issued.secret)
+
+    assert identity.user_id == restricted.erin
+    with acting_as(Caller(role=Role.VIEWER, key_id=identity.key_id, user_id=identity.user_id)):
+        found = await service.search(QUESTION, limit=5)
+    assert RESTRICTED_ID in _documents(found)
 
 
 async def test_one_readers_cached_ranking_is_never_served_to_another(

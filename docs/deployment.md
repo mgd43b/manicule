@@ -111,7 +111,8 @@ What that does, precisely:
 - **The operator at this machine is not restricted**: the command line, stdio MCP and a served
   process with `security.auth.mode = none` act with the authority of whoever started the process.
   Every network caller is, **administrators included** — an administrator who needs to read a
-  restricted source joins a group granted it, and that change is audited. A key nobody owns has no
+  restricted source joins a group granted it, and with `security.audit.enabled` on, that change
+  is in the audit trail. A key nobody owns has no
   person to put in a group, so it reads only sources with no grant; mint keys for a person
   (`manicule auth create-key --user HANDLE`) when a program needs to read a restricted source.
 - **It is enforced where the workspace is**: by the store when it hydrates retrieved chunk ids
