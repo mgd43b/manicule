@@ -122,7 +122,11 @@ def test_typer_is_held_below_the_release_the_cli_cannot_build_against(
         if requirement.name == "typer"
     ]
 
-    assert typer.specifier.contains("0.27.3"), "the version the lock pins must stay allowed"
+    with (REPO_ROOT / "uv.lock").open("rb") as handle:
+        packages = cast(list[dict[str, Any]], tomllib.load(handle)["package"])
+    (locked,) = [package["version"] for package in packages if package["name"] == "typer"]
+
+    assert typer.specifier.contains(locked), "the version the lock pins must stay allowed"
     assert not typer.specifier.contains("0.29.0"), (
         "typer 0.29 requires a type_descriptor that manicule.cli.main does not pass"
     )

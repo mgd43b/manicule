@@ -183,9 +183,9 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   # Typer derives the command line from type hints, so the signature of a service call and
   # the shape of the command that reaches it cannot drift. MIT.
   #
-  # The ceiling is 0.29, exclusive, and it is a ceiling rather than a preference. 0.29 dropped
-  # its dependency on Click and carries a private copy (`typer._click`), and with it changed the
-  # constructor of `typer.core.TyperOption`: `type_descriptor`, a `typer._coercion` object, is
+  # The ceiling is 0.29, exclusive, and it is a ceiling rather than a preference. As of 0.29.0
+  # Typer dropped its dependency on Click and carries a private copy (`typer._click`), and with it
+  # changed the constructor of `typer.core.TyperOption`: `type_descriptor`, a `typer._coercion` object, is
   # now a required argument. `manicule.cli.main` builds the options every command shares
   # (`--json`, `--workspace`) with that constructor, so against 0.29 the console script dies
   # with a `TypeError` before it prints anything. `manicule.cli.shell` also reaches into
