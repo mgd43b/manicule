@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.26](https://github.com/mgd43b/manicule/compare/v0.2.25...v0.2.26) (2026-11-11)
+
+
+### Features
+
+* **connectors:** index the documents in a Git repository, local or remote ([#555](https://github.com/mgd43b/manicule/issues/555)) ([d3dc18a](https://github.com/mgd43b/manicule/commit/d3dc18a3365326f2f96e11180d689f07cee9e837))
+
 ## [0.2.25](https://github.com/mgd43b/manicule/compare/v0.2.24...v0.2.25) (2026-11-11)
 
 
