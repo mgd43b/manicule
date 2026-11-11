@@ -13,11 +13,13 @@ starts, including ``manicule doctor`` on a machine that is never going to sync a
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from manicule.connectors.config import (
     CONNECTOR_NAME,
     FILESYSTEM_CONNECTOR_NAME,
+    GIT_DOCS_CONNECTOR_NAME,
     GIT_SITE_CONNECTOR_NAME,
     GMAIL_CONNECTOR_NAME,
     MBOX_CONNECTOR_NAME,
@@ -26,6 +28,7 @@ from manicule.connectors.config import (
     ConfluenceConfig,
     ConfluenceSnapshotConfig,
     FilesystemConfig,
+    GitDocsConfig,
     GitSiteConfig,
     GmailConfig,
     MboxConfig,
@@ -52,6 +55,7 @@ __all__ = [
     "build_confluence",
     "build_confluence_snapshot",
     "build_filesystem",
+    "build_git_docs",
     "build_git_site",
     "build_gmail",
     "build_mbox",
@@ -244,6 +248,45 @@ def build_git_site(context: BuildContext) -> Connector:
     return GitSiteConnector(settings, name=_source_name(context, GIT_SITE_CONNECTOR_NAME))
 
 
+def build_git_docs(context: BuildContext) -> Connector:
+    """Construct the Git documents connector without importing it at discovery.
+
+    The token is read here, so a source naming a variable that is unset fails at startup naming
+    the setting and the variable, rather than as a ``401`` from the first fetch. A blank variable
+    counts as unset, because a deployment that mounts an empty secret has not provided one.
+    """
+    from manicule.connectors.git_docs import GitDocsConnector  # noqa: PLC0415
+
+    settings = context.config
+    if not isinstance(settings, GitDocsConfig):
+        msg = (
+            f"connector {GIT_DOCS_CONNECTOR_NAME!r} was built with {type(settings).__name__} "
+            f"where it declares GitDocsConfig."
+        )
+        raise ConfigError(msg)
+    token: str | None = None
+    if settings.token_env is not None:
+        token = os.environ.get(settings.token_env, "").strip() or None
+        if token is None:
+            where = (
+                f"[connectors.{context.instance}.options]"
+                if context.instance
+                else 'plugins.config."connector.git-docs"'
+            )
+            msg = (
+                f"the git-docs connector's token_env in {where} names ${settings.token_env}, "
+                f"which is not set or is empty. Put a token that can read the repository in it, "
+                f"or remove token_env for a public repository."
+            )
+            raise ConfigError(msg)
+    return GitDocsConnector(
+        settings,
+        name=_source_name(context, GIT_DOCS_CONNECTOR_NAME),
+        token=token,
+        mirror_root=context.cache_dir / "git-mirrors",
+    )
+
+
 def build_gmail(context: BuildContext) -> Connector:
     """Construct the Gmail connector from validated configuration.
 
@@ -401,8 +444,8 @@ class ConnectorsPlugin:
         name="connectors",
         version="0.1.0",
         core_version=">=0.1,<0.3",
-        summary="Sources manicule ingests from: files, Git sites, Confluence, Gmail, Outlook, "
-        "mbox and Trilium.",
+        summary="Sources manicule ingests from: files, Git sites, Git documents, Confluence, "
+        "Gmail, Outlook, mbox and Trilium.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -429,6 +472,13 @@ class ConnectorsPlugin:
             build_git_site,
             config_model=GitSiteConfig,
             summary="Pages from one pinned local Git commit, cited by their public site routes.",
+        )
+        registry.add(
+            keys.CONNECTOR.named(GIT_DOCS_CONNECTOR_NAME),
+            build_git_docs,
+            config_model=GitDocsConfig,
+            summary="The Markdown and text in a Git repository, mirrored over https or read from "
+            "a checkout, from one pinned commit, with BMAD output recognized.",
         )
         registry.add(
             keys.CONNECTOR.named(GMAIL_CONNECTOR_NAME),

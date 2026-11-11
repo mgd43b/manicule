@@ -21,6 +21,8 @@ __all__ = [
     "GitSourceError",
     "GitTreeEntry",
     "PinnedGitReader",
+    "hardened_git_environment",
+    "path_below",
 ]
 
 _OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -43,6 +45,21 @@ class GitObjectMissingError(BodyUnavailableError):
 
 class GitBlobTooLargeError(GitSourceError):
     """A blob exceeded the configured ceiling before its body was requested."""
+
+
+def path_below(path: str, root: str) -> str:
+    """``path`` relative to the content root ``root`` (``"."`` is the repository root).
+
+    Raises:
+        GitSourceError: ``path`` is not under ``root``, which means Git returned something other
+            than what was asked for.
+    """
+    if root == ".":
+        return path
+    prefix = f"{root}/"
+    if not path.startswith(prefix):
+        raise GitSourceError("Git returned a path outside the configured content root")
+    return path[len(prefix) :]
 
 
 class _OutputLimitError(RuntimeError):
@@ -125,8 +142,15 @@ class PinnedGitReader:
     def entries(self) -> tuple[GitTreeEntry, ...]:
         return self._entries
 
-    async def setup(self, *, content_root: str = ".") -> tuple[GitTreeEntry, ...]:
-        """Pin a commit and enumerate one complete tree prefix in raw Git order."""
+    async def resolve(self) -> str:
+        """Pin the revision to one commit, without listing its tree.
+
+        The cheap half of :meth:`setup`: one ``rev-parse``. A caller that stores the commit it last
+        synced asks this first and lists the tree only if the answer changed, so a periodic check of
+        a repository nobody has pushed to costs a process start rather than a tree walk. Idempotent.
+        """
+        if self._commit is not None:
+            return self._commit
         try:
             repository = self._repository_input.resolve(strict=True)
         except OSError as exc:
@@ -154,6 +178,11 @@ class PinnedGitReader:
             raise GitSourceError("Git returned an invalid commit object id") from exc
         self._validate_oid(commit)
         self._commit = commit
+        return commit
+
+    async def setup(self, *, content_root: str = ".") -> tuple[GitTreeEntry, ...]:
+        """Pin a commit and enumerate one complete tree prefix in raw Git order."""
+        commit = await self.resolve()
         root = normalize_repository_path(content_root, allow_root=True)
         arguments = ["ls-tree", "-r", "-z", "-l", "--full-tree", commit]
         if root != ".":
@@ -387,19 +416,30 @@ class PinnedGitReader:
 
     @staticmethod
     def _environment() -> dict[str, str]:
-        environment = {
-            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        return hardened_git_environment()
+
+
+def hardened_git_environment() -> dict[str, str]:
+    """The environment every Git process this package starts runs under.
+
+    Inherited ``GIT_*`` variables are dropped rather than trusted: ``GIT_DIR``, ``GIT_SSH_COMMAND``
+    or ``GIT_CONFIG_*`` in the server's environment would otherwise change which repository a
+    command reads or what it executes. System and global configuration are switched off for the
+    same reason, and nothing here may prompt, because a prompt in a service nobody is watching is
+    a hang. One function so the reader and the mirror (:mod:`manicule.connectors.git_mirror`),
+    which fetches from a network, cannot drift into two sets of rules.
+    """
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "LC_ALL": "C",
         }
-        environment.update(
-            {
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_OPTIONAL_LOCKS": "0",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "LC_ALL": "C",
-            }
-        )
-        return environment
+    )
+    return environment
 
 
 async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:

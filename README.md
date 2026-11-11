@@ -58,8 +58,10 @@ vectors are filtered during hydration and reclaimed by the normal sweep. The sam
 applies when parsing, middleware or chunking concludes that a document has no chunks.
 
 > [!IMPORTANT]
-> **Eight sources are built**: a local directory tree, Confluence (live, or from a directory of
-> mirrored pages), a pinned Git checkout of a site you own, a Google Workspace mailbox, a Microsoft
+> **Nine sources are built**: a local directory tree, Confluence (live, or from a directory of
+> mirrored pages), a pinned Git checkout of a site you own, the Markdown and text in any Git
+> repository, local or remote, with BMAD output recognized
+> ([`docs/connectors/git-docs.md`](docs/connectors/git-docs.md)), a Google Workspace mailbox, a Microsoft
 > 365 mailbox and calendar ([`docs/connectors/outlook.md`](docs/connectors/outlook.md); built against
 > a synthetic Graph and not yet run against a live tenant), and old
 > mail archives in unix mbox files ([`docs/connectors/mbox.md`](docs/connectors/mbox.md), which
@@ -662,6 +664,27 @@ even if `HEAD` moves before fetching finishes. Markdown, MDX and HTML routes are
 their paths by default; sites with custom permalinks can commit an authoritative route manifest.
 See [`docs/connectors/web-crawler.md`](docs/connectors/web-crawler.md) for the manifest format,
 include/exclude rules and the operational tradeoff of disabled source-byte retention.
+
+A repository whose *documents* are wanted and whose code is not — a handbook, a set of design docs,
+the output of a planning tool such as BMAD — needs no site and no checkout. `git-docs` reads only the
+Markdown and text in it, from one pinned commit, and for an `https` address keeps its own mirror
+current, so a push is searchable at the next sync:
+
+```toml
+[connectors.planning]
+type = "git-docs"
+schedule_s = 900               # a served manicule checks for changes every fifteen minutes
+reconcile_interval_s = 86400   # and for documents deleted upstream daily
+
+[connectors.planning.options]
+repository = "https://git.example.org/team/planning.git"   # or the path of a local checkout
+revision = "main"
+token_env = "PLANNING_GIT_TOKEN"   # the variable's name, for a private repository
+```
+
+BMAD's v6 and v7 output folders are recognized by their shape, so a citation says it is a PRD or an
+epic's retrospective; the folders an agent framework installs into a project (`_bmad/`, `.claude/`)
+are left out by default. See [`docs/connectors/git-docs.md`](docs/connectors/git-docs.md).
 
 A directory on disk is the simplest configured source, and it can be told what not to walk:
 

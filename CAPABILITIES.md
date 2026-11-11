@@ -535,6 +535,19 @@ is a feature list entry, not a feature.
   `message/rfc822` or `application/vnd.ms-outlook` document refuses an unauthenticated server
   too, whichever connector indexed it. Outlook PST has no reader: the documented recipe
   converts with `readpst` outside manicule. `docs/connectors/mbox.md`.
+- `connectors.<name>` with `type = "git-docs"` — the Markdown and text in a Git repository, and
+  nothing else: only paths `include` admits and `exclude` does not are listed or read, so a large
+  source tree costs one directory listing. An `https` repository is mirrored (bare, tip only) into the
+  cache directory and fetched before every sync, with `token_env` naming the variable that holds a
+  token, which travels only in the fetch's environment, scoped to the origin; a local path is read as
+  it stands. Everything is read from one pinned commit and identity is the path. The last indexed
+  commit is stored: a run that finds it unchanged lists and fetches nothing (a periodic check of a
+  quiet repository is one `rev-parse`), and a new commit lists the tree with the blob id as the
+  change token, so a commit that touched no document fetches nothing. A document over `max_bytes` or
+  with no usable suffix is skipped and counted. `layout = "auto"` recognizes BMAD's v6 and v7 output
+  folders and records what each document is (a PRD, a story, an epic's retrospective, with its
+  initiative and epic); it never changes what is admitted. Periodic change detection is the
+  scheduler's `schedule_s` and `reconcile_interval_s`. `docs/connectors/git-docs.md`.
 - `connectors.<name>` with `type = "trilium"` — a Trilium Notes server (the TriliumNext line),
   read-only over ETAPI with a token: one document per `text`, `code` or `mermaid` note, identified
   by its note id so a rename, move or clone leaves one document. ETAPI has no change feed, so every

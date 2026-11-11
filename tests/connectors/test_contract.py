@@ -164,6 +164,8 @@ def test_registering_the_connector_loads_no_http_client() -> None:
     assert not [name for name in loaded if name == "httpx" or name.startswith("httpx.")]
     assert "manicule.connectors.git_reader" not in loaded
     assert "manicule.connectors.git_site" not in loaded
+    assert "manicule.connectors.git_docs" not in loaded
+    assert "manicule.connectors.git_mirror" not in loaded
     assert "manicule.connectors.gmail_client" not in loaded
     assert "manicule.connectors.gmail" not in loaded
     assert "manicule.connectors.outlook_client" not in loaded
@@ -213,6 +215,7 @@ def test_the_plugin_registers_the_sources_this_build_ships() -> None:
         "confluence",
         "confluence-snapshot",
         "filesystem",
+        "git-docs",
         "git-site",
         "gmail",
         "mbox",

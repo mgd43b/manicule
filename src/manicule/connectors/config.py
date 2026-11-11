@@ -23,9 +23,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
-from typing import Self
+from typing import Final, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -33,6 +34,11 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from manicule.connectors import globs
 from manicule.connectors.cql import is_page_id
 from manicule.connectors.enriched import DEFAULT_PROFILE, EnrichedProfile
+from manicule.connectors.git_remote import (
+    is_remote,
+    normalize_remote_url,
+    require_fetchable_revision,
+)
 from manicule.connectors.pagination import origin_of
 from manicule.connectors.site_routes import normalize_base_url, normalize_repository_path
 from manicule.core.errors import ConfigError
@@ -41,6 +47,7 @@ __all__ = [
     "ALWAYS_EXCLUDED_LABELS",
     "CONNECTOR_NAME",
     "FILESYSTEM_CONNECTOR_NAME",
+    "GIT_DOCS_CONNECTOR_NAME",
     "GIT_SITE_CONNECTOR_NAME",
     "GMAIL_CONNECTOR_NAME",
     "MBOX_CONNECTOR_NAME",
@@ -56,6 +63,7 @@ __all__ = [
     "EnrichedProfile",
     "FilesystemConfig",
     "FullInventoryAuthority",
+    "GitDocsConfig",
     "GitSiteConfig",
     "GmailConfig",
     "MboxConfig",
@@ -108,6 +116,9 @@ reaches no network cannot be misconfigured into trying.
 
 GIT_SITE_CONNECTOR_NAME = "git-site"
 """The registered name of the commit-pinned local website connector."""
+
+GIT_DOCS_CONNECTOR_NAME = "git-docs"
+"""The registered name of the connector that indexes the documents in a Git repository."""
 
 GMAIL_CONNECTOR_NAME = "gmail"
 """The registered name of the Gmail connector."""
@@ -180,6 +191,211 @@ class GitSiteConfig(BaseModel):
                 "source_scope": source_scope,
                 "route_policy": "git-site-v1",
                 **self.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
+
+
+_GIT_DOCS_INCLUDE: Final = ("**/*.md", "**/*.markdown", "**/*.txt")
+_GIT_DOCS_EXCLUDE: Final = (
+    "**/node_modules/**",
+    "**/vendor/**",
+    "**/third_party/**",
+    "**/.venv/**",
+    # What an agent framework installs into a project. BMAD alone writes hundreds of Markdown
+    # files into these, and every one is a prompt for a tool rather than a document about the
+    # project, so admitting them would bury the project's own words.
+    "**/_bmad/**",
+    "**/.claude/**",
+    "**/.agents/**",
+    "**/.cursor/**",
+    "**/.codex/**",
+    "**/.gemini/**",
+)
+_ENV_NAME: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+GIT_DOCS_DEFAULT_MAX_BYTES: Final = 2 * 1024 * 1024
+"""A document longer than this is skipped, and counted, rather than indexed or fatal.
+
+Two mebibytes is far past any hand-written page and well short of the generated ``.txt`` dumps a
+repository sometimes carries. Skipped rather than refused for the whole sync, because one stray
+file in a large repository is not a reason for every document in it to go stale.
+"""
+
+
+class GitDocsConfig(BaseModel):
+    """The documents in one Git repository, and nothing else.
+
+    A repository is mostly code, and code is not what this reads: only paths admitted by
+    ``include`` and not refused by ``exclude`` are listed, fetched or parsed, so a large source
+    tree costs one directory listing. ``repository`` is either an ``https`` address, which
+    manicule mirrors and refreshes before every sync, or a path to a checkout that something else
+    keeps current.
+    """
+
+    # ``hide_input_in_errors``: pydantic otherwise prints the rejected value, and the value
+    # rejected for carrying a credential is the credential.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    repository: str = Field(
+        min_length=1,
+        max_length=4_096,
+        description="An https address (mirrored and fetched before each sync) or a path to a "
+        "local repository (read as it is). Credentials do not go here: see token_env.",
+    )
+    revision: str = Field(
+        default="HEAD",
+        min_length=1,
+        max_length=1_024,
+        description="The branch, tag or commit to index. Resolved to one commit at the start of "
+        "every sync, so a push is seen at the next one and a sync never reads half of two.",
+    )
+    content_root: str = Field(
+        default=".",
+        min_length=1,
+        max_length=4_096,
+        description="A folder inside the repository that bounds what is read. Documents are "
+        "still identified and cited by their path from the repository root.",
+    )
+    include: tuple[str, ...] = Field(
+        default=_GIT_DOCS_INCLUDE,
+        min_length=1,
+        max_length=256,
+        description="Path globs admitted, relative to content_root. A suffix with no known media "
+        "type (anything but md, markdown, mdx and txt) is skipped and counted.",
+    )
+    exclude: tuple[str, ...] = Field(
+        default=_GIT_DOCS_EXCLUDE,
+        max_length=256,
+        description="Path globs refused, winning over include. Setting it replaces the default "
+        "list rather than extending it, so a narrower list admits what the default refused.",
+    )
+    layout: Literal["auto", "bmad-v6", "bmad-v7", "none"] = Field(
+        default="auto",
+        description="Whether to read BMAD's output folders and cite documents as what they are "
+        "(a PRD, a story, an epic's retrospective). 'auto' recognizes either layout where it "
+        "finds one; it never changes what is indexed, only what is known about it.",
+    )
+    token_env: str | None = Field(
+        default=None,
+        description="The name of the environment variable holding a token that can read a "
+        "private https repository. The token is never written to configuration, to the "
+        "repository's own config or to a command line.",
+    )
+    username: str = Field(
+        default="x-access-token",
+        min_length=1,
+        max_length=255,
+        description="The user name sent with the token. GitHub accepts any; GitLab and Gitea "
+        "ignore it for a personal access token.",
+    )
+    blob_url: str | None = Field(
+        default=None,
+        max_length=4_096,
+        description="Where a reader opens a document in the forge, with {commit} and {path} "
+        "standing for the indexed commit and the repository path. Unset, an https repository "
+        "gets '<repository>/blob/{commit}/{path}', which GitHub and GitLab both serve; a local "
+        "path gets none, and cites by its path alone.",
+    )
+    max_bytes: int = Field(
+        default=GIT_DOCS_DEFAULT_MAX_BYTES,
+        ge=1,
+        description="Largest document read. A larger one is skipped and counted.",
+    )
+    fetch_timeout_s: float = Field(
+        default=300.0,
+        gt=0,
+        le=3_600,
+        description="Longest one fetch from the remote may take. Meaningless for a local path.",
+    )
+
+    @field_validator("repository", "revision")
+    @classmethod
+    def _one_argument(cls, value: str) -> str:
+        if value != value.strip() or "\0" in value or "\n" in value:
+            raise ValueError("repository and revision must each be one unpadded command argument")
+        return value
+
+    @field_validator("repository")
+    @classmethod
+    def _repository(cls, value: str) -> str:
+        return normalize_remote_url(value) if is_remote(value) else value
+
+    @field_validator("content_root")
+    @classmethod
+    def _content_root(cls, value: str) -> str:
+        return normalize_repository_path(value, allow_root=True)
+
+    @field_validator("include", "exclude")
+    @classmethod
+    def _patterns(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(globs.path_glob(value) for value in values))
+
+    @field_validator("token_env")
+    @classmethod
+    def _token_env(cls, value: str | None) -> str | None:
+        if value is not None and not _ENV_NAME.fullmatch(value):
+            raise ValueError(
+                "token_env names an environment variable, not a token: letters, digits and "
+                "underscores only. Put the token itself in that variable"
+            )
+        return value
+
+    @field_validator("username")
+    @classmethod
+    def _username(cls, value: str) -> str:
+        if ":" in value or not value.isprintable() or value != value.strip():
+            raise ValueError("username must be printable, unpadded and contain no ':'")
+        return value
+
+    @field_validator("blob_url")
+    @classmethod
+    def _blob_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if "{path}" not in value:
+            raise ValueError("blob_url must contain {path}, or every document would cite one page")
+        probe = value.replace("{commit}", "0").replace("{path}", "p")
+        if "{" in probe or "}" in probe:
+            raise ValueError("blob_url may use only {commit} and {path}")
+        try:
+            parsed = urlsplit(probe)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("blob_url must be a valid URL") from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("blob_url must be an absolute http(s) URL with a hostname")
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError("blob_url must carry no credentials and no fragment")
+        return value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        remote = is_remote(self.repository)
+        if remote:
+            require_fetchable_revision(self.revision)
+        elif self.token_env is not None:
+            raise ValueError(
+                "token_env applies only to an https repository; a local path is read with the "
+                "permissions of this process"
+            )
+        return self
+
+    def scope_fingerprint(self, source_scope: str) -> str:
+        """What a change to makes the documents this source holds a different set.
+
+        Everything that decides *which* documents or *what is said about them* is in; how the
+        remote is reached is out, because moving a token to another variable or raising a timeout
+        changes nothing about the corpus and must not look like a new source.
+        """
+        material = json.dumps(
+            {
+                "source_scope": source_scope,
+                "policy": "git-docs-v1",
+                **self.model_dump(
+                    mode="json", exclude={"token_env", "username", "fetch_timeout_s"}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
