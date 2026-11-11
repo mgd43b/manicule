@@ -7,6 +7,7 @@ from :mod:`manicule.testing` and run it against your components.
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ from manicule.core.content import RawDocument
 from manicule.core.errors import ConfigError
 from manicule.core.protocols import Connector, Middleware, Parser, RetrievalStage
 from manicule.core.retrieval import Filter, Query
-from manicule.core.sources import DocRef
+from manicule.core.sources import DocRef, Watermark
 from manicule.core.version import CORE_VERSION
 from manicule.plugins import ComponentRegistry, check_core_version, discover
 from manicule.testing import (
@@ -129,8 +130,10 @@ def connector(root: Path) -> DirectoryConnector:
     return DirectoryConnector("notes", DirectoryConnectorConfig(root=root))
 
 
-async def discovered_ids(source: DirectoryConnector, watermark: object = None) -> list[str]:
-    return [doc.ref.source_id async for doc in source.discover(watermark)]  # pyright: ignore[reportArgumentType]
+async def discovered_ids(
+    source: DirectoryConnector, watermark: Watermark | None = None
+) -> list[str]:
+    return [doc.ref.source_id async for doc in source.discover(watermark)]
 
 
 async def test_the_connector_passes_the_conformance_suite(notes: Path) -> None:
@@ -250,3 +253,52 @@ async def test_a_misspelled_option_is_a_startup_error_and_not_a_setting_that_doe
 
     with pytest.raises(ConfigError, match="sufix"):
         await Container(configured, registry).connector("handbook")
+
+
+async def test_a_watermark_from_another_scope_is_not_a_position_in_this_source(
+    notes: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Repointing a source must not skip what is older than where the last one got to.
+
+    Without the scope fingerprint, the second source's older files would sit below the first
+    one's position and never be enumerated, with nothing raised.
+    """
+    first = connector(notes)
+    await discovered_ids(first)
+    position = first.watermark
+    assert position is not None
+
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    old = elsewhere / "old.txt"
+    old.write_text("older than the last position\n", encoding="utf-8")
+    os.utime(old, ns=(1, 1))
+
+    assert await discovered_ids(connector(elsewhere), position) == ["old.txt"]
+    suffixed = DirectoryConnector("notes", DirectoryConnectorConfig(root=notes, suffix=".md"))
+    assert await discovered_ids(suffixed, position) == ["ignored.md"]
+
+
+async def test_a_watermark_that_is_not_ours_means_start_over(notes: Path) -> None:
+    foreign = Watermark(value="not-a-number", observed_at=datetime.now(UTC))
+    assert await discovered_ids(connector(notes), foreign) == ["a.txt", "b.txt", "sub/c.txt"]
+
+
+async def test_a_symlink_out_of_the_directory_is_not_a_document(
+    notes: Path, tmp_path: Path
+) -> None:
+    """Listed and unfetchable would fail one document on every sync, forever."""
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("elsewhere", encoding="utf-8")
+    (notes / "link.txt").symlink_to(outside)
+    source = connector(notes)
+
+    assert "link.txt" not in await discovered_ids(source)
+    assert "link.txt" not in [source_id async for source_id in source.reconcile()]
+    await assert_connector_contract(source)
+
+
+async def test_the_suffix_is_matched_literally_and_not_as_a_glob(notes: Path) -> None:
+    (notes / "odd[1].txt").write_text("x", encoding="utf-8")
+    bracketed = DirectoryConnector("notes", DirectoryConnectorConfig(root=notes, suffix="[1].txt"))
+
+    assert await discovered_ids(bracketed) == ["odd[1].txt"]

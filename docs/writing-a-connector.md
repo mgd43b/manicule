@@ -90,6 +90,18 @@ starts there and never sees them again, with no error. Set it after the loop, as
 `DirectoryConnector` does. If your source has no change signal, leave it `None` and re-enumerate
 fully; that is a legitimate connector, and it shows in `doctor` rather than being hidden.
 
+**Tie the watermark to the configuration that produced it.** If the base URL, a space filter
+or a root directory changes, the stored position says nothing about the new scope, and honoring
+it skips everything older than that position, permanently and without an error. Record a
+fingerprint of the scope-defining options in `Watermark.metadata` and treat a watermark whose
+fingerprint differs as `None`. `DirectoryConnector._position` is the short version; the mbox and
+Git-site connectors do the same with `scope_fingerprint`.
+
+**Know what your change signal cannot see.** A modification time or an "updated since" cursor
+misses anything that appears *behind* the position: a file copied in with its old timestamp, a
+page restored from backup. `reconcile` only finds deletions. If your source can do that, return
+`None` and enumerate fully, as `DirectoryConnector`'s docstring describes.
+
 **Overlap the position slightly.** The gap between "yielded" and "committed" is real and is not
 eliminated, only made survivable: start each sync a little before the stored position (the
 Confluence connector reaches five minutes back). Re-enumerating a few documents costs a
@@ -133,7 +145,7 @@ recorded.
 ```python
 from manicule.testing import assert_connector_contract
 
-async def test_it_honors_the_contract(tmp_path):
+async def test_it_honors_the_contract():
     await assert_connector_contract(AcmeConnector("handbook", fake_config))
 ```
 

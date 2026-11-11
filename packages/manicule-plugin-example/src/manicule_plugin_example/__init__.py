@@ -21,6 +21,7 @@ from manicule.container import keys
 from manicule.core.anchors import Anchor, LineAnchor, Unlocated
 from manicule.core.content import BlockKind, Chunk, Document, ParsedBlock, RawDocument
 from manicule.core.errors import ManiculeError, ParseError
+from manicule.core.ids import content_hash
 from manicule.core.lifecycle import HealthReport, Metric
 from manicule.core.protocols import Connector, Middleware, Parser, RetrievalStage
 from manicule.core.retrieval import Candidate, Query
@@ -29,6 +30,9 @@ from manicule.plugins import BuildContext, ComponentRegistry, Plugin, PluginMani
 
 MEDIA_TYPE = "application/x-manicule-example"
 """A made-up format: one block per line. Real parsers claim real IANA media types."""
+
+_SCOPE_KEY = "scope_fingerprint"
+"""Where a watermark records the configuration it was produced under."""
 
 CONNECTOR_NAME = "example-directory"
 """What ``type = ...`` selects in ``[connectors.<name>]``. One name per implementation."""
@@ -137,6 +141,16 @@ class DirectoryConnector:
       it simply stops appearing — so without this the index serves it forever.
     * **Nothing is fetched to find out whether it changed.** ``version_token`` is cheap to
       compute from the directory entry, and an unchanged document is never read.
+    * **A watermark belongs to the configuration that produced it.** It records a fingerprint of
+      the root and suffix, and a watermark from any other scope is ignored. Without that,
+      repointing the source at an older directory would skip everything older than the
+      position the previous directory reached, permanently and without an error.
+
+    **What a modification-time watermark cannot see.** A file that arrives with a modification
+    time *older* than the stored position — ``cp -p``, ``rsync -t``, a restore from backup, a
+    ``git checkout`` — is never enumerated incrementally. A source whose files arrive that way
+    should leave the watermark at ``None`` and enumerate fully: here that costs one ``stat`` per
+    file, because the version token is computed without reading anything.
     """
 
     def __init__(self, name: str, config: DirectoryConnectorConfig) -> None:
@@ -146,6 +160,8 @@ class DirectoryConnector:
         self.name = name
         self._root = config.root.expanduser().resolve()
         self._suffix = config.suffix
+        # A digest, so the path itself never lands in a stored watermark.
+        self._scope = content_hash(f"{self._root}\0{self._suffix}")
         self._watermark: Watermark | None = None
 
     @property
@@ -156,7 +172,7 @@ class DirectoryConnector:
         # Blocking file-system work goes to a thread so a large directory does not stall
         # everything else in the process.
         entries = await asyncio.to_thread(self._scan)
-        since = int(watermark.value) if watermark is not None else None
+        since = self._position(watermark)
 
         newest = 0
         for source_id, path, mtime_ns, size in entries:
@@ -179,7 +195,25 @@ class DirectoryConnector:
         # After the loop, deliberately. An enumeration abandoned part-way never gets here.
         # A source with nothing in it offers no position rather than an invented one.
         if entries:
-            self._watermark = Watermark(value=str(newest), observed_at=datetime.now(UTC))
+            self._watermark = Watermark(
+                value=str(newest),
+                observed_at=datetime.now(UTC),
+                metadata={_SCOPE_KEY: self._scope},
+            )
+
+    def _position(self, watermark: Watermark | None) -> int | None:
+        """Where to resume, or ``None`` to enumerate everything.
+
+        A watermark recorded under another root or suffix is not a position in *this* source,
+        and neither is one that does not parse. Both mean "start over", which costs a version
+        comparison per file and cannot lose a document.
+        """
+        if watermark is None or watermark.metadata.get(_SCOPE_KEY) != self._scope:
+            return None
+        try:
+            return int(watermark.value)
+        except ValueError:
+            return None
 
     async def fetch(self, ref: DocRef) -> RawDocument:
         path = (self._root / ref.source_id).resolve()
@@ -208,10 +242,21 @@ class DirectoryConnector:
         installation happens to keep it.
         """
         found: list[tuple[SourceId, Path, int, int]] = []
-        for path in sorted(self._root.rglob(f"*{self._suffix}")):
-            if not path.is_file():
+        # ``rglob("*")`` and a plain suffix test, rather than a glob built from the setting:
+        # the suffix is user input, and in a glob ``[`` and ``*`` would mean something.
+        for path in sorted(self._root.rglob("*")):
+            if not path.name.endswith(self._suffix):
                 continue
-            stat = path.stat()
+            try:
+                # Resolved, and checked, so what is listed is exactly what ``fetch`` will
+                # serve: a symlink out of the root is not a document of this source.
+                if not path.resolve().is_relative_to(self._root) or not path.is_file():
+                    continue
+                stat = path.stat()
+            except OSError:
+                # Removed between the listing and here. One file going away is not a reason
+                # to fail the whole enumeration.
+                continue
             found.append(
                 (path.relative_to(self._root).as_posix(), path, stat.st_mtime_ns, stat.st_size)
             )
