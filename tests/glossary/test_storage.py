@@ -447,7 +447,7 @@ async def test_a_definition_in_a_document_the_reader_may_not_read_expands_nothin
     group = await store.create_reader_group("editors")
     await store.grant_source("fixture", [group.id])
 
-    outside = system.query_filter(readers=frozenset())
+    outside = system.query_filter(readers=frozenset[str]())
     inside = system.query_filter(readers=frozenset({group_principal(group.id)}))
 
     assert await store.entries_for(["NOW"], outside) == []

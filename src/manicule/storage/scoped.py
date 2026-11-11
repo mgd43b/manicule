@@ -81,9 +81,10 @@ identify a caller — reader groups and who is in them among them. Who is in a g
 which reader set a caller holds, and the reader set is part of every query's filter and so of
 every cache key: a membership change reaches the cache through the key, not this counter. A
 *grant* is the other kind of write, because it changes what one reader set may read, so
-``source_reader_grants`` is not here and counts. Most of them are written *because* somebody searched, asked or signed in,
-which is exactly why a commit to one of them must not move the generation counter — the search
-that wrote it would invalidate its own cached ranking, and the next identical search would miss.
+``source_reader_grants`` is not here and counts. Most of them are written *because* somebody
+searched, asked or signed in, which is exactly why a commit to one of them must not move the
+generation counter — the search that wrote it would invalidate its own cached ranking, and the
+next identical search would miss.
 
 **An exemption list, not a list of tables that count.** A table missing from here — including
 one added next year — counts, and the cost is a cold cache. A list of tables that count would

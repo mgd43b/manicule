@@ -23,7 +23,9 @@ from manicule.core.readers import (
     group_principal,
     user_principal,
 )
-from manicule.core.retrieval import Filter
+from manicule.core.retrieval import Filter, Query
+from manicule.retrieval.router import UtilityKind
+from manicule.retrieval.utility import handlers_for
 from manicule.storage import models
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 from manicule.storage.readers import readable, readable_sql
@@ -365,3 +367,29 @@ async def test_a_collection_lists_only_the_members_the_reader_set_may_read(
     assert {document.id for document in granted} == {open_document.id, restricted.id}
     assert {document.id for document in everyone} == {open_document.id, restricted.id}
     assert all(document.access is not None for document in everyone)
+
+
+async def test_the_utility_routes_count_only_what_the_reader_set_may_read(
+    store: SqliteDocStore,
+) -> None:
+    """ "How many documents", answered with the workspace's total, says the rest exist."""
+    await _corpus(store)
+    member = await _restrict(store)
+    handlers = handlers_for(store)
+
+    def asked(readers: frozenset[str] | None) -> Query:
+        return Query(text="how many documents", filter=Filter(workspace_ids=SCOPE, readers=readers))
+
+    nobody = await handlers[UtilityKind.DOCUMENT_COUNT](asked(frozenset()))
+    granted = await handlers[UtilityKind.DOCUMENT_COUNT](asked(frozenset({member})))
+    everyone = await handlers[UtilityKind.DOCUMENT_COUNT](asked(None))
+    listed = await handlers[UtilityKind.DOCUMENT_LIST](asked(frozenset()))
+    status = await handlers[UtilityKind.INDEX_STATUS](asked(frozenset()))
+
+    assert (nobody.data["documents"], granted.data["documents"]) == (1, 2)
+    assert everyone.data["documents"] == 2
+    assert listed.data["documents"] == [
+        {"id": document.id, "title": document.title, "uri": document.uri}
+        for document in await store.list_documents(Filter(workspace_ids=SCOPE, readers=frozenset()))
+    ]
+    assert status.data["chunks"] == 1

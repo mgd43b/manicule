@@ -88,6 +88,12 @@ def viewer(user_id: str | None) -> Caller:
     return Caller(role=Role.VIEWER, user_id=user_id)
 
 
+def _ignores_the_reader_set(readers: frozenset[str]) -> tuple[str, dict[str, object]]:
+    """The lexical leg's reader predicate with its body deleted: it admits everything."""
+    del readers
+    return "1 = 1", {}
+
+
 @pytest.fixture
 async def opened(manicule_environment: Path) -> AsyncIterator[Runtime]:
     async with _runtime(manicule_environment) as running:
@@ -227,7 +233,7 @@ async def test_the_outbound_check_refuses_what_a_store_that_ignored_the_reader_s
     The re-check reads the gates the document came back carrying and nothing else, so it fires
     with the store's ``WHERE`` clause gone — and the refusal names no document.
     """
-    monkeypatch.setattr(docstore_module, "readable_sql", lambda readers: ("1 = 1", {}))
+    monkeypatch.setattr(docstore_module, "readable_sql", _ignores_the_reader_set)
 
     with acting_as(viewer(restricted.vic)), pytest.raises(UnreadableDocumentError) as refused:
         await service.search(QUESTION, limit=5)
