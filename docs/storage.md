@@ -276,14 +276,16 @@ reads.
 
 ## 4. The tables
 
-The authoritative SQLAlchemy model has **46 relational tables**. The 34 outside the durable
+The authoritative SQLAlchemy model has **49 relational tables**. The 37 outside the durable
 re-embedding snapshot set are `acquisition_records`, `acquisition_runs`, `api_keys`, `audit_logs`,
 `auth_sessions`, `blob_backlog_members`, `blob_backlog_totals`, `blobs`, `acquisition_markers`, `chunk_relations`, `chunks`,
 `collection_documents`, `collections`, `connectors`, `conversations`, `document_tags`,
 `document_versions`, `documents`, `glossary_aliases`, `glossary_entries`, `index_state`,
-`messages`, `plugins`, `query_logs`, `reconciliation_candidates`,
+`messages`, `plugins`, `query_logs`, `reader_group_members`, `reader_groups`,
+`reconciliation_candidates`,
 `reconciliation_inventory_items`, `reconciliation_runs`, `security_alerts`,
-`source_dependencies`, `tags`, `users`, `vector_tombstones`, `workspace_members` and
+`source_dependencies`, `source_reader_grants`, `tags`, `users`, `vector_tombstones`,
+`workspace_members` and
 `workspaces`. Seven more make a re-embedding run
 durable without changing live reads until publication: `corpus_revision`,
 `reembed_corpus_snapshots`, `reembed_snapshot_documents`, `reembed_snapshot_chunks`,
@@ -300,7 +302,7 @@ and which blobs it counts, which blob admission reads (§7).
 Three more carry team mode ([#13](https://github.com/mgd43b/manicule/issues/13)): `users`,
 `auth_sessions` and `security_alerts` (§4.8).
 `alembic_version` and the FTS5 virtual/shadow tables also exist and are managed, not modeled or
-included in the 46.
+included in the 49.
 
 ### 4.1 The pre-#187 additions
 
@@ -778,6 +780,34 @@ password revokes that person's `auth_sessions` rows in the same transaction.
 
 Every read and write of a membership or a session carries the workspace as a predicate; a person
 is read without one, because a person is the same person everywhere.
+
+#### Reader groups and source grants
+
+Three more tables, added by `e7a3c9d14b52` (after `d2f5b8e31a64`) and arriving empty, let an
+administrator restrict a source of a workspace to some of its readers
+([`deployment.md` §1.2](deployment.md#12-who-can-read-what-is-indexed)). Nothing is added to
+`documents`: a grant is evaluated when a query runs, through a correlated subquery on
+`documents.source`, so neither a column nor a rebuild of that table is needed, and a revocation
+takes effect on the next query rather than the next sync.
+
+| Table | What it is | Why it is shaped this way |
+|---|---|---|
+| `reader_groups` | A named set of people in one workspace: `id`, `workspace_id`, `name`, `UNIQUE (workspace_id, name)` | A reader set names a group by `id` (`group:<id>`), never by name, so a search spanning workspaces can hold several workspaces' groups in one set without two `editors` colliding |
+| `reader_group_members` | `(group_id, user_id)`, `WITHOUT ROWID`, cascading from both | Removing a member, a person or a group narrows what somebody reads — the safe direction for a cascade |
+| `source_reader_grants` | `(workspace_id, source, group_id)`, `WITHOUT ROWID` | **The group's foreign key has no `ON DELETE` action.** A cascade would delete a source's last grant with its group and open the source to everyone; the store refuses to delete a group still granted a source, and the constraint refuses a statement that tried. It is checked at the end of the statement, so deleting a workspace still takes its groups and grants together |
+
+A document's **reader gates** are read with it: `list_documents`, `get_document` and
+`collection_documents` attach them (`Document.access`), and a document produced by any other read
+carries `None`, which every restricted caller is refused — "not read" is never "unrestricted".
+`reader_groups` and `reader_group_members` are in `NON_CORPUS_TABLES`: who is in a group decides
+which reader set a caller holds, and the reader set is part of the cache key. A grant is not: it
+changes what one reader set may read, so writing one moves the generation counter
+([`retrieval.md`](retrieval.md) §10.3).
+
+The same revision adds a nullable `context_documents JSON` to `messages`, by a plain
+`ADD COLUMN`: the ids of every document whose passages an answer was built from, cited or not,
+written with the answer. A stored answer is shown to a restricted reader only when they may read
+all of them; `NULL`, on every row written before the revision, is never shown to one.
 
 ---
 
@@ -2280,9 +2310,10 @@ it should ship with the design rather than be discovered by whoever finds the di
 Recovering the source documents from it would have been lossy and partial.
 
 **With retention it holds the corpus itself.** Every PDF, every attachment, every page body,
-byte-identical to what the connector fetched. And because the index is not permission-aware —
-content is fetched as the sync user, per `docs/connectors/confluence.md` §9 — the directory
-accumulates everything that user can see, now in original form. Two consequences follow, and
+byte-identical to what the connector fetched. And because the source's own restrictions do not
+travel with it — content is fetched as the sync user, per `docs/connectors/confluence.md` §9 —
+the directory accumulates everything that user can see, now in original form. Reader groups
+(§4.8) restrict what a search returns; they do not change what is on disk. Two consequences follow, and
 both are storage's to handle:
 
 **Permissions are part of the layout.** `<data_dir>` and everything under it is created

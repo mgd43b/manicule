@@ -15,9 +15,10 @@ from typing import TYPE_CHECKING, Any, override
 
 import pytest
 
+from manicule.app.caller import Caller, acting_as
 from manicule.app.runtime import Runtime
 from manicule.app.service import ApplicationService
-from manicule.config.settings import Settings
+from manicule.config.settings import Role, Settings
 from manicule.container import keys
 from manicule.core.errors import (
     FingerprintMismatchError,
@@ -26,6 +27,8 @@ from manicule.core.errors import (
 )
 from manicule.core.ids import document_id
 from manicule.plugins.registry import discover
+from manicule.storage import models
+from manicule.storage.docstore import SqliteDocStore
 from tests.fakes import HashEmbedder
 
 if TYPE_CHECKING:
@@ -302,3 +305,37 @@ async def test_a_workspace_reset_after_it_was_opened_is_reopened_rather_than_sea
         after = await service.search("orchard", workspaces=["alpha", "beta"], limit=1)
 
     assert _titles(after) == [("beta-new", "beta")]
+
+
+async def test_each_workspace_applies_its_own_grants_to_a_spanning_search(corpus: Path) -> None:
+    """An administrator's reach across workspaces is still their reader set in each.
+
+    Beta's source is granted to a group of beta's. Ada administers both workspaces and is in no
+    group, so beta answers her with nothing until beta puts her in the group — while alpha,
+    which granted nothing, answers in full throughout.
+    """
+    async with _runtime(corpus, "beta") as beta:
+        service = ApplicationService(beta)
+        ada = (await service.user_create("ada", role="admin")).user.id
+        await service.reader_group_create("beta-readers")
+        await service.source_grant(SOURCE, ["beta-readers"])
+    async with _runtime(corpus, "alpha") as opened:
+        # A person is installation-wide; this admits the same one to alpha as well.
+        store = await opened.documents()
+        assert isinstance(store, SqliteDocStore)
+        async with store.sessions.begin() as session:
+            session.add(models.WorkspaceMember(workspace_id="alpha", user_id=ada, role="admin"))
+        with acting_as(Caller(role=Role.ADMIN, user_id=ada)):
+            outside = await ApplicationService(opened).search(
+                "orchard", workspaces=["alpha", "beta"], limit=5
+            )
+    async with _runtime(corpus, "beta") as beta:
+        await ApplicationService(beta).reader_group_add("beta-readers", ["ada"])
+    async with _runtime(corpus, "alpha") as opened:
+        with acting_as(Caller(role=Role.ADMIN, user_id=ada)):
+            inside = await ApplicationService(opened).search(
+                "orchard", workspaces=["alpha", "beta"], limit=5
+            )
+
+    assert {hit.workspace for hit in outside.hits} == {"alpha"}
+    assert {hit.workspace for hit in inside.hits} == {"alpha", "beta"}

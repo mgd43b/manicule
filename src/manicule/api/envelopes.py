@@ -75,6 +75,9 @@ STATUS_BY_ERROR: dict[str, int] = {
     # produced it: a store returned another tenant's row and the surface refused it. That is a
     # defect in this installation, and reporting it as 4xx would file it against the caller.
     "CrossWorkspaceError": SERVER_ERROR,
+    # The same reasoning for a reader refusal on the way out: the store was asked to exclude the
+    # document, so finding one here is this installation's defect rather than the caller's.
+    "UnreadableDocumentError": SERVER_ERROR,
     "OSError": SERVER_ERROR,
 }
 """Which status each failure gets, keyed by the exception class name the envelope carries.

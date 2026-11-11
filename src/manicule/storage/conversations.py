@@ -140,9 +140,12 @@ class SqliteConversationStore:
         return conversation_id
 
     async def list_conversations(
-        self, *, limit: int = 50, offset: int = 0
+        self, *, limit: int = 50, offset: int = 0, owner: str | None = None
     ) -> Sequence[ConversationRecord]:
         """This workspace's live conversations, most recently touched first.
+
+        ``owner`` narrows the page to the conversations one person started, in the statement
+        rather than afterwards, so that a page is still a page.
 
         The turn count comes from a correlated subquery rather than from a second pass, so a
         page of twenty conversations is one statement. Soft-deleted ones are absent for the
@@ -162,6 +165,7 @@ class SqliteConversationStore:
                     .where(
                         models.Conversation.workspace_id == self._workspace_id,
                         models.Conversation.deleted_at.is_(None),
+                        *(() if owner is None else (models.Conversation.user_id == owner,)),
                     )
                     .order_by(models.Conversation.updated_at.desc(), models.Conversation.id)
                     .limit(max(limit, 0))
@@ -275,6 +279,11 @@ class SqliteConversationStore:
                     response_time_ms=message.response_time_ms,
                     finish_reason=(message.finish_reason.value if message.finish_reason else None),
                     query_log_id=message.query_log_id,
+                    context_documents=(
+                        None
+                        if message.context_documents is None
+                        else list(message.context_documents)
+                    ),
                 )
             )
         return message_id
@@ -318,6 +327,7 @@ class SqliteConversationStore:
         feedback: Feedback,
         reason: FeedbackReason | None = None,
         comment: str = "",
+        owner: str | None = None,
     ) -> bool:
         """Rate an answer. **Returns whether a row actually matched.**
 
@@ -335,6 +345,7 @@ class SqliteConversationStore:
                         select(models.Conversation.id).where(
                             models.Conversation.workspace_id == self._workspace_id,
                             models.Conversation.deleted_at.is_(None),
+                            *(() if owner is None else (models.Conversation.user_id == owner,)),
                         )
                     ),
                 )
@@ -508,6 +519,7 @@ def _to_record(row: models.Conversation, messages: int) -> ConversationRecord:
         created_at=row.created_at,
         updated_at=row.updated_at,
         messages=messages,
+        user_id=row.user_id,
     )
 
 
@@ -527,7 +539,26 @@ def _to_shared_turn(row: models.Message) -> SharedTurn:
 
 def _to_turn(row: models.Message) -> Turn:
     role = "assistant" if row.role == "assistant" else "user"
-    return Turn(role=role, content=row.content, citations=_citations(row.sources))
+    return Turn(
+        role=role,
+        content=row.content,
+        citations=_citations(row.sources),
+        context_documents=_context_documents(row.context_documents),
+    )
+
+
+def _context_documents(stored: object) -> tuple[str, ...] | None:
+    """The recorded provenance, or ``None`` when there is none to trust.
+
+    A value of any other shape is treated as unrecorded rather than as empty: empty means "built
+    from nothing", which is a claim, and a malformed column does not make it.
+    """
+    if not isinstance(stored, list):
+        return None
+    items = cast("list[object]", stored)
+    if not all(isinstance(item, str) for item in items):
+        return None
+    return tuple(str(item) for item in items)
 
 
 def _citations(stored: object) -> tuple[Citation, ...]:

@@ -1349,8 +1349,12 @@ Concretely, and in the terms someone deciding this needs:
 
 - **Confluence's space and page restrictions do not travel with the content.** A page
   restricted to three people, indexed by an account that is one of them, is retrievable by
-  every member of the workspace it was indexed into — text, attachments and the answers
-  generated from them. Roles in team mode decide what a member may do, not what they may read.
+  every reader of the source it was indexed into — text, attachments and the answers generated
+  from them. Roles in team mode decide what a member may do, not what they may read. What an
+  administrator *can* do is grant the whole source to reader groups
+  ([`deployment.md` §1.2](../deployment.md#12-who-can-read-what-is-indexed)), which restricts
+  every page of it to their members; a restriction finer than a source is not read from
+  Confluence.
 - **The sync account is the blast radius.** Point the connector at an account with access to
   exactly what the index is meant to hold; an admin token indexes everything an admin can see.
   A 403 during a sync is therefore not necessarily a fault — it is the boundary working — and

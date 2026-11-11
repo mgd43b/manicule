@@ -69,15 +69,22 @@ NON_CORPUS_TABLES: frozenset[str] = frozenset(
         models.WorkspaceMember.__tablename__,
         models.AuthSession.__tablename__,
         models.ApiKey.__tablename__,
+        models.ReaderGroup.__tablename__,
+        models.ReaderGroupMember.__tablename__,
     }
 )
 """Tables no query reads, whose writes therefore cannot change what a query returns.
 
 A record of who asked what, and of who is allowed to ask: the query log, the audit trail and
 its alerts, conversations and their turns, and the people, memberships, sessions and keys that
-identify a caller. Most of them are written *because* somebody searched, asked or signed in,
-which is exactly why a commit to one of them must not move the generation counter — the search
-that wrote it would invalidate its own cached ranking, and the next identical search would miss.
+identify a caller — reader groups and who is in them among them. Who is in a group decides
+which reader set a caller holds, and the reader set is part of every query's filter and so of
+every cache key: a membership change reaches the cache through the key, not this counter. A
+*grant* is the other kind of write, because it changes what one reader set may read, so
+``source_reader_grants`` is not here and counts. Most of them are written *because* somebody
+searched, asked or signed in, which is exactly why a commit to one of them must not move the
+generation counter — the search that wrote it would invalidate its own cached ranking, and the
+next identical search would miss.
 
 **An exemption list, not a list of tables that count.** A table missing from here — including
 one added next year — counts, and the cost is a cold cache. A list of tables that count would

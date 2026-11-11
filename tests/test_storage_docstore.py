@@ -11,6 +11,7 @@ from sqlalchemy import event, func, select, update
 from manicule.core.acquisition import AcquisitionFence
 from manicule.core.content import BlockKind, DocumentStatus, PipelineStage
 from manicule.core.protocols import DocStore
+from manicule.core.readers import UNRESTRICTED
 from manicule.core.retrieval import Filter
 from manicule.core.sources import Watermark
 from manicule.storage import models
@@ -57,13 +58,18 @@ async def test_a_document_round_trips_through_storage_unchanged(store: SqliteDoc
     a value nothing supplied against one storage invented. The honest claim is two claims — every
     other field survives the trip, and this one comes back filled in — and splitting them is what
     lets the second one fail on its own if the stamp ever stops happening.
+
+    ``access`` is the other field storage supplies rather than round-trips: the reader gates are
+    read with the document, from the grants on its source, and a document with none comes back
+    carrying an empty set of gates rather than the ``None`` that means "not read".
     """
     document = make_document()
     assert document.indexed_at is None, "the fixture must not pre-supply the stamped field"
     await store.upsert_document(document)
     loaded = await store.get_document(document.id)
     assert loaded is not None
-    assert loaded.model_copy(update={"indexed_at": None}) == document
+    assert loaded.model_copy(update={"indexed_at": None, "access": None}) == document
+    assert loaded.access == UNRESTRICTED
     assert loaded.indexed_at is not None, (
         "storage stamps indexed_at for an indexed document, and a citation reports it as the one "
         "of a mirrored document's three timestamps that describes this installation"

@@ -51,6 +51,7 @@ from manicule.storage.fts import SEARCH_SQL, escape_match_query
 from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
 from manicule.storage.organization import CollectionsMixin, TagsMixin
+from manicule.storage.readers import ReadersMixin, access_for, readable, readable_sql
 from manicule.storage.reconciliation import ReconciliationJournalMixin
 from manicule.storage.relations import RelationsMixin
 from manicule.storage.rows import apply_document, chunk_values, to_chunk, to_document
@@ -140,6 +141,7 @@ LISTABLE_FILTER_FIELDS: Final = frozenset(
         "media_types",
         "updated_after",
         "updated_before",
+        "readers",
     }
 )
 """:class:`~manicule.core.retrieval.Filter` fields :meth:`SqliteDocStore.list_documents` honors.
@@ -171,6 +173,7 @@ class SqliteDocStore(
     TrashMixin,
     RelationsMixin,
     GlossaryMixin,
+    ReadersMixin,
     WorkspaceScoped,
 ):
     """Every relational protocol manicule has, over SQLite.
@@ -190,9 +193,17 @@ class SqliteDocStore(
     # --- documents ------------------------------------------------------------------------
 
     async def get_document(self, document_id: str) -> Document | None:
+        """One live document of this workspace, carrying its reader gates.
+
+        Takes no reader set, as it takes no workspace: the gates come back on the document, and
+        the caller that knows who is asking checks them (:func:`~manicule.core.readers.admits`).
+        """
         async with self._sessions() as session:
             row = await self._live_document(session, document_id)
-            return None if row is None else to_document(row)
+            if row is None:
+                return None
+            access = await access_for(session, self._workspace_id, [row])
+            return to_document(row, access=access[row.id])
 
     async def find_document(self, source: str, source_id: SourceId) -> Document | None:
         """Look a document up by where it came from.
@@ -939,9 +950,14 @@ class SqliteDocStore(
                 statement = statement.where(models.Document.updated_at > filter.updated_after)
             if filter.updated_before is not None:
                 statement = statement.where(models.Document.updated_at < filter.updated_before)
+            if filter.readers is not None:
+                statement = statement.where(readable(filter.readers))
         async with self._sessions() as session:
             rows = (await session.execute(statement)).scalars().all()
-            return [to_document(row) for row in rows]
+            # Every listed document carries the gates it was admitted under, so the surface
+            # can re-check readability on the row in hand rather than trusting the clause above.
+            access = await access_for(session, self._workspace_id, rows)
+            return [to_document(row, access=access[row.id]) for row in rows]
 
     async def delete_document(self, document_id: str) -> None:
         """Hard-delete a document and everything hanging off it. Idempotent.
@@ -1631,6 +1647,10 @@ class SqliteDocStore(
                 clauses.append(f"AND d.updated_at {comparison} :{name}")
                 params[name] = moment
                 timestamps.append(name)
+            if filter.readers is not None:
+                fragment, bound = readable_sql(filter.readers)
+                clauses.append(f"AND {fragment}")
+                params.update(bound)
 
         statement = sql(SEARCH_SQL.format(extra="\n  ".join(clauses)))
         if timestamps:

@@ -15,6 +15,7 @@ import pytest
 from manicule.core.content import DocumentStatus
 from manicule.core.glossary import DefinitionForm, GlossaryEntry
 from manicule.core.ids import glossary_entry_id
+from manicule.core.readers import group_principal
 from manicule.ingest.glossary_lineage import glossary_fingerprint
 from manicule.retrieval.expansion import ExpansionPolicy, resolve_expansion
 from manicule.retrieval.ports import GlossarySource
@@ -429,6 +430,32 @@ async def test_an_expansion_built_on_a_leaky_source_still_carries_its_provenance
 
     assert result.fired
     assert result.matches[0].entry.document_id == "foreign-document"
+
+
+# --- readers ------------------------------------------------------------------------------------
+
+
+async def test_a_definition_in_a_document_the_reader_may_not_read_expands_nothing(
+    store: SqliteDocStore,
+) -> None:
+    """A definition is text from its document, and so is the term it fires on.
+
+    The glossary's source is granted to a group. A reader holding no group must find nothing
+    and expand nothing; a member of the group finds the entry exactly as before.
+    """
+    document_id = await a_glossary(store, "glossary", f"NOW — {EXPANSION}")
+    group = await store.create_reader_group("editors")
+    await store.grant_source("fixture", [group.id])
+
+    outside = system.query_filter(readers=frozenset[str]())
+    inside = system.query_filter(readers=frozenset({group_principal(group.id)}))
+
+    assert await store.entries_for(["NOW"], outside) == []
+    assert not (await _expand("What is NOW?", store, outside)).fired
+    assert [entry.document_id for entry in await store.entries_for(["NOW"], inside)] == [
+        document_id
+    ]
+    assert (await _expand("What is NOW?", store, inside)).fired
 
 
 # --- helpers ------------------------------------------------------------------------------------
