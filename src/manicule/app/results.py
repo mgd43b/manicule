@@ -2699,6 +2699,15 @@ class Stats(Payload):
     by_source: dict[str, int] = Field(default_factory=dict)
     by_media_type: dict[str, int] = Field(default_factory=dict)
     by_status: dict[str, int] = Field(default_factory=dict)
+    vectors_from_other_workspaces: int | None = Field(default=None, ge=0)
+    """Vectors this workspace copied from another workspace's store instead of embedding them.
+
+    **The operator's number, and nobody else's** (``docs/storage.md`` §6.2.1). Filled only for
+    the operator at this machine, who holds every workspace already; ``None`` for every caller
+    reached over the network, administrators included, because a count that rose when another
+    tenant already held a text would tell a workspace-scoped caller that it did. ``0`` and
+    ``None`` are different answers: none borrowed, and not this caller's to know.
+    """
 
 
 class Check(Payload):

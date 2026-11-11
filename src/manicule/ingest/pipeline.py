@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     from manicule.core.sources import DocRef, Watermark
     from manicule.ingest.middleware import MiddlewareRunner
     from manicule.ingest.ports import IngestStore
+    from manicule.ingest.shared_vectors import SharedVectors
     from manicule.ingest.workers import ParseRunner
     from manicule.parsers.expansion import MemberOutcome
 
@@ -1093,7 +1094,7 @@ def _declared_knowledge(raw: RawDocument) -> Knowledge | None:
 class IngestPipeline:
     """Runs one connector's documents through every stage, and never lets one stop the rest."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915 - one assignment per injected collaborator, kept flat to read
         self,
         *,
         store: IngestStore,
@@ -1126,6 +1127,7 @@ class IngestPipeline:
         mutation_guard: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
         expected_reset_epoch: int | None = None,
         sensitive_sources: AbstractSet[str] = frozenset(),
+        shared_vectors: SharedVectors | None = None,
     ) -> None:
         derived = (chunker, embedder, vectors, runner, resolve_chain, middleware, chunk_fingerprint)
         if any(component is None for component in derived) and not all(
@@ -1143,6 +1145,10 @@ class IngestPipeline:
             require_measured(chunk_fingerprint)
         self._store = store
         self._sensitive_sources, self._marked_sensitive = frozenset(sensitive_sources), set[str]()
+        # Other workspaces' stored vectors, consulted for what this one's store cannot supply
+        # (`docs/storage.md` §6.2.1). Always on where the runtime provides it; `None` is a
+        # pipeline built without a view of any other workspace, which is every unit test.
+        self._shared_vectors = shared_vectors
         # Explicit protocol injection keeps the legacy bounded path available to protocol-only
         # stores and unit tests. Production wires the SQLite acquisition store here, making the
         # blob-backed snapshot path the normal connector topology rather than structural guesswork.
@@ -4243,6 +4249,11 @@ class IngestPipeline:
                     lock=self._embedding,
                     reuse=reuse_vectors,
                     timings=self._timings,
+                    lender=(
+                        None
+                        if self._shared_vectors is None
+                        else self._shared_vectors.for_document(document.source, document.source_id)
+                    ),
                 )
         except (_SupersededError, StorageBusyError):
             # A refused writer slot is the run's to stop on, not this document's to fail:

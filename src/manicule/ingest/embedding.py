@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Protocol
 
 from manicule.chunking.tokens import SupportsTokenCount
 from manicule.core.embedding import VectorState, require_within_context
@@ -96,6 +96,32 @@ async def embed_chunks(
     Raises:
         ContextOverflowError: Any chunk exceeds what the model will read.
     """
+    measured = _measured(embedder, chunks, chunk_fingerprint)
+    if not chunks:
+        return []
+    return await embed_checked_chunks(
+        embedder,
+        measured,
+        target_batch_tokens=target_batch_tokens,
+        maximum=maximum,
+        batch_budget_tokens=_batch_budget(embedder, chunk_fingerprint),
+        on_batch=on_batch,
+    )
+
+
+def _measured(
+    embedder: Embedder, chunks: Sequence[Chunk], chunk_fingerprint: ChunkFingerprint | None
+) -> Sequence[Chunk]:
+    """Refuse any of ``chunks`` the model would truncate, measured as exactly as it can be.
+
+    The whole of :func:`embed_chunks`'s policy, apart so that :func:`embed_or_reuse` can hold a
+    vector copied from another workspace to exactly the check the model call would have made.
+    An embedder that counts its own tokens is asked, and the chunks come back carrying that
+    count; one that cannot is held to the count the chunker recorded.
+
+    Raises:
+        ContextOverflowError: Any chunk exceeds what the model will read.
+    """
     measured = chunks
     if isinstance(embedder, SupportsTokenCount):
         require_within_context(chunks, embedder.fingerprint)
@@ -104,21 +130,15 @@ async def embed_chunks(
             for chunk in chunks
         ]
     require_within_context(measured, embedder.fingerprint, chunk_fingerprint)
-    if not chunks:
-        return []
+    return measured
 
-    budget = (
+
+def _batch_budget(embedder: Embedder, chunk_fingerprint: ChunkFingerprint | None) -> int:
+    """The per-chunk token budget a batch size is derived from, as :func:`embed_chunks` uses it."""
+    return (
         chunk_fingerprint.max_tokens
         if chunk_fingerprint
         else embedder.fingerprint.max_sequence_length
-    )
-    return await embed_checked_chunks(
-        embedder,
-        measured,
-        target_batch_tokens=target_batch_tokens,
-        maximum=maximum,
-        batch_budget_tokens=budget,
-        on_batch=on_batch,
     )
 
 
@@ -210,6 +230,25 @@ async def embed_checked_chunks(
     return [vector for vector in vectors if vector is not None]
 
 
+class VectorLender(Protocol):
+    """Vectors another workspace already holds, offered in place of a model call.
+
+    The cross-workspace half of :func:`embed_or_reuse` (``docs/storage.md`` §6.2.1), as the one
+    question that function needs answered. :class:`manicule.ingest.shared_vectors.SharedVectors`
+    is the implementation; a protocol here so that this module, which every embedding route
+    imports, does not import the workspace machinery the answer needs.
+    """
+
+    async def lend(self, chunks: Sequence[Chunk]) -> Mapping[str, Vector]:
+        """A readable stored vector for each of ``chunks`` some other workspace holds, by chunk id.
+
+        Every vector returned must satisfy the same three-part reuse condition this workspace's
+        own store applies — same fingerprint, same embedding input, a readable stored vector —
+        and must be the stored vector exactly. A chunk with no such vector is simply absent.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class EmbeddingWork:
     """What one call to :func:`embed_or_reuse` cost, in the terms that are not each other.
@@ -242,7 +281,14 @@ class EmbeddingWork:
     """Vectors taken from the store without a model call, because the embedding input matched."""
 
     embedded: int = 0
-    """Chunks handed to the embedder. The honest count of embedding work done."""
+    """Chunks this workspace held no reusable vector for: the embedding work this document cost.
+
+    Includes any chunk whose vector was copied from another workspace that already held the same
+    embedding input (``docs/storage.md`` §6.2.1). That copy is invisible here on purpose: this
+    record reaches callers scoped to one workspace, and a count that fell when another tenant
+    already held a text would tell them so. The operator's count of copied vectors is kept
+    apart, by the lender.
+    """
 
     input_changed: int = 0
     """Of ``embedded``, those the index held an embedding input for and no longer matches.
@@ -296,7 +342,14 @@ class EmbeddingWork:
     """
 
     forward_calls: int = 0
-    """Batches the embedder was actually asked for. Counted at the call, not derived from it."""
+    """Batches ``embedded`` occupies. Counted at the call, unless another workspace lent vectors.
+
+    When nothing was borrowed this is the number of times the embedder was asked, counted as it
+    was asked rather than derived. When :func:`embed_or_reuse` copied any vector from another
+    workspace it is instead the number of batches the same chunks would have taken, so that it
+    reads the same whether or not another tenant held the text; how many passes the copy
+    actually saved is counted only where an operator reads it.
+    """
 
     cache_hits: int = 0
     """Chunks the embedder served from its in-memory cache instead of the model.
@@ -358,6 +411,7 @@ async def embed_or_reuse(
     lock: AbstractAsyncContextManager[object] | None = None,
     reuse: bool = True,
     timings: StageTimings | None = None,
+    lender: VectorLender | None = None,
 ) -> tuple[list[Vector], EmbeddingWork]:
     """Embed only the chunks whose embedding input the index does not already hold a vector for.
 
@@ -406,6 +460,14 @@ async def embed_or_reuse(
             chunks were reusable and which rows the new vectors replace.
 
         timings: Where to record the time the vector store's lookup took, as ``stored_vectors``.
+        lender: Where to look, after this workspace's own store, for a vector another workspace
+            of this installation already holds for exactly the same embedding input
+            (``docs/storage.md`` §6.2.1). Asked only about chunks this store could not supply,
+            only when ``reuse`` is true, and only after the oversize refusal has run over them.
+            What it lends is placed exactly as a model output would be and **reported exactly
+            as one**: the chunks count as ``embedded`` under the same classification, and
+            ``forward_calls`` is the number of batches they would have taken. The difference is
+            visible only to an operator, through the lender's own count.
 
     Returns:
         One vector per chunk, in the order the chunks were given, and what it cost.
@@ -417,42 +479,56 @@ async def embed_or_reuse(
     if not chunks:
         return [], EmbeddingWork()
 
+    # One visit to the stage for both lookups, the store's own and the other workspaces', so
+    # that how many times the stage ran says nothing about whether a second lookup happened.
     with timings.timing(Stage.STORED_VECTORS) if timings is not None else nullcontext():
         verdicts = await vectors.stored_vectors(chunks)
-    held = previous or {}
+        held = previous or {}
 
-    reused: dict[int, Vector] = {}
-    pending: list[Chunk] = []
-    positions: list[int] = []
-    counts = dict.fromkeys(VectorState, 0)
-    backfilled = 0
-    repaired = 0
-    first_seen = 0
-    refreshed = 0
-    # Whether the caller looked and found the index holding nothing for these chunks at all.
-    # **Not "this chunk id is new"**, which is a different and wrong test: a chunk id is derived
-    # from its text, so a chunk whose text moved arrives with an id the index has never seen and
-    # would be counted as growth when it is exactly the change being measured.
-    nothing_held = previous is not None and not previous
+        reused: dict[int, Vector] = {}
+        pending: list[Chunk] = []
+        positions: list[int] = []
+        counts = dict.fromkeys(VectorState, 0)
+        backfilled = 0
+        repaired = 0
+        first_seen = 0
+        refreshed = 0
+        # Whether the caller looked and found the index holding nothing for these chunks at
+        # all. **Not "this chunk id is new"**, which is a different and wrong test: a chunk id
+        # is derived from its text, so a chunk whose text moved arrives with an id the index
+        # has never seen and would be counted as growth when it is exactly the change being
+        # measured.
+        nothing_held = previous is not None and not previous
 
-    for position, chunk in enumerate(chunks):
-        verdict = verdicts[chunk.id]
-        counts[verdict.state] += 1
-        if verdict.is_reusable and reuse:
-            reused[position] = verdict.vector
-            backfilled += 0 if verdict.identity_recorded else 1
-            continue
-        if verdict.is_reusable:
-            refreshed += 1
-        elif verdict.state is VectorState.CORRUPT or (
-            verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
-        ):
-            repaired += 1
-        elif nothing_held:
-            first_seen += 1
-        pending.append(chunk)
-        positions.append(position)
+        for position, chunk in enumerate(chunks):
+            verdict = verdicts[chunk.id]
+            counts[verdict.state] += 1
+            if verdict.is_reusable and reuse:
+                reused[position] = verdict.vector
+                backfilled += 0 if verdict.identity_recorded else 1
+                continue
+            if verdict.is_reusable:
+                refreshed += 1
+            elif verdict.state is VectorState.CORRUPT or (
+                verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
+            ):
+                repaired += 1
+            elif nothing_held:
+                first_seen += 1
+            pending.append(chunk)
+            positions.append(position)
 
+        # Held to the check the model call would make, before anything is borrowed: a chunk the
+        # model would refuse is refused whether or not another workspace holds a vector for it,
+        # so a borrowed vector can never be the reason a document indexed that otherwise would
+        # not have.
+        measured = _measured(embedder, pending, chunk_fingerprint)
+        borrowed = await _borrow(lender, pending) if reuse and lender is not None else {}
+
+    model_positions = [
+        position for index, position in enumerate(positions) if index not in borrowed
+    ]
+    to_embed = [chunk for index, chunk in enumerate(measured) if index not in borrowed]
     forward_calls = 0
 
     def count_batch(batch: Sequence[Chunk]) -> None:
@@ -461,21 +537,37 @@ async def embed_or_reuse(
         forward_calls += 1
 
     before_hits = _cache_hits(embedder)
+    budget = _batch_budget(embedder, chunk_fingerprint)
     async with lock if lock is not None else nullcontext():
-        produced = await embed_chunks(
+        produced = await embed_checked_chunks(
             embedder,
-            pending,
-            chunk_fingerprint=chunk_fingerprint,
+            to_embed,
             target_batch_tokens=target_batch_tokens,
             maximum=maximum,
+            batch_budget_tokens=budget,
             on_batch=count_batch,
         )
 
     ordered: list[Vector] = [()] * len(chunks)
     for position, vector in reused.items():
         ordered[position] = vector
-    for position, vector in zip(positions, produced, strict=True):
+    for index, vector in borrowed.items():
+        ordered[positions[index]] = vector
+    for position, vector in zip(model_positions, produced, strict=True):
         ordered[position] = vector
+
+    if borrowed:
+        # **Reported as the model call it replaced.** A caller in this workspace sees the batches
+        # its chunks occupy, which is what they would have cost here alone; how many of them
+        # another workspace's vectors stood in for is an operator's number, and only the lender
+        # records it. A count that fell when another tenant already held the text would tell
+        # this one so.
+        forward_calls = _batches(
+            len(pending),
+            budget_tokens=budget,
+            target_batch_tokens=target_batch_tokens,
+            maximum=maximum,
+        )
 
     return ordered, EmbeddingWork(
         chunks=len(chunks),
@@ -491,6 +583,27 @@ async def embed_or_reuse(
         vectors_replaced=counts[VectorState.STALE] + counts[VectorState.CORRUPT] + refreshed,
         vectors_backfilled=backfilled,
     )
+
+
+async def _borrow(lender: VectorLender, pending: Sequence[Chunk]) -> dict[int, Vector]:
+    """What ``lender`` holds for ``pending``, by position in ``pending``.
+
+    Keyed by position rather than by chunk id, because positions are what the caller pairs the
+    answer with; a lender that answered about an id it was never asked about is ignored rather
+    than trusted to have meant one of these.
+    """
+    if not pending:
+        return {}
+    lent = await lender.lend(pending)
+    return {index: lent[chunk.id] for index, chunk in enumerate(pending) if chunk.id in lent}
+
+
+def _batches(count: int, *, budget_tokens: int, target_batch_tokens: int, maximum: int) -> int:
+    """How many forward passes :func:`embed_checked_chunks` makes for ``count`` chunks."""
+    size = batch_size(
+        budget_tokens=budget_tokens, target_batch_tokens=target_batch_tokens, maximum=maximum
+    )
+    return -(-count // size)
 
 
 CACHE_HIT_METRIC: Final = "embedding_cache_hits"
@@ -517,6 +630,7 @@ __all__ = [
     "DEFAULT_TARGET_BATCH_TOKENS",
     "MAX_BATCH",
     "EmbeddingWork",
+    "VectorLender",
     "batch_size",
     "embed_checked_chunks",
     "embed_chunks",

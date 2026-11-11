@@ -1043,6 +1043,11 @@ def render_stats(out: Console, payload: r.Stats) -> None:
         for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             table.add_row(escape(key), str(count))
         out.print(table)
+    if payload.vectors_from_other_workspaces is not None:
+        out.print(
+            f"[dim]vectors copied from other workspaces instead of embedded (operator only):"
+            f"[/dim] {payload.vectors_from_other_workspaces}"
+        )
 
 
 def render_diagnosis(out: Console, payload: r.Diagnosis) -> None:

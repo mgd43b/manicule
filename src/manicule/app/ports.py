@@ -226,6 +226,20 @@ class OpenedWorkspace:
 
 
 @runtime_checkable
+class CountsVectorReuse(Protocol):
+    """A backend that keeps the operator's count of vectors borrowed from other workspaces.
+
+    Optional on the terms :class:`SpansWorkspaces` is: a backend that serves one workspace has
+    no other workspace to borrow from, and reports nothing rather than a zero it never counted.
+    """
+
+    async def vectors_from_other_workspaces(self) -> int:
+        """How many vectors this workspace copied from another one's store (``docs/storage.md``
+        §6.2.1). Read only on behalf of the operator at this machine."""
+        ...
+
+
+@runtime_checkable
 class SpansWorkspaces(Protocol):
     """A backend that can open the other workspaces on its data directory for reading.
 
