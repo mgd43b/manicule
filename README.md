@@ -774,7 +774,7 @@ attends to, a scanned PDF that yielded nothing, a plugin built for another versi
 | `src/manicule/api` | Twelve HTTP route groups over that service, and nothing else |
 | `src/manicule/extension` | A Chrome extension that hands this browser's Confluence session to a local manicule. No build step |
 | `src/manicule/web` | Fifteen areas of HTML — fourteen pages and the frame they render inside — plus a sign-in page. No build step, no new operation |
-| `packages/manicule-plugin-example` | The smallest complete plugin. Copy it to start one |
+| `packages/manicule-plugin-example` | The smallest complete plugin, with a connector. Copy it to start one, or to bring a source of your own ([guide](docs/writing-a-connector.md)) |
 | `packages/manicule-plugin-wikilinks` | Turns `[[wikilinks]]` into typed chunk relations. A plugin doing real work |
 | `packages/manicule-ollama` | Embedding on an Ollama server, for a host that cannot embed in process |
 
