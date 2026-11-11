@@ -34,12 +34,22 @@ WORKSPACE_FIELD: Final = "workspace_ids"
 """Resolved by neither store: the hydrating join enforces it (``docs/retrieval.md`` §4.2)."""
 
 JOIN_REQUIRING_FIELDS: Final = frozenset(
-    {"sources", "media_types", "collection_ids", "tag_ids", "updated_after", "updated_before"}
+    {
+        "sources",
+        "media_types",
+        "collection_ids",
+        "tag_ids",
+        "updated_after",
+        "updated_before",
+        "readers",
+    }
 )
 """Fields that need a join the vector table has no columns for.
 
 Each is a property of a *document*, so each is resolved in the document store and reaches the
-vector store — if it reaches it at all — as ``document_ids``.
+vector store — if it reaches it at all — as ``document_ids``. ``readers`` is one of them: who
+may read a document is a fact about the document and its source, held in the authoritative
+store, and a copy of it in the vector table would be a value that can disagree.
 """
 
 

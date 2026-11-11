@@ -1871,6 +1871,47 @@ class CollectionOrphans(Payload):
     document_ids: tuple[str, ...] = ()
 
 
+class ReaderGroupSummary(Payload):
+    """One reader group: who is in it, and which sources are granted to it."""
+
+    id: str
+    name: str
+    members: tuple[str, ...] = Field(default=(), description="Each member's user id.")
+    sources: tuple[str, ...] = Field(default=(), description="Sources granted to this group.")
+
+
+class ReaderGroupList(Payload):
+    """Every reader group in this workspace, and every source that is granted to any."""
+
+    count: int = Field(ge=0)
+    groups: tuple[ReaderGroupSummary, ...] = ()
+    grants: dict[str, tuple[str, ...]] = Field(
+        default_factory=dict,
+        description="Each granted source, and the names of the groups it is granted to. A "
+        "source absent here is readable by every reader of the workspace.",
+    )
+
+
+class ReaderGroupDeleted(Payload):
+    """The outcome of deleting a reader group."""
+
+    group: ReaderGroupSummary
+    deleted: bool
+
+
+class SourceReaders(Payload):
+    """Who may read one source, after a grant or a revocation."""
+
+    source: str
+    groups: tuple[str, ...] = Field(
+        default=(), description="The groups the source is granted to, by name."
+    )
+    restricted: bool = Field(
+        description="Whether the source is readable only by members of those groups. False "
+        "means every reader of the workspace may read it."
+    )
+
+
 class TagSummary(Payload):
     """One tag."""
 
@@ -3388,6 +3429,9 @@ __all__ = [
     "PluginSummary",
     "QueryLogEntry",
     "QueryLogPage",
+    "ReaderGroupDeleted",
+    "ReaderGroupList",
+    "ReaderGroupSummary",
     "ReconcileAction",
     "ReconcileOutcome",
     "ReembedCleanupReport",
@@ -3415,6 +3459,7 @@ __all__ = [
     "SignedIn",
     "SignedOut",
     "SourceDocumentsDeleted",
+    "SourceReaders",
     "SourceReference",
     # `StaleReparseReport` is listed here for the first time, and it is not this change's.
     # #113 added the class and not the name, so `from manicule.app.results import *` produced a

@@ -69,6 +69,8 @@ NON_CORPUS_TABLES: frozenset[str] = frozenset(
         models.WorkspaceMember.__tablename__,
         models.AuthSession.__tablename__,
         models.ApiKey.__tablename__,
+        models.ReaderGroup.__tablename__,
+        models.ReaderGroupMember.__tablename__,
         models.VectorReuseLedger.__tablename__,
     }
 )
@@ -76,12 +78,16 @@ NON_CORPUS_TABLES: frozenset[str] = frozenset(
 
 A record of who asked what, and of who is allowed to ask: the query log, the audit trail and
 its alerts, conversations and their turns, and the people, memberships, sessions and keys that
-identify a caller. And one operator's tally: the count of vectors a workspace copied from
-another instead of embedding (``docs/storage.md`` §6.2.6), written beside an ingest whose own
-corpus writes already count. Most of them are written *because* somebody searched, asked or
-signed in, which is exactly why a commit to one of them must not move the generation counter —
-the search that wrote it would invalidate its own cached ranking, and the next identical search
-would miss.
+identify a caller — reader groups and who is in them among them. Who is in a group decides
+which reader set a caller holds, and the reader set is part of every query's filter and so of
+every cache key: a membership change reaches the cache through the key, not this counter. A
+*grant* is the other kind of write, because it changes what one reader set may read, so
+``source_reader_grants`` is not here and counts. And one operator's tally: the count of
+vectors a workspace copied from another instead of embedding (``docs/storage.md`` §6.2.6),
+written beside an ingest whose own corpus writes already count. Most of them are written
+*because* somebody searched, asked or signed in, which is exactly why a commit to one of them
+must not move the generation counter — the search that wrote it would invalidate its own cached
+ranking, and the next identical search would miss.
 
 **An exemption list, not a list of tables that count.** A table missing from here — including
 one added next year — counts, and the cost is a cold cache. A list of tables that count would

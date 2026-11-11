@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     from manicule.core.embedding import IndexFingerprints
     from manicule.core.glossary import GlossaryEntry
+    from manicule.core.readers import ReadableTotals
     from manicule.core.retrieval import Filter
 
 
@@ -53,6 +54,20 @@ class SupportsDocumentCount(Protocol):
 
     async def count_documents(self) -> int:
         """Live documents in this store's workspace."""
+        ...
+
+
+@runtime_checkable
+class SupportsReadableTotals(Protocol):
+    """A store that can count only what one reader set may read.
+
+    What a count answers to a caller whose reader set restricts them
+    (:attr:`~manicule.core.retrieval.Filter.readers`). A store without it has no way to say,
+    and a count it cannot scope is not offered to that caller at all.
+    """
+
+    async def readable_totals(self, readers: frozenset[str]) -> ReadableTotals:
+        """Live documents and their chunks, counted over what ``readers`` may read."""
         ...
 
 
@@ -105,4 +120,5 @@ __all__ = [
     "SupportsDocumentCount",
     "SupportsIndexState",
     "SupportsLiveChunkCount",
+    "SupportsReadableTotals",
 ]

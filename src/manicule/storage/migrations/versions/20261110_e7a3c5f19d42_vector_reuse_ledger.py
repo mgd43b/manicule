@@ -8,7 +8,7 @@ per receiving workspace, for the operator.
 A new table and nothing else, so no existing row is touched and the downgrade is a drop.
 
 Revision ID: e7a3c5f19d42
-Revises: d2f5b8e31a64
+Revises: e7a3c9d14b52
 Created: 2026-11-10 09:00:00.000000
 """
 
@@ -22,7 +22,7 @@ from alembic import op
 import manicule.storage.types
 
 revision: str = "e7a3c5f19d42"
-down_revision: str | None = "d2f5b8e31a64"
+down_revision: str | None = "e7a3c9d14b52"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

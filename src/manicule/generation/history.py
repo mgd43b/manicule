@@ -44,6 +44,8 @@ class Turn:
     role: Literal["user", "assistant"]
     content: str
     citations: tuple[Citation, ...] = ()
+    context_documents: tuple[str, ...] | None = None
+    """The documents this answer was built from, when they were recorded with it."""
 
     def citation_for(self, slot: int) -> Citation | None:
         for citation in self.citations:

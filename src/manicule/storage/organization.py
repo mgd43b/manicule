@@ -288,8 +288,16 @@ class CollectionsMixin(WorkspaceScoped):
             return len(present)
 
     async def collection_documents(
-        self, collection_id: str, *, limit: int = 100, offset: int = 0
+        self,
+        collection_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        readers: frozenset[str] | None = None,
     ) -> Sequence[Document]:
+        # Deferred: `readers` imports this module for `normalize_name`.
+        from manicule.storage.readers import access_for, readable  # noqa: PLC0415
+
         async with self._sessions() as session:
             row = await self._collection(session, collection_id)
             if row is None:
@@ -302,6 +310,7 @@ class CollectionsMixin(WorkspaceScoped):
                             models.Document.workspace_id == self._workspace_id,
                             models.Document.deleted_at.is_(None),
                             self._membership_clause(row),
+                            *(() if readers is None else (readable(readers),)),
                         )
                         .order_by(models.Document.created_at.desc(), models.Document.id)
                         .limit(limit)
@@ -311,7 +320,8 @@ class CollectionsMixin(WorkspaceScoped):
                 .scalars()
                 .all()
             )
-            return [to_document(document) for document in rows]
+            access = await access_for(session, self._workspace_id, rows)
+            return [to_document(document, access=access[document.id]) for document in rows]
 
     async def collections_for(self, document_id: str) -> Sequence[Collection]:
         """Every collection holding this document, by hand or by rule.

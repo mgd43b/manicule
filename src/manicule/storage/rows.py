@@ -19,11 +19,17 @@ from manicule.storage.types import utcnow
 
 if TYPE_CHECKING:
     from manicule.core.content import Metadata
+    from manicule.core.readers import DocumentAccess
 
 _ANCHOR: TypeAdapter[Anchor] = TypeAdapter(Anchor)
 
 
-def to_document(row: models.Document) -> Document:
+def to_document(row: models.Document, *, access: DocumentAccess | None = None) -> Document:
+    """The domain document for ``row``.
+
+    ``access`` is the reader gates the caller read with it. Left out, the document carries
+    ``None`` — "not read" rather than "unrestricted" — which every restricted caller is refused.
+    """
     return Document(
         id=row.id,
         publication_id=row.publication_id,
@@ -47,6 +53,7 @@ def to_document(row: models.Document) -> Document:
         # document makes it easy to confuse it is the only one that is a fact about *this*
         # installation rather than about the source or about whoever took the snapshot.
         indexed_at=row.indexed_at,
+        access=access,
     )
 
 

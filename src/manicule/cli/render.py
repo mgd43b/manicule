@@ -1689,6 +1689,42 @@ def render_snapshot_status(out: Console, payload: r.SnapshotStatusReport) -> Non
         out.print(f"enumeration stopped by: {escape(progress.enumeration_failure_code)}")
 
 
+def render_reader_group(out: Console, payload: r.ReaderGroupSummary) -> None:
+    out.print(f"[bold]{escape(payload.name)}[/bold] [dim]{escape(payload.id)}[/dim]")
+    out.print(f"members: {escape(', '.join(payload.members)) or '—'}")
+    out.print(f"sources: {escape(', '.join(payload.sources)) or '—'}")
+
+
+def render_reader_groups(out: Console, payload: r.ReaderGroupList) -> None:
+    table = Table("name", "id", "members", "sources", box=None, pad_edge=False)
+    for group in payload.groups:
+        table.add_row(
+            escape(group.name),
+            escape(group.id),
+            str(len(group.members)),
+            escape(", ".join(group.sources) or "—"),
+        )
+    out.print(table)
+    if not payload.groups:
+        out.print("[dim]no reader groups[/dim]")
+    if not payload.grants:
+        out.print("[dim]no source is restricted; every reader may read every source[/dim]")
+
+
+def render_reader_group_deleted(out: Console, payload: r.ReaderGroupDeleted) -> None:
+    out.print(f"deleted reader group [bold]{escape(payload.group.name)}[/bold]")
+
+
+def render_source_readers(out: Console, payload: r.SourceReaders) -> None:
+    if payload.restricted:
+        out.print(
+            f"[bold]{escape(payload.source)}[/bold] is readable by members of "
+            f"{escape(', '.join(payload.groups))}"
+        )
+    else:
+        out.print(f"[bold]{escape(payload.source)}[/bold] is readable by every reader")
+
+
 def render_collection(out: Console, payload: r.CollectionSummary) -> None:
     out.print(f"[bold]{escape(payload.name)}[/bold] [dim]{escape(payload.id)}[/dim]")
     if payload.description:
@@ -1918,6 +1954,12 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.SecurityAlertAcknowledged: lambda out, p: render_security_alert_acknowledged(
         out, _as(r.SecurityAlertAcknowledged, p)
     ),
+    r.ReaderGroupSummary: lambda out, p: render_reader_group(out, _as(r.ReaderGroupSummary, p)),
+    r.ReaderGroupList: lambda out, p: render_reader_groups(out, _as(r.ReaderGroupList, p)),
+    r.ReaderGroupDeleted: lambda out, p: render_reader_group_deleted(
+        out, _as(r.ReaderGroupDeleted, p)
+    ),
+    r.SourceReaders: lambda out, p: render_source_readers(out, _as(r.SourceReaders, p)),
     r.CollectionSummary: lambda out, p: render_collection(out, _as(r.CollectionSummary, p)),
     r.CollectionList: lambda out, p: render_collections(out, _as(r.CollectionList, p)),
     r.CollectionDeleted: lambda out, p: render_collection_deleted(out, _as(r.CollectionDeleted, p)),

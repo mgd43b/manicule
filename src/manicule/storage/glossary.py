@@ -51,6 +51,7 @@ VOCABULARY_FILTER_FIELDS = frozenset(
         "tag_ids",
         "updated_after",
         "updated_before",
+        "readers",
     }
 )
 """Which of a filter's fields restrict *which glossary a query may consult*.
@@ -90,6 +91,7 @@ def vocabulary_filter(source: Filter) -> Filter:
         tag_ids=source.tag_ids,
         updated_after=source.updated_after,
         updated_before=source.updated_before,
+        readers=source.readers,
     )
 
 
@@ -338,6 +340,9 @@ class GlossaryMixin(WorkspaceScoped):
             media_types=resolved.media_types,
             updated_after=resolved.updated_after,
             updated_before=resolved.updated_before,
+            # A definition stated in a document the caller cannot read must not expand their
+            # query: the expansion is text from that document, and so is the term it fired on.
+            readers=resolved.readers,
         )
         # Cast rather than inherit: the method belongs to the class this mixin is combined
         # with, and declaring it on the mixin would make every real definition an override
