@@ -303,6 +303,20 @@ BINDERS: Mapping[str, Binder] = {
     "auth_ack_alert": lambda service, args, report: service.security_alert_acknowledge(
         args.text("alert_id")
     ),
+    "readers_create": lambda service, args, report: service.reader_group_create(args.text("name")),
+    "readers_delete": lambda service, args, report: service.reader_group_delete(args.text("group")),
+    "readers_add": lambda service, args, report: service.reader_group_add(
+        args.text("group"), args.texts("users")
+    ),
+    "readers_remove": lambda service, args, report: service.reader_group_remove(
+        args.text("group"), args.texts("users")
+    ),
+    "readers_grant": lambda service, args, report: service.source_grant(
+        args.text("source"), args.texts("groups")
+    ),
+    "readers_revoke": lambda service, args, report: service.source_revoke(
+        args.text("source"), args.texts("groups")
+    ),
     "collection_add": lambda service, args, report: service.collection_add(
         args.text("collection_id"), args.texts("document_ids")
     ),

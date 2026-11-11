@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 from manicule.core.anchors import Anchor
 from manicule.core.knowledge import Knowledge
 from manicule.core.provenance import Provenance
+from manicule.core.readers import DocumentAccess
 
 Metadata = dict[str, JsonValue]
 """Free-form per-item metadata. JSON-shaped so it survives the round trip to storage."""
@@ -452,6 +453,17 @@ class Document(_Content):
         "modification time, the moment a local snapshot was taken, and this, which is the only "
         "one that is a fact about *this installation*. A citation that offered one of the "
         "others under this name would claim the corpus was fresher than it is.",
+    )
+
+    access: DocumentAccess | None = Field(
+        default=None,
+        exclude=True,
+        description="The reader gates this document carries, as the store read them with it, "
+        "or ``None`` when the path that produced this object did not read them. **Read here, "
+        'written only by the store**, like ``indexed_at``. ``None`` is not "unrestricted": '
+        ":func:`~manicule.core.readers.admits` refuses it to every restricted caller, so a "
+        "lookup that forgot the gates cannot vouch for a document it never checked. Excluded "
+        "from serialization because who may read a document is not part of the document.",
     )
 
     @model_validator(mode="after")

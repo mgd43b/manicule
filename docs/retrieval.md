@@ -214,6 +214,7 @@ class Filter(BaseModel):
     langs: frozenset[str] = frozenset()
     updated_after: datetime | None = None
     updated_before: datetime | None = None
+    readers: frozenset[str] | None = None  # the caller's reader set, §3.5
 ```
 
 Every field is a conjunct; within a field, membership is a disjunction; an unset field
@@ -346,7 +347,7 @@ set it.**
 |---|---|---|
 | `document_ids`, `kinds`, `langs` | Vector store predicate | A promoted field exists on both backends ([`storage.md`](storage.md) §6.2), and neither is widened past it: the same query must return the same rows whichever store an installation configured |
 | `workspace_ids` | **Neither.** The hydrating join (§4.2) | No field on either store, deliberately: promoting it creates a value that can disagree with SQLite |
-| `sources`, `media_types`, `collection_ids`, `tag_ids`, `updated_*` | SQLite, into `document_ids`, then pushed down | Each needs a join neither vector store has fields for |
+| `sources`, `media_types`, `collection_ids`, `tag_ids`, `updated_*`, `readers` | SQLite, into `document_ids`, then pushed down | Each needs a join neither vector store has fields for. `readers` is also applied by the hydrating join itself (§3.5), so the post-filter regime enforces it too |
 
 **Level on eligibility, not on recall.** What the table holds equal across the two backends is
 which rows a filter admits. How closely an approximate search then finds the nearest of those rows
@@ -447,6 +448,43 @@ what each item changed and why it was necessary:
   default — and it holds every leg of a cross-workspace search too.
 
 ---
+
+### 3.5 `readers` is the second boundary, enforced the way the first one is
+
+A workspace admits everyone it admits to all of it. **Readers** narrow that inside a workspace:
+an administrator grants a source to reader groups, and a document of a granted source is
+readable only by a member of a granted group ([`deployment.md` §1.2](deployment.md)). The
+caller's **reader set** — the principals they hold, `user:<id>` and one `group:<id>` per group
+— travels on `Filter.readers`, and `None` and `frozenset()` are opposite instructions in the
+way an unset and an empty collection are: `None` restricts nothing, and is what the operator at
+this machine and every caller of a workspace with no grant hold; an empty set is a caller who
+holds no principal, and reads only documents that carry no gate.
+
+A document's **access** is the list of gates it must pass, every one of them; a gate is a set of
+principals, any one of which opens it, and a gate with none opens for nobody
+(`manicule.core.readers`). It is read from SQLite with the document and never copied into the
+vector store, for `workspace_ids`' reason: a copy is a value that can disagree.
+
+It is enforced in the same places as the workspace, and nowhere else:
+
+- **The lexical statement** applies it inline, before `LIMIT`, as a correlated subquery on the
+  document's source (`manicule.storage.readers.readable_sql`).
+- **The hydrating join** (`manicule.retrieval.hydration.visible_documents`) asks the store with
+  the reader set as a predicate, and then reads each document's gates on the row it came back
+  as, dropping one that does not admit the caller. The dense leg, a cache hit's rehydration and
+  a promoted glossary definition all go through it.
+- **The glossary lookup** narrows the documents whose definitions may expand a query to those
+  the reader set may read, so a definition from a document the caller cannot read neither
+  expands their query nor is reported.
+- **On the way out**, the service checks every document behind every passage the run produced —
+  the page returned, the rest of the ranking and the assembled context, which confidence and
+  `truncated` are computed from — against the gates it came back carrying, and refuses the whole
+  result (`UnreadableDocumentError`) if one does not admit the caller. That check reads nothing
+  but the row in hand (`manicule.app.tenancy.require_readable`), so it still fires if every
+  reader predicate in the store were deleted. The refusal names no document.
+
+`assert_pipeline_enforces_scope` checks it: given a query with a reader set, a stage that
+returned a passage of a document the set may not read fails, with a message of its own.
 
 ## 4. The two legs
 
@@ -1710,6 +1748,14 @@ Notes on four of those:
   workspace's ranking of the same words apart — served to each other, the first would show a
   single-workspace caller other tenants' passages, and the second would report a search that
   says it spanned several and looked at one.
+- **The reader set is in it, because it is a field of the `Filter`.** Two callers holding
+  different reader sets compute different rankings, and the rehydrating join catches only one
+  direction of serving one's to the other: a ranking holding a document the second caller may
+  not read is stale for them and recomputed, but a ranking computed for a *narrower* reader set
+  holds only documents a wider one may also read, and would be served whole — short of the
+  passages the wider reader may see, with a confidence computed without them. The key keeps the
+  two apart; the sorted set is hashed with the rest of the filter, so callers holding the same
+  principals share entries and callers holding different ones never do.
 - **The pipeline declaration and the reranker id.** Comparing two pipelines is #15's entire
   method, and a cache that cannot tell them apart would serve pipeline A's ranking as pipeline
   B's result. #15 also runs with the cache **disabled**, which is a configuration flag rather

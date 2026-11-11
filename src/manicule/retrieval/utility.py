@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from manicule.core.content import Metadata
-from manicule.retrieval.ports import SupportsDocumentCount, SupportsIndexState
+from manicule.core.readers import ReadableTotals
+from manicule.retrieval.ports import (
+    SupportsDocumentCount,
+    SupportsIndexState,
+    SupportsReadableTotals,
+)
 from manicule.retrieval.router import UtilityKind
 
 if TYPE_CHECKING:
@@ -87,8 +92,13 @@ class _DocumentCount:
         self._docstore = docstore
 
     async def __call__(self, query: Query) -> UtilityAnswer:
-        del query  # the store is bound to one workspace, which is the whole scope here
-        total = await self._docstore.count_documents()
+        # The store is bound to one workspace, which is the whole scope here — except for a
+        # caller whose reader set restricts them, who is told how many documents they may read.
+        total = (
+            await self._docstore.count_documents()
+            if query.filter.readers is None
+            else (await _readable(self._docstore, query.filter.readers)).documents
+        )
         return UtilityAnswer(
             kind=UtilityKind.DOCUMENT_COUNT,
             text=f"{total} document(s) are indexed in this workspace",
@@ -101,9 +111,12 @@ class _IndexStatus:
         self._docstore = docstore
 
     async def __call__(self, query: Query) -> UtilityAnswer:
-        del query
         state = await self._docstore.index_fingerprints()
-        chunks = await self._docstore.count_chunks()
+        chunks = (
+            await self._docstore.count_chunks()
+            if query.filter.readers is None
+            else (await _readable(self._docstore, query.filter.readers)).chunks
+        )
         embedder = state.embed.describe() if state.embed else "nothing yet"
         return UtilityAnswer(
             kind=UtilityKind.INDEX_STATUS,
@@ -114,6 +127,17 @@ class _IndexStatus:
                 "vector_table": state.vector_table,
             },
         )
+
+
+async def _readable(store: object, readers: frozenset[str]) -> ReadableTotals:
+    """What ``readers`` may read of ``store``, or nothing if the store cannot say.
+
+    Zero rather than the workspace's own total, because the total is the disclosure: a store
+    that cannot count by reader set has no number it may give this caller.
+    """
+    if isinstance(store, SupportsReadableTotals):
+        return await store.readable_totals(readers)
+    return ReadableTotals()
 
 
 __all__ = ["LIST_LIMIT", "UtilityAnswer", "UtilityHandler", "handlers_for"]

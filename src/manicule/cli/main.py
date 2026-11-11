@@ -460,6 +460,11 @@ auth_app = typer.Typer(
 collection_app = typer.Typer(
     help="Named sets of documents.", no_args_is_help=True, cls=CommandsShareTheRootOptions
 )
+readers_app = typer.Typer(
+    help="Reader groups, and the sources granted to them: who may read what.",
+    no_args_is_help=True,
+    cls=CommandsShareTheRootOptions,
+)
 collection_rule_app = typer.Typer(
     help="Show, replace, or clear evaluated collection membership rules.",
     no_args_is_help=True,
@@ -484,6 +489,7 @@ app.add_typer(workspace_app, name="workspace")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(config_app, name="config")
 app.add_typer(auth_app, name="auth")
+app.add_typer(readers_app, name="readers")
 app.add_typer(reembed_app, name="reembed")
 app.add_typer(rebuild_app, name="rebuild")
 
@@ -758,6 +764,13 @@ PAYLOADS: dict[str, type[Payload]] = {
     "auth_sign_out": r.UserSignedOut,
     "auth_alerts": r.SecurityAlertList,
     "auth_ack_alert": r.SecurityAlertAcknowledged,
+    "readers_create": r.ReaderGroupSummary,
+    "readers_list": r.ReaderGroupList,
+    "readers_delete": r.ReaderGroupDeleted,
+    "readers_add": r.ReaderGroupSummary,
+    "readers_remove": r.ReaderGroupSummary,
+    "readers_grant": r.SourceReaders,
+    "readers_revoke": r.SourceReaders,
     "collection_create": r.CollectionSummary,
     "collection_list": r.CollectionList,
     "collection_rename": r.CollectionSummary,
@@ -1732,6 +1745,75 @@ def collection_delete(
 ) -> None:
     """Delete a collection. The documents in it are untouched."""
     submit(Command("collection_delete", {"collection_id": collection_id}))
+
+
+_GROUP = Annotated[str, typer.Argument(help="The reader group's name or id.")]
+
+
+@readers_app.command("create")
+def readers_create(
+    name: Annotated[str, typer.Argument(help="What to call the group.")],
+) -> None:
+    """Make an empty reader group. Granting a source to it is what restricts anything."""
+    submit(Command("readers_create", {"name": name}))
+
+
+@readers_app.command("list")
+def readers_list() -> None:
+    """List the reader groups, their members, and every source granted to any of them."""
+    emit("readers_list", lambda service: service.reader_group_list())
+
+
+@readers_app.command("delete")
+def readers_delete(group: _GROUP) -> None:
+    """Delete a reader group. Refused while a source is still granted to it."""
+    submit(Command("readers_delete", {"group": group}))
+
+
+@readers_app.command("add")
+def readers_add(
+    group: _GROUP,
+    user: Annotated[
+        list[str],
+        typer.Argument(help="Members to add: a user id, a handle, or an address naming one."),
+    ],
+) -> None:
+    """Put members of this workspace in a reader group."""
+    users = cast("list[JsonValue]", list(user))
+    submit(Command("readers_add", {"group": group, "users": users}))
+
+
+@readers_app.command("remove")
+def readers_remove(
+    group: _GROUP,
+    user: Annotated[
+        list[str],
+        typer.Argument(help="Members to remove: a user id, a handle, or an address naming one."),
+    ],
+) -> None:
+    """Take members of this workspace out of a reader group."""
+    users = cast("list[JsonValue]", list(user))
+    submit(Command("readers_remove", {"group": group, "users": users}))
+
+
+@readers_app.command("grant")
+def readers_grant(
+    source: Annotated[str, typer.Argument(help="The source, as documents name it.")],
+    group: Annotated[list[str], typer.Argument(help="The groups to grant it to.")],
+) -> None:
+    """Restrict a source to the members of these groups, from the next query on."""
+    groups = cast("list[JsonValue]", list(group))
+    submit(Command("readers_grant", {"source": source, "groups": groups}))
+
+
+@readers_app.command("revoke")
+def readers_revoke(
+    source: Annotated[str, typer.Argument(help="The source, as documents name it.")],
+    group: Annotated[list[str], typer.Argument(help="The groups to revoke it from.")],
+) -> None:
+    """Revoke a source from these groups. Its last grant revoked, every reader may read it."""
+    groups = cast("list[JsonValue]", list(group))
+    submit(Command("readers_revoke", {"source": source, "groups": groups}))
 
 
 @collection_app.command("add")

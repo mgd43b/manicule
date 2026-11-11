@@ -29,7 +29,7 @@ from manicule.app.results import (
     failed,
     succeeded,
 )
-from manicule.app.tenancy import CrossWorkspaceError
+from manicule.app.tenancy import CrossWorkspaceError, UnreadableDocumentError
 from manicule.core.errors import (
     AcquisitionLeaseHeldError,
     AmbiguousHandleError,
@@ -94,6 +94,10 @@ _HINTS: dict[type[Exception], str] = {
     ),
     CrossWorkspaceError: (
         "Something returned data belonging to another workspace and it was refused. This is a "
+        "defect, not a configuration problem — report it with the message above."
+    ),
+    UnreadableDocumentError: (
+        "Something returned a document this caller may not read and it was refused. This is a "
         "defect, not a configuration problem — report it with the message above."
     ),
     CapacityRefusedError: (
@@ -357,6 +361,7 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         "auth_list_keys",
         "auth_users",
         "auth_alerts",
+        "readers_list",
         # Reads of configuration and of what is installed. These touch no data directory at
         # all; they are named rather than left to the default because the default is "writer",
         # and a command that takes an exclusive lock to print a setting would be absurd.

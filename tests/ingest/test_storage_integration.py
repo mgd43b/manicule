@@ -3833,7 +3833,8 @@ async def test_acquisition_failure_does_not_mutate_the_prior_document(
     assert record.diagnostic is not None
     assert record.diagnostic.code.value == "fetch_failed"
     assert after is not None
-    assert after == existing
+    # `get_document` reads the reader gates with the row; the comparison is of the row.
+    assert after.model_copy(update={"access": existing.access}) == existing
 
 
 async def test_a_durable_limited_run_has_no_completion_marker_or_watermark(
@@ -6840,7 +6841,11 @@ async def test_atomic_publication_cas_has_one_winner_across_two_real_sessions(
     miss = next(result for result in results if not result.committed)
     winner = next(result for result in results if result.committed)
     assert miss.stored == winner.stored
-    assert await store.get_document(original.id) == winner.stored
+    published = await store.get_document(original.id)
+    assert published is not None
+    assert winner.stored is not None
+    # `get_document` reads the reader gates with the row; the comparison is of the row.
+    assert published.model_copy(update={"access": winner.stored.access}) == winner.stored
 
 
 async def test_stale_retained_failure_cannot_overwrite_an_indexed_winners_original(

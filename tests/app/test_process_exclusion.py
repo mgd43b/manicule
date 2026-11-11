@@ -270,6 +270,14 @@ WRITERS: frozenset[str] = frozenset(
         "auth_set_password",
         "auth_sign_out",
         "auth_ack_alert",
+        # Reader groups and grants are rows in the data directory's database, like the
+        # memberships above, and a grant changes what every later query returns.
+        "readers_add",
+        "readers_create",
+        "readers_delete",
+        "readers_grant",
+        "readers_remove",
+        "readers_revoke",
         "collection_add",
         "collection_create",
         "collection_delete",

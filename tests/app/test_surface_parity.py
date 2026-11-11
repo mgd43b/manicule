@@ -220,7 +220,7 @@ def test_only_private_safe_reembed_status_is_an_mcp_tool() -> None:
     }.isdisjoint(TOOL_NAMES)
 
 
-def test_the_command_line_offers_exactly_thirty_three_commands() -> None:
+def test_the_command_line_offers_exactly_thirty_four_commands() -> None:
     """Counted from the built command tree rather than from the source.
 
     A command registered on a sub-application and never attached would be in the file and not
@@ -233,6 +233,8 @@ def test_the_command_line_offers_exactly_thirty_three_commands() -> None:
     the browser extension reaches manicule through. It is a command rather than a documented
     path to write a file by hand because the four locations differ by browser and by operating
     system, which is exactly the instruction people get wrong.
+    ``readers`` is the group that says who may read which source: reader groups, their members,
+    and the grants that restrict a source to them.
     ``serve`` is the name the documentation uses and the one every refusal names, because it
     says what the process does; ``start`` is what scripts and habits already type, so it is kept
     rather than broken.
@@ -260,6 +262,7 @@ def test_the_command_line_offers_exactly_thirty_three_commands() -> None:
         "init",
         "migrate-vectors",
         "plugin",
+        "readers",
         "rebuild",
         "reembed",
         "release-source-history",
@@ -276,7 +279,7 @@ def test_the_command_line_offers_exactly_thirty_three_commands() -> None:
         "vector-checksum",
         "workspace",
     ]
-    assert len(names) == 33
+    assert len(names) == 34
 
 
 def test_only_the_command_line_can_ask_doctor_to_repair_anything(

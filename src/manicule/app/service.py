@@ -66,9 +66,15 @@ from manicule.app.people import (
     provider_for,
     serving_problems,
 )
-from manicule.app.ports import RetrievingAcross, SpansWorkspaces
+from manicule.app.ports import ReaderStore, RetrievingAcross, SpansWorkspaces
 from manicule.app.sensitive import UnreadableDatabaseError, sensitive_exposure
-from manicule.app.tenancy import CrossWorkspaceError, require_owned, require_owns
+from manicule.app.tenancy import (
+    CrossWorkspaceError,
+    UnreadableDocumentError,
+    require_owned,
+    require_owns,
+    require_readable,
+)
 from manicule.app.throttle import RateDecision, RateLimiter
 from manicule.config.loader import load_settings
 from manicule.config.profiles import profile_config
@@ -94,6 +100,7 @@ from manicule.core.errors import (
     PolicyError,
     RateLimitedError,
     SignInRefusedError,
+    StorageBusyError,
     UnknownComponentError,
     UnknownEntityError,
 )
@@ -101,6 +108,7 @@ from manicule.core.fingerprints import identity_differences
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id as document_id_of
 from manicule.core.organization import directory_prefix
+from manicule.core.readers import ReaderGroup, admits
 from manicule.core.rebuild import (
     RebuildLeaseConflictError,
     RebuildLeaseError,
@@ -112,7 +120,14 @@ from manicule.core.rebuild import (
     RebuildTerminalGenerationError,
     RebuildValidationError,
 )
-from manicule.core.retrieval import Candidate, Context, Filter, Query, RetrievalProfile
+from manicule.core.retrieval import (
+    Candidate,
+    Context,
+    Filter,
+    Query,
+    RetrievalProfile,
+    SupportsGeneration,
+)
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
 from manicule.ingest.knowledge import check as check_knowledge
@@ -156,11 +171,12 @@ if TYPE_CHECKING:
     from manicule.core.content import Chunk, Document
     from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.fingerprints import Fingerprint
-    from manicule.core.organization import Collection, CollectionRule, Tag
+    from manicule.core.organization import Collection, CollectionRule, Tag, TrashEntry
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
     from manicule.generation.answers import AnswerEnvelope, AnswerEvent, Citation
+    from manicule.generation.history import Turn
     from manicule.generation.ports import ConversationRecord
     from manicule.ingest.embedding import EmbeddingWork
     from manicule.ingest.pipeline import RunReport, Watching
@@ -170,6 +186,13 @@ if TYPE_CHECKING:
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
     from manicule.storage.vector_migration import VectorMigration
+
+
+class _Unresolved:
+    """The reader set of an operation that has not resolved it yet: distinct from ``None``."""
+
+
+UNRESOLVED = _Unresolved()
 
 _log = logging.getLogger("manicule.app")
 """For the one thing here that is reported rather than raised: a telemetry write that failed.
@@ -1086,16 +1109,26 @@ class ApplicationService:
         )
 
         started = time.monotonic()
+        since = await self._generation()
+        readers = await self._reader_set()
+        if conversation_id is not None and readers is not None:
+            # The answer is written into this conversation, so a restricted caller has to be
+            # one who may open it. Writing into somebody else's would put text from documents
+            # this caller may read in front of a person who may not.
+            await self._require_conversation(
+                await self._backend.conversations(), conversation_id, readers=readers
+            )
         query = self._query(
             question,
             limit=limit or 8,
             profile=profile,
             sources=sources,
             collection_ids=sorted(await self._collection_scope(collections)),
+            readers=readers,
         )
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
-        documents = await self._require_scoped_context(retrieved)
+        documents = await self._require_scoped_context(retrieved, readers, since=since)
         # After the tenancy check and before the model. Recording first would put another
         # tenant's chunk ids into this workspace's telemetry on the exact path the check
         # exists to stop.
@@ -1115,7 +1148,9 @@ class ApplicationService:
         if confidence is not None:
             record.confidence_band = confidence.band.value
             record.confidence_reason = confidence.reason
-        record.expansions, record.conflicts = await self._glossary_payloads(retrieved.expansion)
+        record.expansions, record.conflicts = await self._glossary_payloads(
+            retrieved.expansion, readers
+        )
         # After the expansions, because the classification is only reportable alongside the
         # provenance it names and `_glossary_payloads` is what decides whether that survived.
         record.explicit_definition = cited_definition(confidence, record.expansions)
@@ -1179,12 +1214,15 @@ class ApplicationService:
 
         started = time.monotonic()
         limits = _research_limits(self.settings)
+        since = await self._generation()
+        readers = await self._reader_set()
         base = self._query(
             question,
             limit=limit or 8,
             profile=profile,
             sources=sources,
             collection_ids=sorted(await self._collection_scope(collections)),
+            readers=readers,
         )
         retriever = await self._backend.retriever()
         answerer = await self._backend.answerer()
@@ -1213,7 +1251,7 @@ class ApplicationService:
             redactor=Redactor(self.settings.security.data_policy.auto_redact),
         ).run(question, base)
         documents = await self._require_scoped_chunks(
-            candidate.chunk for candidate in evidence.passages
+            (candidate.chunk for candidate in evidence.passages), readers, since=since
         )
         context = _research_context(self.settings, base, evidence.passages, limits)
 
@@ -1332,6 +1370,8 @@ class ApplicationService:
                 collections=collections,
             )
         started = time.monotonic()
+        since = await self._generation()
+        readers = await self._reader_set()
         query = self._query(
             query_text,
             limit=limit,
@@ -1339,17 +1379,28 @@ class ApplicationService:
             sources=sources,
             media_types=media_types,
             collection_ids=sorted(await self._collection_scope(collections)),
+            readers=readers,
         )
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
         candidates = list(retrieved.candidates or retrieved.context.passages)[:limit]
-        documents = await self._require_scoped_chunks(candidate.chunk for candidate in candidates)
+        # Every passage the run produced is checked, not only the page returned: the confidence
+        # and the truncation flag below are computed over the whole context, and a document
+        # the caller may not read must not move either of them.
+        documents = await self._require_scoped_chunks(
+            (
+                candidate.chunk
+                for candidate in (*candidates, *retrieved.candidates, *retrieved.context.passages)
+            ),
+            readers,
+            since=since,
+        )
         await self._record_query(query, retrieved, started=started)
         hits = tuple(
             _hit(candidate, documents, workspace=self.workspace) for candidate in candidates
         )
         confidence = retrieved.confidence
-        expansions, conflicts = await self._glossary_payloads(retrieved.expansion)
+        expansions, conflicts = await self._glossary_payloads(retrieved.expansion, readers)
         return r.SearchResult(
             query=query_text,
             profile=query.profile.value,
@@ -1481,6 +1532,7 @@ class ApplicationService:
             )
             raise ConfigError(msg)
         opened = list(await backend.open_workspaces(spanned))
+        readers = await _reader_set_across(opened)
         collection_ids = await self._collections_across(opened, collections)
         retriever = await backend.retriever()
         if not isinstance(retriever, RetrievingAcross):
@@ -1497,10 +1549,25 @@ class ApplicationService:
             media_types=media_types,
             collection_ids=sorted(collection_ids),
             workspaces=spanned,
+            readers=readers,
         )
         retrieved = await retriever.retrieve_across(query, [workspace.leg for workspace in opened])
         candidates = list(retrieved.candidates)[:limit]
-        attributed = await self._require_owned_across(opened, retrieved.origins, candidates)
+        attributed = await self._require_owned_across(
+            opened, retrieved.origins, list(retrieved.candidates), readers
+        )
+        attributed = attributed[: len(candidates)]
+        # The merged context is what confidence and `truncated` are computed over. Its passages
+        # are candidates of the merge, so each was attributed and checked above; a passage that
+        # is not one has no workspace to be checked in, and is refused rather than trusted.
+        claimed = {candidate.chunk.id for candidate in retrieved.candidates}
+        if any(passage.chunk.id not in claimed for passage in retrieved.context.passages):
+            msg = (
+                "a passage in the merged context of a search spanning workspaces was not one of "
+                "its ranked candidates, so no workspace's search vouches for it. Nothing was "
+                "returned."
+            )
+            raise CrossWorkspaceError(msg)
         await self._record_query(query, retrieved, started=started)
         await self._audit(
             "search.cross_workspace",
@@ -1615,6 +1682,7 @@ class ApplicationService:
         opened: Sequence[OpenedWorkspace],
         origins: Mapping[str, tuple[str, ...]],
         candidates: Sequence[Candidate],
+        readers: frozenset[str] | None,
     ) -> list[tuple[str, dict[str, Document]]]:
         """Check each hit's identity in the workspace whose search returned it.
 
@@ -1647,14 +1715,14 @@ class ApplicationService:
             grouped.setdefault(claimed[0], []).append(candidate.chunk)
         resolved = {
             workspace: await self._require_scoped_in(
-                handles[workspace].documents, workspace, chunks
+                handles[workspace].documents, workspace, chunks, readers
             )
             for workspace, chunks in grouped.items()
         }
         return [(workspace, resolved[workspace]) for workspace in claims]
 
     async def _glossary_payloads(
-        self, expansion: QueryExpansion | None
+        self, expansion: QueryExpansion | None, readers: frozenset[str] | None
     ) -> tuple[tuple[r.GlossaryExpansion, ...], tuple[r.GlossaryConflict, ...]]:
         """Turn what the glossary said into payloads, with every source resolved.
 
@@ -1674,11 +1742,15 @@ class ApplicationService:
             return (), ()
         entries = [match.entry for match in expansion.matches]
         entries += [entry for conflict in expansion.conflicts for entry in conflict.entries]
-        documents = await self._scoped_documents({entry.document_id for entry in entries})
+        documents = await self._scoped_documents(
+            {entry.document_id for entry in entries}, readers=readers
+        )
 
         def payload(entry: GlossaryEntry, matched: str, reason: str) -> r.GlossaryExpansion | None:
             document = documents.get(entry.document_id)
-            if document is None:
+            # Read against the gates the document came back carrying, as well as through the
+            # store's reader predicate: a definition is text from its document.
+            if document is None or not admits(readers, document.access):
                 return None
             return r.GlossaryExpansion(
                 document_id=entry.document_id,
@@ -2954,15 +3026,20 @@ class ApplicationService:
         source: str | None = None,
         media_type: str | None = None,
     ) -> r.DocumentList:
-        """A page of this workspace's documents, newest first."""
+        """A page of this workspace's documents, newest first — those the caller may read."""
         store = await self._backend.documents()
+        readers = await self._reader_set()
         selector = Filter(
             workspace_ids=frozenset({self.workspace}),
             sources=frozenset({source}) if source else frozenset(),
             media_types=frozenset({media_type}) if media_type else frozenset(),
+            readers=readers,
         )
-        found = require_owned(
-            self.workspace, await store.list_documents(selector, limit=limit, offset=offset)
+        found = require_readable(
+            readers,
+            require_owned(
+                self.workspace, await store.list_documents(selector, limit=limit, offset=offset)
+            ),
         )
         return r.DocumentList(
             count=len(found),
@@ -2980,7 +3057,7 @@ class ApplicationService:
                 a cross-tenant disclosure.
         """
         store = await self._backend.documents()
-        document = await store.get_document(document_id)
+        document = await self._visible(await store.get_document(document_id))
         if document is None:
             msg = (
                 f"no live document {document_id!r} in workspace {self.workspace!r}. A "
@@ -3127,7 +3204,7 @@ class ApplicationService:
 
         store = await self._backend.documents()
         if document_id is not None:
-            found = await store.get_document(document_id)
+            found = await self._visible(await store.get_document(document_id))
             return "document_id", _found_or_raise(found, f"document_id {document_id!r}")
         if uri is not None:
             return "uri", await self._by_uri(uri)
@@ -3142,13 +3219,17 @@ class ApplicationService:
         # workspace scope into the key rather than applying it afterwards, which is what makes
         # this path incapable of reaching another tenant's row even in principle.
         derived = document_id_of(self.workspace, source, source_id)
-        found = await store.get_document(derived)
+        found = await self._visible(await store.get_document(derived))
         return "source_id", _found_or_raise(found, f"{source!r} document {source_id!r}")
 
     async def _by_uri(self, uri: str) -> Document:
         """The one live document at ``uri``, or a refusal that names the alternatives."""
         store = await self._backend.documents()
-        candidates = await store.find_documents_by_uri(uri)
+        readers = await self._reader_set()
+        # Narrowed to what the caller may read before anything is decided, counted or named: a
+        # match the caller may not read is no match, so it neither suppresses the normalized
+        # retry below nor appears in an ambiguity listing.
+        candidates = await self._visible_all(await store.find_documents_by_uri(uri), readers)
         if not candidates:
             # Retried once against a conservatively normalized form rather than normalizing up
             # front, because the stored URI is the connector's own and an exact match is the
@@ -3156,7 +3237,9 @@ class ApplicationService:
             # in are folded — never the path, where a Confluence page's title slug lives.
             normalized = _normalize_uri(uri)
             if normalized != uri:
-                candidates = await store.find_documents_by_uri(normalized)
+                candidates = await self._visible_all(
+                    await store.find_documents_by_uri(normalized), readers
+                )
         if not candidates:
             msg = (
                 f"no live document at {uri!r} in workspace {self.workspace!r}. A URI is "
@@ -3301,6 +3384,7 @@ class ApplicationService:
         # unlikely rather than impossible — and "unlikely" is not what a path check is for.
         _require_segment(collection, "collection name")
         content = _authored_markdown(body, slug=slug)
+        await self._require_readable_source(authoring.source)
 
         store = await self._backend.organization()
         found = await store.find_collection(collection)
@@ -3444,7 +3528,7 @@ class ApplicationService:
             UnknownEntityError: No live document with that id in this workspace.
         """
         store = await self._backend.documents()
-        document = await store.get_document(document_id)
+        document = await self._visible(await store.get_document(document_id))
         if document is None:
             msg = f"no live document {document_id!r} in workspace {self.workspace!r}"
             raise UnknownEntityError(msg)
@@ -3478,7 +3562,7 @@ class ApplicationService:
     async def document_reindex(self, document_id: str) -> r.DocumentReindexed:
         """Re-parse one document from its retained bytes. Touches no network."""
         store = await self._backend.documents()
-        document = await store.get_document(document_id)
+        document = await self._visible(await store.get_document(document_id))
         if document is None:
             msg = f"no live document {document_id!r} in workspace {self.workspace!r}"
             raise UnknownEntityError(msg)
@@ -3734,7 +3818,23 @@ class ApplicationService:
         Deliberately a report on what the store already knows. Trends, alerting and history
         belong to Operations; a surface that invented them here would be a second, weaker
         copy of that subsystem.
+
+        Every number here is the whole index's, including the vector table's row count, so
+        while any document of this workspace is restricted to some of its readers this is an
+        administrator's report, and a restricted caller who is not one is refused it.
+        :meth:`stats` is the count that is narrowed to what its caller may read.
+
+        Raises:
+            PolicyError: The caller's reader set restricts them and they are not an
+                administrator.
         """
+        if await self._reader_set() is not None and not current().holds(Role.ADMIN):
+            msg = (
+                "index status reports counts over the whole index, and some of this "
+                "workspace's documents are restricted to some of its readers, so it is an "
+                "administrator's report. `stats` counts what you may read."
+            )
+            raise PolicyError(msg)
         store = await self._backend.documents()
         maintenance = await self._backend.maintenance()
         statistics = await store.document_statistics()
@@ -4010,9 +4110,60 @@ class ApplicationService:
         self._ready_answer = (True, now)
         self._ready_last_ok = now
 
-    async def stats(self) -> r.Stats:
-        """Counts, grouped the three ways anybody asks for."""
+    async def _document_total(self, store: DocumentSurface) -> int:
+        """How many documents this workspace holds, as the caller may be told it.
+
+        The workspace's own total for a caller :meth:`stats` reports totals to; for anyone else
+        a count of what they may read, for :meth:`stats`'s reason.
+        """
+        readers = await self._reader_set()
+        if readers is None or current().holds(Role.ADMIN) or not isinstance(store, ReaderStore):
+            return await store.count_documents()
+        return (await store.readable_totals(readers)).documents
+
+    async def counts_scope(self) -> str:
+        """A canonical name for what :meth:`stats` counts for this caller.
+
+        Empty for a caller who is shown the workspace's own totals; otherwise a digest of the
+        reader set the counts are narrowed to. Two callers with the same scope are shown the
+        same counts, which is what lets a surface that caches them share one copy between them
+        and never hand one reader's counts to another.
+        """
+        readers = await self._reader_set()
+        if readers is None or current().holds(Role.ADMIN):
+            return ""
+        # The grants are part of the scope as well as the reader set: a grant changes what one
+        # reader set may count, and a snapshot taken before it would otherwise go on being
+        # served — including while the cache refreshes it — under the same key.
         store = await self._backend.documents()
+        grants = await store.source_grants() if isinstance(store, ReaderStore) else {}
+        canonical = json.dumps(
+            {"readers": sorted(readers), "grants": {k: list(v) for k, v in sorted(grants.items())}},
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    async def stats(self) -> r.Stats:
+        """Counts, grouped the three ways anybody asks for.
+
+        For a caller whose reader set restricts them, and who is not an administrator, the
+        counts are of what they may read: a count of documents somebody may not read says that
+        those documents exist. An administrator is shown the workspace's own totals, which are
+        what operating the index needs and carry no document's content.
+        """
+        store = await self._backend.documents()
+        readers = await self._reader_set()
+        if readers is not None and not current().holds(Role.ADMIN):
+            if not isinstance(store, ReaderStore):  # pragma: no cover - no gates without one
+                return r.Stats(documents=0, chunks=0)
+            totals = await store.readable_totals(readers)
+            return r.Stats(
+                documents=totals.documents,
+                chunks=totals.chunks,
+                by_source=dict(totals.by_source),
+                by_media_type=dict(totals.by_media_type),
+                by_status=dict(totals.by_status),
+            )
         statistics = await store.document_statistics()
         return r.Stats(
             documents=await store.count_documents(),
@@ -4023,6 +4174,26 @@ class ApplicationService:
         )
 
     async def doctor(self, *, fix: bool = False) -> r.Diagnosis:
+        """See :meth:`_doctor`, which is the diagnosis; this is who may have it.
+
+        Its findings count the whole workspace and can name documents by source id, so while
+        any document of this workspace is restricted to some of its readers it is an
+        administrator's, as :meth:`index_status` is.
+
+        Raises:
+            PolicyError: The caller's reader set restricts them and they are not an
+                administrator.
+        """
+        if await self._reader_set() is not None and not current().holds(Role.ADMIN):
+            msg = (
+                "the diagnosis counts the whole workspace and can name its documents, and some "
+                "of this workspace's documents are restricted to some of its readers, so it is "
+                "an administrator's. `stats` counts what you may read."
+            )
+            raise PolicyError(msg)
+        return await self._doctor(fix=fix)
+
+    async def _doctor(self, *, fix: bool = False) -> r.Diagnosis:
         """Check what can be checked without building anything expensive.
 
         Every check answers one question and says what to do when the answer is bad. It does
@@ -6829,7 +7000,7 @@ class ApplicationService:
                     name=name,
                     mode=self.settings.mode.value if active else recorded,
                     active=active,
-                    documents=await store.count_documents() if active else None,
+                    documents=await self._document_total(store) if active else None,
                 )
             )
         return r.WorkspaceList(
@@ -7445,9 +7616,9 @@ class ApplicationService:
     # --- conversations --------------------------------------------------------------------
 
     async def conversation_create(self, *, title: str | None = None) -> r.ConversationSummary:
-        """Start a conversation in this workspace."""
+        """Start a conversation in this workspace, owned by the person who started it."""
         store = await self._backend.conversations()
-        identifier = await store.create_conversation(title=title)
+        identifier = await store.create_conversation(user_id=current().user_id, title=title)
         record = await store.get_conversation(identifier)
         if record is None:  # pragma: no cover - the row was just written
             msg = f"conversation {identifier!r} vanished between creation and reading"
@@ -7455,9 +7626,18 @@ class ApplicationService:
         return _conversation(record)
 
     async def conversation_list(self, *, limit: int = 50, offset: int = 0) -> r.ConversationList:
-        """A page of this workspace's live conversations, most recently touched first."""
+        """A page of this workspace's live conversations, most recently touched first.
+
+        A caller whose reader set restricts them sees only the conversations they started. A
+        conversation is answers, and an answer is text from the documents it was built from, so
+        reading somebody else's would read documents through them.
+        """
         store = await self._backend.conversations()
-        found = await store.list_conversations(limit=limit, offset=offset)
+        owner = await self._conversation_owner()
+        if owner == "":
+            found: Sequence[ConversationRecord] = ()
+        else:
+            found = await store.list_conversations(limit=limit, offset=offset, owner=owner)
         return r.ConversationList(
             count=len(found),
             limit=limit,
@@ -7478,8 +7658,11 @@ class ApplicationService:
             UnknownEntityError: No live conversation of that id in this workspace.
         """
         store = await self._backend.conversations()
-        await self._require_conversation(store, conversation_id)
-        turns = await store.history(conversation_id, limit=limit)
+        readers = await self._reader_set()
+        await self._require_conversation(store, conversation_id, readers=readers)
+        turns = await self._readable_turns(
+            await store.history(conversation_id, limit=limit), readers
+        )
         return r.ConversationMessages(
             conversation_id=conversation_id,
             count=len(turns),
@@ -7505,6 +7688,7 @@ class ApplicationService:
             msg = "a conversation title cannot be empty"
             raise ConfigError(msg)
         store = await self._backend.conversations()
+        await self._require_conversation(store, conversation_id)
         if not await store.rename_conversation(conversation_id, wanted):
             raise _no_conversation(conversation_id, self.workspace)
         return r.ConversationRenamed(conversation_id=conversation_id, title=wanted)
@@ -7516,6 +7700,7 @@ class ApplicationService:
             UnknownEntityError: No live conversation of that id in this workspace.
         """
         store = await self._backend.conversations()
+        await self._require_conversation(store, conversation_id)
         if not await store.soft_delete_conversation(conversation_id):
             raise _no_conversation(conversation_id, self.workspace)
         await self._audit(
@@ -7550,6 +7735,7 @@ class ApplicationService:
 
         sharing = self.settings.security.sharing
         require_sharing_enabled(sharing.enabled)
+        await self._require_no_reader_gates_to_share()
         link = new_share(
             conversation_id,
             ttl_s=ttl_s if ttl_s is not None else sharing.link_ttl_s,
@@ -7579,6 +7765,7 @@ class ApplicationService:
             UnknownEntityError: No conversation of that id in this workspace.
         """
         store = await self._backend.conversations()
+        await self._require_conversation(store, conversation_id)
         if not await store.revoke_share(conversation_id):
             raise _no_conversation(conversation_id, self.workspace)
         await self._audit("conversation.unshared", details={"conversation_id": conversation_id})
@@ -7607,7 +7794,11 @@ class ApplicationService:
             now=datetime.now(UTC),
             # Read from configuration on the *read* path, not only at minting: an operator
             # switching sharing off has decided the disclosure already made is the problem.
-            sharing_enabled=self.settings.security.sharing.enabled,
+            # And off while any document here is restricted to some of its readers: a link is
+            # read by whoever holds it, so it can honor no reader set, and a link minted before
+            # the restriction would otherwise go on serving what it now covers.
+            sharing_enabled=self.settings.security.sharing.enabled
+            and not await self._reader_gates_in_force(),
         )
         return r.SharedConversation(
             count=len(turns),
@@ -7656,8 +7847,11 @@ class ApplicationService:
                 msg = f"no such feedback reason {reason!r}. Available: {allowed}"
                 raise ConfigError(msg) from exc
         store = await self._backend.conversations()
-        if not await store.record_feedback(
-            message_id, feedback=rating, reason=chosen, comment=comment
+        # A restricted caller rates only answers in conversations they started, and is refused
+        # anyone else's with the same words as a message that does not exist.
+        owner = await self._conversation_owner()
+        if owner == "" or not await store.record_feedback(
+            message_id, feedback=rating, reason=chosen, comment=comment, owner=owner
         ):
             msg = (
                 f"no message {message_id!r} in workspace {self.workspace!r}. Feedback on an id "
@@ -7666,9 +7860,94 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         return r.FeedbackRecorded(message_id=message_id, recorded=True, feedback=rating.value)
 
-    async def _require_conversation(self, store: Conversing, conversation_id: str) -> None:
-        if await store.get_conversation(conversation_id) is None:
+    async def _require_conversation(
+        self,
+        store: Conversing,
+        conversation_id: str,
+        *,
+        readers: frozenset[str] | _Unresolved | None = UNRESOLVED,
+    ) -> None:
+        """Refuse a conversation that is not there — or, for a restricted caller, not theirs.
+
+        Both refusals are the same refusal, so a restricted caller learns nothing about a
+        conversation they may not open by asking for it.
+        """
+        record = await store.get_conversation(conversation_id)
+        owner = await self._conversation_owner(readers)
+        if record is None or (owner is not None and record.user_id != owner):
             raise _no_conversation(conversation_id, self.workspace)
+
+    async def _conversation_owner(
+        self, readers: frozenset[str] | _Unresolved | None = UNRESOLVED
+    ) -> str | None:
+        """Whose conversations the caller may open: ``None`` for anyone's, ``""`` for nobody's.
+
+        Anyone's for a caller no reader gate applies to, as before readers existed. Their own,
+        for a restricted caller who is a person. Nobody's for a restricted caller who is not —
+        a key nobody owns has started no conversation. ``readers`` is the reader set when the
+        operation has already resolved it, so it is not resolved twice.
+        """
+        held = await self._reader_set() if isinstance(readers, _Unresolved) else readers
+        if held is None:
+            return None
+        return current().user_id or ""
+
+    async def _readable_turns(
+        self, turns: Sequence[Turn], readers: frozenset[str] | None
+    ) -> Sequence[Turn]:
+        """The turns of a conversation the caller may read now.
+
+        An answer is withheld whole, its text included, unless every document it was built from
+        — every one whose passages reached the model, cited or not — and every document it cites
+        is one the caller may read. An answer whose provenance was never recorded is withheld
+        too: what it was built from cannot be named, so it cannot be vouched for. A question is
+        the asker's own text and is always shown. For a caller no gate applies to, every turn.
+        """
+        if readers is None:
+            return turns
+        named = {
+            document_id
+            for turn in turns
+            for document_id in (
+                *(citation.document_id for citation in turn.citations),
+                *(turn.context_documents or ()),
+            )
+        }
+        store = await self._backend.documents()
+        readable = (
+            await store.readable_document_ids(named, readers)
+            if isinstance(store, ReaderStore)
+            else frozenset[str]()
+        )
+
+        def shown(turn: Turn) -> bool:
+            if turn.role != "assistant":
+                return True
+            if turn.context_documents is None:
+                return False
+            built = {*turn.context_documents, *(c.document_id for c in turn.citations)}
+            return built <= readable
+
+        return [turn for turn in turns if shown(turn)]
+
+    async def _reader_gates_in_force(self) -> bool:
+        """Whether any document of this workspace is restricted to some of its readers."""
+        store = await self._backend.documents()
+        return isinstance(store, ReaderStore) and await store.has_reader_gates()
+
+    async def _require_no_reader_gates_to_share(self) -> None:
+        """Refuse to mint a share link while any document here is restricted.
+
+        Raises:
+            PolicyError: A document of this workspace carries a reader gate.
+        """
+        if await self._reader_gates_in_force():
+            msg = (
+                "conversations cannot be shared while some of this workspace's documents are "
+                "restricted to some of its readers. A share link is read by whoever holds it, "
+                "so it cannot honor a reader set."
+            )
+            raise PolicyError(msg)
 
     # --- collections ----------------------------------------------------------------------
 
@@ -7719,8 +7998,11 @@ class ApplicationService:
         """Add documents to a collection.
 
         Raises:
-            UnknownEntityError: No such collection, or a document this workspace cannot see.
+            UnknownEntityError: No such collection, or a document this workspace cannot see —
+                which, for a caller whose reader set restricts them, includes one they may not
+                read.
         """
+        await self._require_readable_ids(list(document_ids))
         store = await self._backend.organization()
         changed = await store.add_to_collection(collection_id, list(document_ids))
         return r.CollectionMembership(
@@ -7733,8 +8015,10 @@ class ApplicationService:
         """Remove documents from a collection.
 
         Raises:
-            UnknownEntityError: No such collection in this workspace.
+            UnknownEntityError: No such collection in this workspace, or a document the caller
+                may not read.
         """
+        await self._require_readable_ids(list(document_ids))
         store = await self._backend.organization()
         changed = await store.remove_from_collection(collection_id, list(document_ids))
         return r.CollectionMembership(
@@ -7823,13 +8107,21 @@ class ApplicationService:
         # would be a second reader of the same rule, free to drift from it. A number that
         # disagrees with the list it claims to count is worse than a slower number.
         chunks = await self._backend.documents()
+        readers = await self._reader_set()
         documents = 0
         counted = 0
         offset = 0
         while True:
-            page = require_owned(
-                self.workspace,
-                await store.collection_documents(collection_id, limit=_COUNT_PAGE, offset=offset),
+            # Counted over what the caller may read. A member they may not read is not one they
+            # may learn exists, and a total is exactly how they would learn it.
+            page = require_readable(
+                readers,
+                require_owned(
+                    self.workspace,
+                    await store.collection_documents(
+                        collection_id, limit=_COUNT_PAGE, offset=offset, readers=readers
+                    ),
+                ),
             )
             if not page:
                 break
@@ -7909,9 +8201,15 @@ class ApplicationService:
         if await store.get_collection(collection_id) is None:
             msg = f"no collection {collection_id!r} in workspace {self.workspace!r}"
             raise UnknownEntityError(msg)
-        found = require_owned(
-            self.workspace,
-            await store.collection_documents(collection_id, limit=limit, offset=offset),
+        readers = await self._reader_set()
+        found = require_readable(
+            readers,
+            require_owned(
+                self.workspace,
+                await store.collection_documents(
+                    collection_id, limit=limit, offset=offset, readers=readers
+                ),
+            ),
         )
         return r.DocumentList(
             count=len(found),
@@ -7977,6 +8275,157 @@ class ApplicationService:
             tags=tuple(_tag(item) for item in await store.tags_for(document_id)),
         )
 
+    # --- readers --------------------------------------------------------------------------
+
+    async def reader_group_create(self, name: str) -> r.ReaderGroupSummary:
+        """Make an empty reader group.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+            NameInUseError: A group by that name exists here already.
+        """
+        store = await self._reader_admin("create a reader group")
+        group = await store.create_reader_group(name)
+        await self._audit("readers.group_created", details={"group": group.id})
+        return _reader_group(group)
+
+    async def reader_group_list(self) -> r.ReaderGroupList:
+        """Every reader group here, and every source granted to any of them.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+        """
+        store = await self._reader_admin("list reader groups")
+        groups = tuple(_reader_group(group) for group in await store.list_reader_groups())
+        return r.ReaderGroupList(
+            count=len(groups), groups=groups, grants=dict(await store.source_grants())
+        )
+
+    async def reader_group_delete(self, group: str) -> r.ReaderGroupDeleted:
+        """Delete a reader group no source is granted to.
+
+        Raises:
+            PolicyError: The caller is not an administrator, or a source is granted to it.
+            UnknownEntityError: No such group here.
+        """
+        store = await self._reader_admin("delete a reader group")
+        deleted = await store.delete_reader_group(group)
+        await self._audit("readers.group_deleted", details={"group": deleted.id})
+        return r.ReaderGroupDeleted(group=_reader_group(deleted), deleted=True)
+
+    async def reader_group_add(self, group: str, users: Sequence[str]) -> r.ReaderGroupSummary:
+        """Put members of this workspace in a reader group.
+
+        Each person is named as :meth:`user_update` names one — an id, a handle, or an address
+        that names exactly one member — and every one is resolved before any is added.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+            UnknownEntityError: No such group, or a name that is no member of this workspace.
+            AmbiguousHandleError: An address names more than one member.
+        """
+        store = await self._reader_admin("change a reader group")
+        members = [(await self._member(user)).id for user in users]
+        changed = await store.add_reader_group_members(group, members)
+        await self._audit("readers.members_added", details={"group": changed.id, "users": members})
+        return _reader_group(changed)
+
+    async def reader_group_remove(self, group: str, users: Sequence[str]) -> r.ReaderGroupSummary:
+        """Take members of this workspace out of a reader group.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+            UnknownEntityError: No such group, or a name that is no member of this workspace.
+            AmbiguousHandleError: An address names more than one member.
+        """
+        store = await self._reader_admin("change a reader group")
+        members = [(await self._member(user)).id for user in users]
+        changed = await store.remove_reader_group_members(group, members)
+        await self._audit(
+            "readers.members_removed", details={"group": changed.id, "users": members}
+        )
+        return _reader_group(changed)
+
+    async def source_grant(self, source: str, groups: Sequence[str]) -> r.SourceReaders:
+        """Restrict a source to the members of ``groups``, in addition to any already granted.
+
+        From the next query on, a document of ``source`` is readable only by a member of a
+        group it is granted to.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+            ValueError: No source, or no group, was named.
+            UnknownEntityError: A group named is not one of this workspace's. Nothing is
+                granted.
+        """
+        store = await self._reader_admin("grant a source")
+        named = _source_and_groups(source, groups)
+        await self._require_known_source(named)
+        granted = await store.grant_source(named, list(groups))
+        await self._audit("readers.source_granted", details={"source": named, "groups": granted})
+        return r.SourceReaders(source=named, groups=granted, restricted=bool(granted))
+
+    async def source_revoke(self, source: str, groups: Sequence[str]) -> r.SourceReaders:
+        """Revoke a source from ``groups``. Revoking its last grant opens it to every reader.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+            ValueError: No source, or no group, was named.
+            UnknownEntityError: A group named is not one of this workspace's.
+        """
+        store = await self._reader_admin("revoke a source")
+        named = _source_and_groups(source, groups)
+        granted = await store.revoke_source(named, list(groups))
+        await self._audit("readers.source_revoked", details={"source": named, "groups": granted})
+        return r.SourceReaders(source=named, groups=granted, restricted=bool(granted))
+
+    async def _require_known_source(self, source: str) -> None:
+        """Refuse a grant on a source this workspace has never heard of.
+
+        A source is known when it is a configured connector instance or when a document here
+        names it. A grant on a misspelled source would report the source restricted while every
+        document of the real one stayed readable by everyone.
+
+        Raises:
+            UnknownEntityError: Neither. The message lists the sources that are known.
+        """
+        documents = await self._backend.documents()
+        known = set(self.settings.connectors) | set(
+            (await documents.document_statistics()).get("by_source", {})
+        )
+        if source not in known:
+            listed = ", ".join(repr(name) for name in sorted(known)) or "none"
+            msg = (
+                f"no source {source!r} in workspace {self.workspace!r}: it is neither a "
+                f"configured connector nor the source of any document. Known sources: "
+                f"{listed}. A grant on a name nothing uses would restrict nothing."
+            )
+            raise UnknownEntityError(msg)
+
+    async def _reader_admin(self, action: str) -> ReaderStore:
+        """This workspace's reader store, for an administrator.
+
+        Checked here as well as at each surface, for :meth:`_require_admin_to_span`'s reason:
+        who may read what is an administrator's decision on every surface at once.
+
+        Raises:
+            PolicyError: The caller is not an administrator.
+            ConfigError: The document store keeps no reader groups.
+        """
+        caller = current()
+        if not caller.holds(Role.ADMIN):
+            held = caller.role.value if caller.role is not None else "none"
+            msg = f"to {action} needs the 'admin' role, and this caller holds {held!r}."
+            raise PolicyError(msg)
+        store = await self._backend.documents()
+        if not isinstance(store, ReaderStore):
+            msg = (
+                f"the configured document store {type(store).__name__} keeps no reader groups, "
+                f"so every document it holds is readable by every reader of the workspace."
+            )
+            raise ConfigError(msg)
+        return store
+
     # --- the trash ------------------------------------------------------------------------
 
     async def document_trash(self, *, limit: int = 50, offset: int = 0) -> r.TrashList:
@@ -7990,6 +8439,7 @@ class ApplicationService:
             grace_s=self.settings.ingest.soft_delete_grace_s, limit=limit, offset=offset
         )
         require_owned(self.workspace, [entry.document for entry in entries])
+        entries = await self._readable_entries(entries)
         return r.TrashList(
             count=len(entries),
             limit=limit,
@@ -8015,6 +8465,7 @@ class ApplicationService:
             UnknownEntityError: Nothing was restored. The reason is in the message: no such
                 document, or one that is not in the trash.
         """
+        await self._require_readable_ids([document_id])
         store = await self._backend.organization()
         restoration = await store.restore_document(document_id)
         if not restoration.restored:
@@ -8025,6 +8476,23 @@ class ApplicationService:
             needs_reparse=restoration.needs_reparse,
             reason=restoration.reason,
         )
+
+    async def _readable_entries(self, entries: Sequence[TrashEntry]) -> Sequence[TrashEntry]:
+        """The trash entries whose document the caller may read.
+
+        Filtered after the page is read, so a restricted caller's page of the trash can hold
+        fewer than ``limit`` entries while more remain. The trash is an administrative view of
+        what is about to be purged, and a short page is the honest cost of not naming a
+        document the caller may not read; ``count`` reports what the page holds.
+        """
+        readers = await self._reader_set()
+        store = await self._backend.documents()
+        if readers is None or not isinstance(store, ReaderStore):
+            return entries
+        readable = await store.readable_document_ids(
+            [entry.document.id for entry in entries], readers
+        )
+        return [entry for entry in entries if entry.document.id in readable]
 
     # --- the workbench --------------------------------------------------------------------
 
@@ -9006,9 +9474,9 @@ class ApplicationService:
     # --- helpers --------------------------------------------------------------------------
 
     async def _require_document(self, document_id: str) -> None:
-        """Prove a document is live and this tenant's before anything is attached to it."""
+        """Prove a document is live, this tenant's and readable before anything is attached."""
         store = await self._backend.documents()
-        document = await store.get_document(document_id)
+        document = await self._visible(await store.get_document(document_id))
         if document is None:
             msg = f"no live document {document_id!r} in workspace {self.workspace!r}"
             raise UnknownEntityError(msg)
@@ -9148,8 +9616,14 @@ class ApplicationService:
         media_types: Sequence[str] = (),
         collection_ids: Sequence[str] = (),
         workspaces: Sequence[str] = (),
+        readers: frozenset[str] | None,
     ) -> Query:
         """Build a query already carrying this workspace — or the ones an administrator named.
+
+        ``readers`` is the caller's reader set (:meth:`_reader_set`), and it has no default for
+        the reason the workspace has none: a query that can be built without it is a query that
+        can be run without it. ``None`` is a caller no gate applies to, and it is an answer
+        :meth:`_reader_set` gives rather than an omission.
 
         The filter has no default workspace and cannot be built without one, so there is no
         path from here to an unscoped search. ``workspaces`` is set only by
@@ -9182,8 +9656,103 @@ class ApplicationService:
                 sources=frozenset(sources),
                 media_types=frozenset(media_types),
                 collection_ids=frozenset(collection_ids),
+                readers=readers,
             ),
         )
+
+    async def _generation(self) -> int | None:
+        """The store's generation now, so a refusal on the way out can tell a race from a leak."""
+        return _generation_of(await self._backend.documents())
+
+    async def _reader_set(self) -> frozenset[str] | None:
+        """The caller's reader set in this workspace (:mod:`manicule.core.readers`).
+
+        See :func:`_reader_set_of`, which is the rule; this is it for the workspace served.
+        """
+        return await _reader_set_of(await self._backend.documents())
+
+    async def _visible(self, document: Document | None) -> Document | None:
+        """``document`` if the caller may read it, and ``None`` if not — exactly as if absent.
+
+        For the operations that name one document by id. Two checks, as everywhere else: the
+        store is asked again with the caller's reader set as a predicate, and the gates the
+        document comes back carrying are then read on the row in hand. ``None`` rather than a
+        refusal of its own, because a refusal worded differently from "there is no such
+        document" would tell the caller that there is one.
+        """
+        if document is None:
+            return None
+        readers = await self._reader_set()
+        if readers is None:
+            return document
+        store = await self._backend.documents()
+        listed = (await _documents_in(store, self.workspace, [document.id], readers=readers)).get(
+            document.id
+        )
+        if listed is None or not admits(readers, listed.access):
+            return None
+        return listed
+
+    async def _visible_all(
+        self, documents: Sequence[Document], readers: frozenset[str] | None
+    ) -> list[Document]:
+        """The documents of ``documents`` the caller may read, as :meth:`_visible` decides.
+
+        One store read for all of them rather than one each, under a reader set already
+        resolved.
+        """
+        if readers is None:
+            return list(documents)
+        store = await self._backend.documents()
+        listed = await _documents_in(
+            store, self.workspace, [document.id for document in documents], readers=readers
+        )
+        return [
+            listed[document.id]
+            for document in documents
+            if document.id in listed and admits(readers, listed[document.id].access)
+        ]
+
+    async def _require_readable_source(self, source: str) -> None:
+        """Refuse to write into a source the caller may not read.
+
+        Authoring reports whether a slug is already taken and can overwrite what holds it, so a
+        caller writing into a source restricted away from them would learn what it holds and
+        could replace text they may not read.
+
+        Raises:
+            PolicyError: The source is granted to reader groups the caller is in none of.
+        """
+        readers = await self._reader_set()
+        store = await self._backend.documents()
+        if readers is None or not isinstance(store, ReaderStore):
+            return
+        if not await store.may_read_source(source, readers):
+            msg = (
+                f"source {source!r} is restricted to reader groups this caller is not in, so "
+                f"this caller cannot write into it: authoring reads what a slug already holds."
+            )
+            raise PolicyError(msg)
+
+    async def _require_readable_ids(self, document_ids: Sequence[str]) -> None:
+        """Refuse an operation naming a document the caller may not read, as if it were absent.
+
+        Raises:
+            UnknownEntityError: Worded as the store words a document it cannot see, and naming
+                only ids the caller sent.
+        """
+        readers = await self._reader_set()
+        if readers is None or not document_ids:
+            return
+        store = await self._backend.documents()
+        if not isinstance(store, ReaderStore):  # pragma: no cover - no gates without one
+            return
+        readable = await store.readable_document_ids(document_ids, readers)
+        missing = [document_id for document_id in document_ids if document_id not in readable]
+        if missing:
+            named = ", ".join(repr(document_id) for document_id in dict.fromkeys(missing))
+            msg = f"no live document {named} in workspace {self.workspace!r}"
+            raise UnknownEntityError(msg)
 
     async def _collection_scope(self, names: Sequence[str]) -> frozenset[str]:
         """Resolve collection names to ids, refusing any name that is not a collection here.
@@ -9218,7 +9787,9 @@ class ApplicationService:
             resolved.add(found.id)
         return frozenset(resolved)
 
-    async def _require_scoped_context(self, retrieved: RetrievalResult) -> dict[str, Document]:
+    async def _require_scoped_context(
+        self, retrieved: RetrievalResult, readers: frozenset[str] | None, *, since: int | None
+    ) -> dict[str, Document]:
         """Prove every retrieved passage belongs to this workspace, before anything leaves.
 
         Returns the documents it resolved, which it previously discarded. Every document a
@@ -9229,10 +9800,14 @@ class ApplicationService:
         read on a canceled path is a second failure mode on top of the first.
         """
         return await self._require_scoped_chunks(
-            candidate.chunk for candidate in retrieved.context.passages
+            (candidate.chunk for candidate in (*retrieved.context.passages, *retrieved.candidates)),
+            readers,
+            since=since,
         )
 
-    async def _require_scoped_chunks(self, chunks: Iterable[Chunk]) -> dict[str, Document]:
+    async def _require_scoped_chunks(
+        self, chunks: Iterable[Chunk], readers: frozenset[str] | None, *, since: int | None = None
+    ) -> dict[str, Document]:
         """Resolve each chunk's document through the scoped store and check its identity.
 
         Two independent facts have to hold, and neither implies the other: the store must be
@@ -9240,21 +9815,34 @@ class ApplicationService:
         and the document's id must be a digest of *this* workspace. A store that ignored its
         scope passes the first and fails the second.
 
+        A third holds when the caller's reader set restricts them: every document must admit
+        that reader set through the gates it came back carrying. That check reads the row in
+        hand and nothing else — the lookup deliberately does not apply the reader predicate, so
+        a retrieval that let an unreadable document through is caught here rather than
+        mistaken for a missing one.
+
         Raises:
             CrossWorkspaceError: A chunk points at a document this workspace does not own.
+            UnreadableDocumentError: A chunk points at a document the caller may not read.
         """
         return await self._require_scoped_in(
-            await self._backend.documents(), self.workspace, chunks
+            await self._backend.documents(), self.workspace, chunks, readers, since=since
         )
 
     @staticmethod
     async def _require_scoped_in(
-        store: DocumentSurface, workspace: str, chunks: Iterable[Chunk]
+        store: DocumentSurface,
+        workspace: str,
+        chunks: Iterable[Chunk],
+        readers: frozenset[str] | None,
+        *,
+        since: int | None = None,
     ) -> dict[str, Document]:
         """:meth:`_require_scoped_chunks` for ``workspace``, through ``store`` — its own handle.
 
         Raises:
             CrossWorkspaceError: A chunk points at a document ``workspace`` does not own.
+            UnreadableDocumentError: A chunk points at a document the caller may not read.
         """
         wanted = list(dict.fromkeys(chunk.document_id for chunk in chunks))
         if not wanted:
@@ -9269,9 +9857,27 @@ class ApplicationService:
             )
             raise CrossWorkspaceError(msg)
         require_owned(workspace, found.values())
+        try:
+            require_readable(readers, found.values())
+        except UnreadableDocumentError as refused:
+            unreadable = [d.id for d in found.values() if not admits(readers, d.access)]
+            moved = since is not None and _generation_of(store) != since
+            if moved and not await _documents_in(store, workspace, unreadable, readers=readers):
+                # The store, asked again now, excludes every one of them too: a grant landed
+                # between retrieval and this check. That is an ordinary race, not a store that
+                # ignored the reader set — which would still be returning them — and nothing
+                # was returned either way.
+                msg = (
+                    "who may read some of this workspace's documents changed while this request "
+                    "was running, so nothing was returned. Retry the same request."
+                )
+                raise StorageBusyError(msg) from refused
+            raise
         return found
 
-    async def _scoped_documents(self, document_ids: Iterable[str]) -> dict[str, Document]:
+    async def _scoped_documents(
+        self, document_ids: Iterable[str], *, readers: frozenset[str] | None
+    ) -> dict[str, Document]:
         """The documents of ``document_ids`` this workspace can see, keyed by id.
 
         One query rather than one per document. ``document_ids`` is a field the store honors,
@@ -9284,7 +9890,9 @@ class ApplicationService:
         glossary entry whose document is missing is a race and must be dropped. Deciding here
         would force one of them to un-decide it.
         """
-        return await _documents_in(await self._backend.documents(), self.workspace, document_ids)
+        return await _documents_in(
+            await self._backend.documents(), self.workspace, document_ids, readers=readers
+        )
 
     def _answer_payload(
         self,
@@ -10165,24 +10773,98 @@ def _hit(candidate: Candidate, documents: Mapping[str, Document], *, workspace: 
 
 
 async def _documents_in(
-    store: DocumentSurface, workspace: str, document_ids: Iterable[str]
+    store: DocumentSurface,
+    workspace: str,
+    document_ids: Iterable[str],
+    *,
+    readers: frozenset[str] | None = None,
 ) -> dict[str, Document]:
     """The documents of ``document_ids`` that ``workspace``'s store can see, keyed by id.
 
     One query rather than one per document, and it returns what was found and says nothing
     about what was not — see :meth:`ApplicationService._scoped_documents` for why each caller
-    decides that for itself.
+    decides that for itself. ``readers`` narrows it to what that reader set may read; left out,
+    every document comes back carrying its gates, for a caller that checks them itself.
     """
     asked = frozenset(document_ids)
     if not asked:
         return {}
     page = await store.list_documents(
-        Filter(workspace_ids=frozenset({workspace}), document_ids=asked), limit=len(asked)
+        Filter(workspace_ids=frozenset({workspace}), document_ids=asked, readers=readers),
+        limit=len(asked),
     )
     # Restricted to what was asked for. A store that returns more than the filter allowed is a
     # defect its own conformance suite owns; here the question is only which of the requested
     # documents came back.
     return {document.id: document for document in page if document.id in asked}
+
+
+def _reader_group(group: ReaderGroup) -> r.ReaderGroupSummary:
+    return r.ReaderGroupSummary(
+        id=group.id, name=group.name, members=group.members, sources=group.sources
+    )
+
+
+def _source_and_groups(source: str, groups: Sequence[str]) -> str:
+    """The source named, once both a source and at least one group were.
+
+    Raises:
+        ValueError: The source is blank, or no group was named. A grant to nobody would read
+            as restricting the source to nobody and do nothing at all.
+    """
+    named = source.strip()
+    if not named:
+        msg = "name the source to grant or revoke; it was empty"
+        raise ValueError(msg)
+    if not groups:
+        msg = f"name at least one reader group to grant or revoke {named!r} for"
+        raise ValueError(msg)
+    return named
+
+
+def _generation_of(store: object) -> int | None:
+    """The generation counter of ``store``, or ``None`` for one that keeps none."""
+    return store.generation if isinstance(store, SupportsGeneration) else None
+
+
+async def _reader_set_of(store: object) -> frozenset[str] | None:
+    """The reader set of the caller in progress, in the workspace ``store`` serves.
+
+    ``None`` — nothing restricts this caller — in three cases, and in each of them it is the
+    answer rather than a fallback: the operator at this machine, who holds every authority the
+    process has; a store that keeps no reader gates (:class:`~manicule.app.ports.ReaderStore`);
+    and a workspace where no document carries a gate, which is every workspace of an
+    installation that configured none. That last case is what keeps such an installation
+    reading exactly as it did before readers existed: no predicate, and the same cache keys.
+
+    Otherwise the caller is restricted. A person holds themself and each group they are in. A
+    caller with no person behind them — a key nobody owns — holds nothing, and so reads only
+    what carries no gate: there is nobody to put in a group. Administrators are not exempt; an
+    administrator who needs to read a restricted source can join a group granted it, and that
+    is recorded where every membership change is.
+    """
+    caller = current()
+    if caller.is_local or not isinstance(store, ReaderStore):
+        return None
+    if not await store.has_reader_gates():
+        return None
+    if caller.user_id is None:
+        return frozenset()
+    return await store.reader_principals(caller.user_id)
+
+
+async def _reader_set_across(opened: Sequence[OpenedWorkspace]) -> frozenset[str] | None:
+    """One reader set for a search spanning ``opened``: the union of the caller's in each.
+
+    Safe to union because a group principal names a group by its id, which is unique across the
+    installation, and a workspace's store finds no grant naming another workspace's group. It
+    is ``None`` only when every workspace's is.
+    """
+    held = [await _reader_set_of(workspace.documents) for workspace in opened]
+    restricted = [readers for readers in held if readers is not None]
+    if not restricted:
+        return None
+    return frozenset[str]().union(*restricted)
 
 
 def _millis(started: float) -> int:

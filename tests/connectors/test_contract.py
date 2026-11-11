@@ -217,6 +217,7 @@ def test_the_plugin_registers_the_sources_this_build_ships() -> None:
         "gmail",
         "mbox",
         "outlook",
+        "trilium",
     ]
 
 

@@ -535,6 +535,15 @@ is a feature list entry, not a feature.
   `message/rfc822` or `application/vnd.ms-outlook` document refuses an unauthenticated server
   too, whichever connector indexed it. Outlook PST has no reader: the documented recipe
   converts with `readpst` outside manicule. `docs/connectors/mbox.md`.
+- `connectors.<name>` with `type = "trilium"` — a Trilium Notes server (the TriliumNext line),
+  read-only over ETAPI with a token: one document per `text`, `code` or `mermaid` note, identified
+  by its note id so a rename, move or clone leaves one document. ETAPI has no change feed, so every
+  run sweeps every note's metadata in one request and reads the content only of notes whose
+  version token changed; a response that may have been cut off (`max_notes`) is refused rather
+  than trusted. Scope is `root_note_ids` and `exclude_labels` (default `manicule_skip`), judged on
+  every path to a note, with `#archived` left out unless `include_archived`. Protected notes are
+  never read. A note deleted, archived, excluded or protected leaves the index at the next
+  reconciliation. Registered as sensitive like `gmail` and `mbox`. `docs/connectors/trilium.md`.
 - Mail attachments are routed by what they are rather than what the sender's client called
   them: a generic or legacy declaration (`application/octet-stream`, `application/msword` on a
   `.docx`) yields to the filename extension, confirmed by the bytes, then to the bytes; declared

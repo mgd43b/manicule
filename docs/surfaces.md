@@ -341,6 +341,8 @@ server and the built command tree.
 | `auth_add_user` | — | `auth add-user HANDLE [--role] [--password]` | the person, and either the password they sign in with (`--password` prompts for it, never an argument) or their first key, secret shown once (HTTP: `POST /api/v1/auth/users`, op `user_create`; a browser signs in at `POST /auth/password`, op `sign_in_with_password`, or `POST /auth/key`, op `sign_in_with_key`) |
 | `auth_set_password` | — | `auth set-password USER` | the person, with every browser session they held ended; prompts for the password, never an argument (HTTP: `PUT /api/v1/auth/users/{user}/password`, op `user_set_password`; a person changes their own at `POST /api/v1/auth/password`, op `password_change`) |
 | `auth_users` / `auth_set_role` / `auth_disable_user` / `auth_enable_user` / `auth_sign_out` | — | `auth users`, `auth set-role`, `auth disable-user`, `auth enable-user`, `auth sign-out` | members of this workspace, and what a change took with it |
+| `readers_create` / `readers_list` / `readers_delete` / `readers_add` / `readers_remove` | — | `readers create NAME`, `readers list`, `readers delete GROUP`, `readers add GROUP USER…`, `readers remove GROUP USER…` | reader groups, their members, and the sources granted to each; administrators only, and deleting a group still granted a source is refused |
+| `readers_grant` / `readers_revoke` | — | `readers grant SOURCE GROUP…`, `readers revoke SOURCE GROUP…` | which groups a source is now granted to, and whether it is restricted at all ([`deployment.md` §1.2](deployment.md#12-who-can-read-what-is-indexed)) |
 
 ### 4.0.1 Shared lifecycle status
 
@@ -1291,7 +1293,9 @@ the wide-bind rule is not: `manicule index` in a team installation opens no sock
 
 #### Sensitive sources take the way out away
 
-The index is not permission-aware: whoever can search a workspace reads everything in it. A
+Whoever can search a workspace reads everything in it that no reader group restricts
+([`deployment.md` §1.2](deployment.md#12-who-can-read-what-is-indexed)), and with
+`security.auth.mode = none` every caller is the operator, whom no grant restricts. A
 connector type can register as **sensitive** (`ComponentRegistry.add(..., sensitive=True)`;
 `gmail` and `mbox` do), because a mailbox is one person's and loopback reaches every other local
 account and process. An installation with `security.auth.mode = none` is then refused wherever a
@@ -1793,10 +1797,12 @@ unsafe method from another origin runs before routing on every route — `POST /
 included. CORS never allows credentials, so a listed origin such as the widget's presents a key
 instead.
 
-**What a role is, and is not.** Team mode does not make the index permission-aware. Every member
-of a workspace can read the whole workspace; roles decide what a person may *do* — `viewer`
-reads, `member` writes, `admin` administers people, keys and the installation — not which
-documents they may see. A corpus some people must not read belongs in another workspace.
+**What a role is, and is not.** Roles decide what a person may *do* — `viewer` reads, `member`
+writes, `admin` administers people, keys and the installation — not which documents they may
+see. **Reader groups** decide that: a source an administrator granted to groups is readable only
+by their members, on every surface and for every role, administrators included
+([`deployment.md` §1.2](deployment.md#12-who-can-read-what-is-indexed)). A source with no grant is
+readable by every member of the workspace.
 
 **Signing in without a provider (`api_key`).** A person can sign a browser in with a handle and
 password, or with an API key they hold, without a provider. Both need the same two settings, and

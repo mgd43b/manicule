@@ -131,6 +131,46 @@ async def test_the_leg_satisfies_the_pipeline_scope_assertion(
     assert {candidate.chunk.id for candidate in kept} == {chunk.id for chunk in live}
 
 
+@pytest.mark.parametrize("prefilter_id_limit", [1, 1000])
+async def test_a_document_the_reader_set_may_not_read_never_leaves_the_leg(
+    store: SqliteDocStore, prefilter_id_limit: int
+) -> None:
+    """Ranked first by the vector table, which has no column for readers, and still dropped.
+
+    Run in both regimes: with the readable documents resolved into ids pushed down to the
+    vector store, and with too many to push down, where only the hydrating join stands between
+    the restricted chunks and the caller.
+    """
+    gated = make_document(source="restricted", source_id="gated")
+    await store.upsert_document(gated)
+    hidden = [make_chunk(gated, position, f"authentication {position}") for position in range(3)]
+    await store.replace_chunks(gated.id, hidden)
+    visible: list[Chunk] = []
+    for source_id in ("shown", "also-shown"):
+        shown = make_document(source="open", source_id=source_id)
+        await store.upsert_document(shown)
+        chunk = make_chunk(shown, 0, f"authentication {source_id}")
+        await store.replace_chunks(shown.id, [chunk])
+        visible.append(chunk)
+    group = await store.create_reader_group("editors")
+    await store.grant_source("restricted", [group.id])
+    stage = _stage(
+        store,
+        ListVectorStore([*hidden, *visible]),
+        config=DenseConfig(prefilter_id_limit=prefilter_id_limit),
+    )
+    query = Query(
+        text="authentication", limit=3, filter=Filter(workspace_ids=SCOPE, readers=frozenset())
+    )
+
+    with installed() as frame:
+        kept = await assert_pipeline_enforces_scope([stage], store, query)
+        report = DenseReport.model_validate(frame.take_diagnostics())
+
+    assert {candidate.chunk.id for candidate in kept} == {chunk.id for chunk in visible}
+    assert report.regime is (Regime.POSTFILTER if prefilter_id_limit == 1 else Regime.PREFILTER)
+
+
 async def test_a_pending_document_is_invisible_to_the_leg(store: SqliteDocStore) -> None:
     """A document mid-ingest has chunks whose vectors and text need not agree yet."""
     waiting = make_document(source_id="waiting", status=DocumentStatus.PENDING)

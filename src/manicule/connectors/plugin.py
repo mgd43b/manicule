@@ -22,14 +22,17 @@ from manicule.connectors.config import (
     GMAIL_CONNECTOR_NAME,
     MBOX_CONNECTOR_NAME,
     SNAPSHOT_CONNECTOR_NAME,
+    TRILIUM_CONNECTOR_NAME,
     ConfluenceConfig,
     ConfluenceSnapshotConfig,
     FilesystemConfig,
     GitSiteConfig,
     GmailConfig,
     MboxConfig,
+    TriliumConfig,
     resolve_credentials,
     resolve_gmail_credentials,
+    resolve_trilium_token,
 )
 from manicule.connectors.outlook_config import (
     OUTLOOK_CONNECTOR_NAME,
@@ -53,6 +56,7 @@ __all__ = [
     "build_gmail",
     "build_mbox",
     "build_outlook",
+    "build_trilium",
 ]
 
 
@@ -355,6 +359,36 @@ def build_mbox(context: BuildContext) -> Connector:
     )
 
 
+def build_trilium(context: BuildContext) -> Connector:
+    """Construct the Trilium Notes connector from validated configuration.
+
+    The token is resolved and checked **here**, before construction, for the reason
+    :func:`build_confluence` gives: a connector that discovers its missing token at the first
+    request of the first sync produces a run that reports progress and indexes nothing.
+
+    Raises:
+        ConfigError: The context carries configuration of some other type, or no token is set
+            or in the environment.
+    """
+    from manicule.connectors.trilium import TriliumConnector  # noqa: PLC0415
+    from manicule.connectors.trilium_client import TriliumClient  # noqa: PLC0415
+
+    settings = context.config
+    if not isinstance(settings, TriliumConfig):
+        msg = (
+            f"connector {TRILIUM_CONNECTOR_NAME!r} was built with {type(settings).__name__} "
+            f"where it declares TriliumConfig."
+        )
+        raise ConfigError(msg)
+    resolved = resolve_trilium_token(settings, instance=context.instance)
+    return TriliumConnector(
+        resolved,
+        TriliumClient(resolved),
+        name=_source_name(context, TRILIUM_CONNECTOR_NAME),
+        max_note_bytes=context.settings.ingest.max_fetch_bytes,
+    )
+
+
 class ConnectorsPlugin:
     """The plugin object the ``connectors`` entry point resolves to."""
 
@@ -363,7 +397,7 @@ class ConnectorsPlugin:
         version="0.1.0",
         core_version=">=0.1,<0.3",
         summary="Sources manicule ingests from: files, Git sites, Confluence, Gmail, Outlook, "
-        "mbox.",
+        "mbox and Trilium.",
     )
 
     def register(self, registry: ComponentRegistry) -> None:
@@ -420,6 +454,16 @@ class ConnectorsPlugin:
             "identified by a digest of its bytes, with messages another mail source holds skipped.",
             # The same refusal as `gmail`: the index is not permission-aware
             # (`docs/connectors/mbox.md` §7).
+            sensitive=True,
+        )
+        registry.add(
+            keys.CONNECTOR.named(TRILIUM_CONNECTOR_NAME),
+            build_trilium,
+            config_model=TriliumConfig,
+            summary="A Trilium Notes server, read-only over ETAPI: one document per note, "
+            "identified by its note id, with deletions removed by a complete sweep.",
+            # Personal notes are where passwords and second thoughts end up, and the index is
+            # not permission-aware (`docs/connectors/trilium.md` §7).
             sensitive=True,
         )
 

@@ -7,7 +7,7 @@ defect it was written for, which is what makes it worth the later tickets' time.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 
@@ -16,7 +16,11 @@ from manicule.core.content import BlockKind, Chunk, DocumentStatus, ParsedBlock
 from manicule.core.embedding import Vector, require_within_context
 from manicule.core.errors import ContextOverflowError
 from manicule.core.ids import chunk_id
+from manicule.core.protocols import DocStore
+from manicule.core.readers import group_principal
 from manicule.core.retrieval import Candidate, Filter, Query
+from manicule.retrieval.hydration import visible_documents
+from manicule.retrieval.prefilter import join_filter
 from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
 from manicule.testing import (
     assert_chunker_contract,
@@ -512,6 +516,104 @@ async def test_a_pipeline_returning_a_pending_document_is_caught(
 
     with pytest.raises(AssertionError, match="rather than 'indexed'"):
         await assert_pipeline_enforces_scope([RawVectorStage([chunk])], store, _query())
+
+
+# --- the reader boundary -----------------------------------------------------------------
+
+
+async def _reader_fixture(store: SqliteDocStore) -> tuple[Chunk, Chunk]:
+    """One open chunk, and one a reader holding no group may not read.
+
+    The restricted one is live, ``indexed`` and in this workspace — it passes every check the
+    workspace case makes — so the only thing that can exclude it is the reader set.
+    """
+    chunks: list[Chunk] = []
+    for source in ("open", "restricted"):
+        document = make_stored_document(source=source, source_id=source)
+        await store.upsert_document(document)
+        chunk = make_stored_chunk(document, 0, f"authentication {source}")
+        await store.replace_chunks(document.id, [chunk])
+        chunks.append(chunk)
+    group = await store.create_reader_group("editors")
+    await store.grant_source("restricted", [group.id])
+    return chunks[0], chunks[1]
+
+
+def _reader_query(readers: frozenset[str]) -> Query:
+    return Query(
+        text="authentication",
+        filter=Filter(workspace_ids=frozenset({DEFAULT_WORKSPACE}), readers=readers),
+    )
+
+
+class ReaderAwareStage(RawVectorStage):
+    """The same search, joined back through the reader-aware hydrating join."""
+
+    name = "reader_aware_vector"
+
+    def __init__(self, chunks: Sequence[Chunk], docstore: DocStore) -> None:
+        super().__init__(chunks)
+        self._docstore = docstore
+
+    @override
+    async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
+        found = await super().run(query, candidates)
+        visible = await visible_documents(
+            self._docstore,
+            join_filter(query.filter),
+            [candidate.chunk.document_id for candidate in found],
+        )
+        return [candidate for candidate in found if candidate.chunk.document_id in visible]
+
+
+@pytest.mark.contract
+async def test_a_pipeline_that_hydrates_through_the_reader_aware_join_passes(
+    store: SqliteDocStore,
+) -> None:
+    """The check admits the stage the design calls for, and that stage drops the gated one."""
+    open_chunk, restricted = await _reader_fixture(store)
+
+    kept = await assert_pipeline_enforces_scope(
+        [ReaderAwareStage([open_chunk, restricted], store)], store, _reader_query(frozenset())
+    )
+
+    assert [candidate.chunk.id for candidate in kept] == [open_chunk.id]
+
+
+@pytest.mark.contract
+async def test_a_stage_that_skipped_the_reader_half_of_the_join_is_caught(
+    store: SqliteDocStore,
+) -> None:
+    """A join that checks workspace, deletion and status — and not readers — leaks.
+
+    :class:`HydratingStage` is exactly the join this check accepted before readers existed. It
+    passes the workspace case and must fail this one, with the reader message rather than any
+    of the others, because the restricted document is excluded by nothing else.
+    """
+    open_chunk, restricted = await _reader_fixture(store)
+
+    with pytest.raises(AssertionError, match="the query's reader set may not read"):
+        await assert_pipeline_enforces_scope(
+            [HydratingStage([open_chunk, restricted], store)], store, _reader_query(frozenset())
+        )
+
+
+@pytest.mark.contract
+async def test_a_member_of_the_granted_group_reads_the_restricted_document(
+    store: SqliteDocStore,
+) -> None:
+    """The same skipped join is not caught for a reader it would not have wronged."""
+    open_chunk, restricted = await _reader_fixture(store)
+    group = await store.find_reader_group("editors")
+    assert group is not None
+
+    kept = await assert_pipeline_enforces_scope(
+        [HydratingStage([open_chunk, restricted], store)],
+        store,
+        _reader_query(frozenset({group_principal(group.id)})),
+    )
+
+    assert {candidate.chunk.id for candidate in kept} == {open_chunk.id, restricted.id}
 
 
 @pytest.mark.contract
