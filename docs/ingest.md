@@ -2490,9 +2490,10 @@ correctly refuses.
 subtree and indexes the rest, which is right for indexing. Reconciliation treats absence as
 deletion, so the filesystem and Confluence-snapshot connectors walk strictly when they reconcile:
 a directory they cannot list (or a root that has vanished) raises, the inventory is canceled and
-nothing is deleted. The git-site connector pins a fresh inventory of the configured revision for a
-pass that does not follow a discovery in its own task, so a pass after a restart works and a pass
-after a sync sees the pages the revision has since dropped.
+nothing is deleted. The git-site and git-docs connectors pin a fresh inventory of the configured
+revision for a pass that does not follow a discovery in its own task, so a pass after a restart
+works and a pass after a sync sees the pages the revision has since dropped. For a remote, git-docs
+fetches first, and a fetch that fails raises, so it deletes nothing.
 
 **Discard restarts the interval and is not a clean pass.** It records `last_discarded_reconcile_at`
 and leaves `last_clean_reconcile_at` alone, so `connector list` does not report a deletion check
