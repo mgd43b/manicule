@@ -17,6 +17,11 @@ every cascade that points at it.
 The grant's foreign key to its group carries no ``ON DELETE`` action, on purpose: a cascade
 would delete a source's last grant with its group and so open the source to everyone.
 
+**``messages`` gains a nullable ``context_documents``**: the documents whose passages an answer
+was built from, so that a stored answer can be withheld from a reader who may not read one of
+them. A plain ``ADD COLUMN`` with no constraint, so no rebuild. Every existing row records
+``NULL``, which a restricted reader is never shown.
+
 Revision ID: e7a3c9d14b52
 Revises: d2f5b8e31a64
 Created: 2026-11-10 09:00:00.000000
@@ -38,6 +43,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.add_column("messages", sa.Column("context_documents", sa.JSON(), nullable=True))
     op.create_table(
         "reader_groups",
         sa.Column("id", sa.Text(), nullable=False),
@@ -109,3 +115,5 @@ def downgrade() -> None:
     op.drop_index("ix_reader_group_members_user_id", table_name="reader_group_members")
     op.drop_table("reader_group_members")
     op.drop_table("reader_groups")
+    with op.batch_alter_table("messages") as batch_op:
+        batch_op.drop_column("context_documents")

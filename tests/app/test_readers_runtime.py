@@ -15,18 +15,23 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from manicule.app.caller import Caller, acting_as
+from manicule.app.caller import LOCAL, Caller, acting_as
 from manicule.app.runtime import Runtime
 from manicule.app.service import ApplicationService
 from manicule.app.tenancy import UnreadableDocumentError
 from manicule.config.settings import AuthoringSettings, ConnectorSettings, Role, Settings
 from manicule.container import keys
-from manicule.core.errors import PolicyError, UnknownEntityError
+from manicule.core.errors import PolicyError, StorageBusyError, UnknownEntityError
 from manicule.core.ids import document_id
+from manicule.generation.ports import StoredMessage
 from manicule.plugins.registry import discover
 from manicule.storage import docstore as docstore_module
+from manicule.storage import models
+from manicule.storage.conversations import SqliteConversationStore
+from manicule.storage.docstore import SqliteDocStore
 from tests.fakes import HashEmbedder
 from tests.generation.fakes import ScriptedGenerator
+from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -455,6 +460,170 @@ async def test_a_reader_cannot_author_into_a_source_they_may_not_read(
         await service.document_create(collection="memories", slug="ledger", body="figures")
 
     assert list((manicule_environment / "authored").rglob("*.md")) == []
+
+
+async def test_a_stored_answer_is_held_to_everything_it_was_built_from(
+    opened: Runtime, service: ApplicationService, restricted: People
+) -> None:
+    """Cited or not: the text of an answer is built from every passage the model was given.
+
+    Three stored answers, none citing anything: one built from the restricted document, one
+    built from nothing, and one written before provenance was recorded. A reader outside the
+    group sees only the second; a member sees the first two; the operator sees all three.
+    """
+    with acting_as(viewer(restricted.erin)):
+        mine = await service.conversation_create(title="budget")
+    store = await opened.conversations()
+    assert isinstance(store, SqliteConversationStore)
+    for content, built in (
+        ("from the budget", (RESTRICTED_ID,)),
+        ("from nothing", ()),
+        ("from before provenance", None),
+    ):
+        await store.append(
+            StoredMessage(
+                conversation_id=mine.id,
+                role="assistant",
+                content=content,
+                context_documents=built,
+            )
+        )
+    shown: dict[str, set[str]] = {}
+    for name, caller in (("erin", viewer(restricted.erin)), ("operator", None)):
+        if caller is None:
+            turns = await service.conversation_messages(mine.id)
+        else:
+            with acting_as(caller):
+                turns = await service.conversation_messages(mine.id)
+        shown[name] = {turn.content for turn in turns.turns}
+    # Handed to Vic, so that only the reader set, not the ownership rule, decides what he sees.
+    documents = await opened.documents()
+    assert isinstance(documents, SqliteDocStore)
+    async with documents.sessions.begin() as session:
+        conversation = await session.get(models.Conversation, mine.id)
+        assert conversation is not None
+        conversation.user_id = restricted.vic
+    with acting_as(viewer(restricted.vic)):
+        shown["vic"] = {
+            turn.content for turn in (await service.conversation_messages(mine.id)).turns
+        }
+
+    assert shown["operator"] == {"from the budget", "from nothing", "from before provenance"}
+    assert shown["erin"] == {"from the budget", "from nothing"}
+    assert shown["vic"] == {"from nothing"}
+
+
+async def test_an_answer_records_every_document_put_in_front_of_the_model(
+    opened: Runtime, service: ApplicationService, restricted: People
+) -> None:
+    with acting_as(viewer(restricted.erin)):
+        mine = await service.conversation_create(title="budget")
+        await service.ask(QUESTION, limit=5, conversation_id=mine.id)
+    turns = await (await opened.conversations()).history(mine.id)
+
+    answers = [turn for turn in turns if turn.role == "assistant"]
+    assert answers
+    assert set(answers[-1].context_documents or ()) == {OPEN_ID, RESTRICTED_ID}
+
+
+async def test_a_reader_cannot_rate_an_answer_in_someone_elses_conversation(
+    service: ApplicationService, restricted: People
+) -> None:
+    with acting_as(viewer(restricted.erin)):
+        mine = await service.conversation_create(title="budget")
+        answered = await service.ask(QUESTION, limit=5, conversation_id=mine.id)
+    assert answered.message_id is not None
+    with acting_as(viewer(restricted.vic)), pytest.raises(UnknownEntityError):
+        await service.chat_feedback(answered.message_id, feedback="negative")
+    with acting_as(viewer(restricted.erin)):
+        rated = await service.chat_feedback(answered.message_id, feedback="positive")
+
+    assert rated.recorded
+
+
+async def test_a_hidden_exact_match_does_not_stop_the_normalized_retry(
+    opened: Runtime, service: ApplicationService, restricted: People
+) -> None:
+    """A match the caller may not read is no match: hidden and absent behave the same."""
+    store = await opened.documents()
+    assert isinstance(store, SqliteDocStore)
+    hidden = make_document(
+        source="restricted",
+        source_id="page-slash",
+        uri="https://example.org/page/",
+        workspace_id=WORKSPACE,
+    )
+    shown = make_document(
+        source="open", source_id="page", uri="https://example.org/page", workspace_id=WORKSPACE
+    )
+    await store.upsert_document(hidden)
+    await store.upsert_document(shown)
+
+    with acting_as(viewer(restricted.vic)):
+        resolved = await service.document_resolve(uri="https://example.org/page/", content=False)
+    with acting_as(viewer(restricted.erin)):
+        exact = await service.document_resolve(uri="https://example.org/page/", content=False)
+
+    assert resolved.document.id == shown.id
+    assert exact.document.id == hidden.id
+
+
+async def test_the_counts_scope_moves_with_the_grants(
+    service: ApplicationService, restricted: People
+) -> None:
+    """A dashboard snapshot keyed by it is never served after a grant changed what it counts."""
+    with acting_as(viewer(restricted.vic)):
+        before = await service.counts_scope()
+    await service.source_grant("open", ["editors"])
+    with acting_as(viewer(restricted.vic)):
+        after = await service.counts_scope()
+
+    assert before != after
+
+
+async def test_the_diagnosis_and_the_workspace_list_count_only_what_the_reader_may_read(
+    service: ApplicationService, restricted: People
+) -> None:
+    with acting_as(viewer(restricted.vic)):
+        with pytest.raises(PolicyError, match="administrator"):
+            await service.doctor()
+        listed = await service.workspace_list()
+    with acting_as(Caller(role=Role.ADMIN, user_id=restricted.vic)):
+        total = await service.workspace_list()
+
+    active = next(summary for summary in listed.workspaces if summary.active)
+    assert active.documents == 1
+    assert next(summary for summary in total.workspaces if summary.active).documents == 2
+
+
+async def test_a_grant_on_a_source_nothing_uses_is_refused(
+    service: ApplicationService, restricted: People
+) -> None:
+    """A typo would report the source restricted while the real one stayed open."""
+    del restricted
+    with pytest.raises(UnknownEntityError, match="Known sources"):
+        await service.source_grant("Restricted", ["editors"])
+
+
+async def test_a_grant_landing_mid_search_is_a_retry_not_a_defect(
+    opened: Runtime,
+    service: ApplicationService,
+    restricted: People,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The store excluded nothing it should have; the grant arrived after it answered."""
+    retriever = await opened.retriever()
+    original = retriever.retrieve
+
+    async def granting(query: Any) -> Any:
+        result = await original(query)
+        with acting_as(LOCAL):
+            await service.source_grant("open", ["editors"])
+        return result
+
+    monkeypatch.setattr(retriever, "retrieve", granting)
+    with acting_as(viewer(restricted.vic)), pytest.raises(StorageBusyError, match="Retry"):
+        await service.search(QUESTION, limit=5)
 
 
 # --- administration ------------------------------------------------------------------------

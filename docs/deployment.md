@@ -120,19 +120,23 @@ What that does, precisely:
   service, by a check that reads only the gates each document came back carrying. Never in the
   vector store, whose schema carries no reader column. A refused document is refused whole, and
   the refusal names no document.
-- **Counts follow it.** `stats` and `collection_counts` report what the caller may read;
-  `index_status`, which reports the whole index, is an administrator's while any grant is in
-  force; an administrator's `stats` reports the workspace's totals.
-- **Conversations follow it.** While any grant is in force a restricted caller opens only
-  conversations they started, a turn citing a document they may not read is withheld whole, and
-  conversations cannot be shared — a share link is read by whoever holds it, so it can honor no
-  reader set, and links minted earlier stop serving.
+- **Counts follow it.** `stats`, `collection_counts` and `workspace_list` report what the
+  caller may read; `index_status` and `doctor`, which report the whole index and can name its
+  documents, are an administrator's while any grant is in force; an administrator is shown the
+  workspace's totals. A grant names a source the workspace knows — a configured connector, or
+  the source of a document — and a name nothing uses is refused rather than granted.
+- **Conversations follow it.** Every stored answer records the documents whose passages
+  were put in front of the model, cited or not. While any grant is in force a restricted caller
+  opens, answers into and rates only conversations they started; an answer is shown to them only
+  if they may read every document it was built from and cites, and an answer stored before
+  that was recorded is not shown to them at all. Conversations cannot be shared — a share link
+  is read by whoever holds it, so it can honor no reader set — and links minted earlier stop
+  serving.
 - **Grants are per source, not per page.** A Confluence page's own restrictions are still not
   read; restrict the source that indexes it, or index it into another workspace.
 
 Content some members must not read belongs either in a source granted only to the people who
-may read it, or in a workspace they are not members of. `doctor` is an operator's diagnostic and
-is not narrowed: its findings can name documents by source id.
+may read it, or in a workspace they are not members of.
 
 ---
 

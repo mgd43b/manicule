@@ -650,6 +650,9 @@ class Answerer:
             profile_used=request.query.profile.value,
             confidence_score=result.envelope.confidence,
             query_log_id=request.query_log_id,
+            context_documents=tuple(
+                sorted({passage.chunk.document_id for passage in request.context.passages})
+            ),
             response_time_ms=result.trace.total_ms,
         )
         write = asyncio.ensure_future(self._conversations.append(message))

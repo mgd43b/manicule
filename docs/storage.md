@@ -804,6 +804,11 @@ which reader set a caller holds, and the reader set is part of the cache key. A 
 changes what one reader set may read, so writing one moves the generation counter
 ([`retrieval.md`](retrieval.md) §10.3).
 
+The same revision adds a nullable `context_documents JSON` to `messages`, by a plain
+`ADD COLUMN`: the ids of every document whose passages an answer was built from, cited or not,
+written with the answer. A stored answer is shown to a restricted reader only when they may read
+all of them; `NULL`, on every row written before the revision, is never shown to one.
+
 ---
 
 ## 5. Alembic

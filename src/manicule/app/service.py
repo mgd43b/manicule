@@ -70,6 +70,7 @@ from manicule.app.ports import ReaderStore, RetrievingAcross, SpansWorkspaces
 from manicule.app.sensitive import UnreadableDatabaseError, sensitive_exposure
 from manicule.app.tenancy import (
     CrossWorkspaceError,
+    UnreadableDocumentError,
     require_owned,
     require_owns,
     require_readable,
@@ -99,6 +100,7 @@ from manicule.core.errors import (
     PolicyError,
     RateLimitedError,
     SignInRefusedError,
+    StorageBusyError,
     UnknownComponentError,
     UnknownEntityError,
 )
@@ -118,7 +120,14 @@ from manicule.core.rebuild import (
     RebuildTerminalGenerationError,
     RebuildValidationError,
 )
-from manicule.core.retrieval import Candidate, Context, Filter, Query, RetrievalProfile
+from manicule.core.retrieval import (
+    Candidate,
+    Context,
+    Filter,
+    Query,
+    RetrievalProfile,
+    SupportsGeneration,
+)
 from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
 from manicule.core.version import CORE_VERSION
 from manicule.ingest.knowledge import check as check_knowledge
@@ -176,6 +185,13 @@ if TYPE_CHECKING:
     from manicule.plugins.registry import Discovery
     from manicule.retrieval.retriever import RetrievalResult
     from manicule.storage.vector_migration import VectorMigration
+
+
+class _Unresolved:
+    """The reader set of an operation that has not resolved it yet: distinct from ``None``."""
+
+
+UNRESOLVED = _Unresolved()
 
 _log = logging.getLogger("manicule.app")
 """For the one thing here that is reported rather than raised: a telemetry write that failed.
@@ -1092,12 +1108,15 @@ class ApplicationService:
         )
 
         started = time.monotonic()
+        since = await self._generation()
         readers = await self._reader_set()
-        if conversation_id is not None and await self._conversation_owner() is not None:
+        if conversation_id is not None and readers is not None:
             # The answer is written into this conversation, so a restricted caller has to be
             # one who may open it. Writing into somebody else's would put text from documents
             # this caller may read in front of a person who may not.
-            await self._require_conversation(await self._backend.conversations(), conversation_id)
+            await self._require_conversation(
+                await self._backend.conversations(), conversation_id, readers=readers
+            )
         query = self._query(
             question,
             limit=limit or 8,
@@ -1108,7 +1127,7 @@ class ApplicationService:
         )
         retriever = await self._backend.retriever()
         retrieved = await retriever.retrieve(query)
-        documents = await self._require_scoped_context(retrieved, readers)
+        documents = await self._require_scoped_context(retrieved, readers, since=since)
         # After the tenancy check and before the model. Recording first would put another
         # tenant's chunk ids into this workspace's telemetry on the exact path the check
         # exists to stop.
@@ -1194,6 +1213,7 @@ class ApplicationService:
 
         started = time.monotonic()
         limits = _research_limits(self.settings)
+        since = await self._generation()
         readers = await self._reader_set()
         base = self._query(
             question,
@@ -1230,7 +1250,7 @@ class ApplicationService:
             redactor=Redactor(self.settings.security.data_policy.auto_redact),
         ).run(question, base)
         documents = await self._require_scoped_chunks(
-            (candidate.chunk for candidate in evidence.passages), readers
+            (candidate.chunk for candidate in evidence.passages), readers, since=since
         )
         context = _research_context(self.settings, base, evidence.passages, limits)
 
@@ -1349,6 +1369,7 @@ class ApplicationService:
                 collections=collections,
             )
         started = time.monotonic()
+        since = await self._generation()
         readers = await self._reader_set()
         query = self._query(
             query_text,
@@ -1371,6 +1392,7 @@ class ApplicationService:
                 for candidate in (*candidates, *retrieved.candidates, *retrieved.context.passages)
             ),
             readers,
+            since=since,
         )
         await self._record_query(query, retrieved, started=started)
         hits = tuple(
@@ -1534,6 +1556,17 @@ class ApplicationService:
             opened, retrieved.origins, list(retrieved.candidates), readers
         )
         attributed = attributed[: len(candidates)]
+        # The merged context is what confidence and `truncated` are computed over. Its passages
+        # are candidates of the merge, so each was attributed and checked above; a passage that
+        # is not one has no workspace to be checked in, and is refused rather than trusted.
+        claimed = {candidate.chunk.id for candidate in retrieved.candidates}
+        if any(passage.chunk.id not in claimed for passage in retrieved.context.passages):
+            msg = (
+                "a passage in the merged context of a search spanning workspaces was not one of "
+                "its ranked candidates, so no workspace's search vouches for it. Nothing was "
+                "returned."
+            )
+            raise CrossWorkspaceError(msg)
         await self._record_query(query, retrieved, started=started)
         await self._audit(
             "search.cross_workspace",
@@ -3080,7 +3113,11 @@ class ApplicationService:
     async def _by_uri(self, uri: str) -> Document:
         """The one live document at ``uri``, or a refusal that names the alternatives."""
         store = await self._backend.documents()
-        candidates = await store.find_documents_by_uri(uri)
+        readers = await self._reader_set()
+        # Narrowed to what the caller may read before anything is decided, counted or named: a
+        # match the caller may not read is no match, so it neither suppresses the normalized
+        # retry below nor appears in an ambiguity listing.
+        candidates = await self._visible_all(await store.find_documents_by_uri(uri), readers)
         if not candidates:
             # Retried once against a conservatively normalized form rather than normalizing up
             # front, because the stored URI is the connector's own and an exact match is the
@@ -3088,14 +3125,9 @@ class ApplicationService:
             # in are folded — never the path, where a Confluence page's title slug lives.
             normalized = _normalize_uri(uri)
             if normalized != uri:
-                candidates = await store.find_documents_by_uri(normalized)
-        # Narrowed to what the caller may read before anything is counted or named. An
-        # ambiguity listing the documents at a URI would otherwise name the ones they may not.
-        candidates = [
-            visible
-            for visible in [await self._visible(candidate) for candidate in candidates]
-            if visible is not None
-        ]
+                candidates = await self._visible_all(
+                    await store.find_documents_by_uri(normalized), readers
+                )
         if not candidates:
             msg = (
                 f"no live document at {uri!r} in workspace {self.workspace!r}. A URI is "
@@ -3966,6 +3998,17 @@ class ApplicationService:
         self._ready_answer = (True, now)
         self._ready_last_ok = now
 
+    async def _document_total(self, store: DocumentSurface) -> int:
+        """How many documents this workspace holds, as the caller may be told it.
+
+        The workspace's own total for a caller :meth:`stats` reports totals to; for anyone else
+        a count of what they may read, for :meth:`stats`'s reason.
+        """
+        readers = await self._reader_set()
+        if readers is None or current().holds(Role.ADMIN) or not isinstance(store, ReaderStore):
+            return await store.count_documents()
+        return (await store.readable_totals(readers)).documents
+
     async def counts_scope(self) -> str:
         """A canonical name for what :meth:`stats` counts for this caller.
 
@@ -3977,7 +4020,16 @@ class ApplicationService:
         readers = await self._reader_set()
         if readers is None or current().holds(Role.ADMIN):
             return ""
-        return hashlib.sha256("\n".join(sorted(readers)).encode()).hexdigest()
+        # The grants are part of the scope as well as the reader set: a grant changes what one
+        # reader set may count, and a snapshot taken before it would otherwise go on being
+        # served — including while the cache refreshes it — under the same key.
+        store = await self._backend.documents()
+        grants = await store.source_grants() if isinstance(store, ReaderStore) else {}
+        canonical = json.dumps(
+            {"readers": sorted(readers), "grants": {k: list(v) for k, v in sorted(grants.items())}},
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
     async def stats(self) -> r.Stats:
         """Counts, grouped the three ways anybody asks for.
@@ -4010,6 +4062,26 @@ class ApplicationService:
         )
 
     async def doctor(self, *, fix: bool = False) -> r.Diagnosis:
+        """See :meth:`_doctor`, which is the diagnosis; this is who may have it.
+
+        Its findings count the whole workspace and can name documents by source id, so while
+        any document of this workspace is restricted to some of its readers it is an
+        administrator's, as :meth:`index_status` is.
+
+        Raises:
+            PolicyError: The caller's reader set restricts them and they are not an
+                administrator.
+        """
+        if await self._reader_set() is not None and not current().holds(Role.ADMIN):
+            msg = (
+                "the diagnosis counts the whole workspace and can name its documents, and some "
+                "of this workspace's documents are restricted to some of its readers, so it is "
+                "an administrator's. `stats` counts what you may read."
+            )
+            raise PolicyError(msg)
+        return await self._doctor(fix=fix)
+
+    async def _doctor(self, *, fix: bool = False) -> r.Diagnosis:
         """Check what can be checked without building anything expensive.
 
         Every check answers one question and says what to do when the answer is bad. It does
@@ -6714,7 +6786,7 @@ class ApplicationService:
                     name=name,
                     mode=self.settings.mode.value if active else recorded,
                     active=active,
-                    documents=await store.count_documents() if active else None,
+                    documents=await self._document_total(store) if active else None,
                 )
             )
         return r.WorkspaceList(
@@ -7372,8 +7444,11 @@ class ApplicationService:
             UnknownEntityError: No live conversation of that id in this workspace.
         """
         store = await self._backend.conversations()
-        await self._require_conversation(store, conversation_id)
-        turns = await self._readable_turns(await store.history(conversation_id, limit=limit))
+        readers = await self._reader_set()
+        await self._require_conversation(store, conversation_id, readers=readers)
+        turns = await self._readable_turns(
+            await store.history(conversation_id, limit=limit), readers
+        )
         return r.ConversationMessages(
             conversation_id=conversation_id,
             count=len(turns),
@@ -7558,8 +7633,11 @@ class ApplicationService:
                 msg = f"no such feedback reason {reason!r}. Available: {allowed}"
                 raise ConfigError(msg) from exc
         store = await self._backend.conversations()
-        if not await store.record_feedback(
-            message_id, feedback=rating, reason=chosen, comment=comment
+        # A restricted caller rates only answers in conversations they started, and is refused
+        # anyone else's with the same words as a message that does not exist.
+        owner = await self._conversation_owner()
+        if owner == "" or not await store.record_feedback(
+            message_id, feedback=rating, reason=chosen, comment=comment, owner=owner
         ):
             msg = (
                 f"no message {message_id!r} in workspace {self.workspace!r}. Feedback on an id "
@@ -7568,49 +7646,75 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         return r.FeedbackRecorded(message_id=message_id, recorded=True, feedback=rating.value)
 
-    async def _require_conversation(self, store: Conversing, conversation_id: str) -> None:
+    async def _require_conversation(
+        self,
+        store: Conversing,
+        conversation_id: str,
+        *,
+        readers: frozenset[str] | _Unresolved | None = UNRESOLVED,
+    ) -> None:
         """Refuse a conversation that is not there — or, for a restricted caller, not theirs.
 
         Both refusals are the same refusal, so a restricted caller learns nothing about a
         conversation they may not open by asking for it.
         """
         record = await store.get_conversation(conversation_id)
-        owner = await self._conversation_owner()
+        owner = await self._conversation_owner(readers)
         if record is None or (owner is not None and record.user_id != owner):
             raise _no_conversation(conversation_id, self.workspace)
 
-    async def _conversation_owner(self) -> str | None:
+    async def _conversation_owner(
+        self, readers: frozenset[str] | _Unresolved | None = UNRESOLVED
+    ) -> str | None:
         """Whose conversations the caller may open: ``None`` for anyone's, ``""`` for nobody's.
 
         Anyone's for a caller no reader gate applies to, as before readers existed. Their own,
         for a restricted caller who is a person. Nobody's for a restricted caller who is not —
-        a key nobody owns has started no conversation.
+        a key nobody owns has started no conversation. ``readers`` is the reader set when the
+        operation has already resolved it, so it is not resolved twice.
         """
-        if await self._reader_set() is None:
+        held = await self._reader_set() if isinstance(readers, _Unresolved) else readers
+        if held is None:
             return None
         return current().user_id or ""
 
-    async def _readable_turns(self, turns: Sequence[Turn]) -> Sequence[Turn]:
+    async def _readable_turns(
+        self, turns: Sequence[Turn], readers: frozenset[str] | None
+    ) -> Sequence[Turn]:
         """The turns of a conversation the caller may read now.
 
-        A turn citing a document the caller may not read is withheld whole, its text included:
-        the text is built from what it cites. For a caller no gate applies to, every turn.
+        An answer is withheld whole, its text included, unless every document it was built from
+        — every one whose passages reached the model, cited or not — and every document it cites
+        is one the caller may read. An answer whose provenance was never recorded is withheld
+        too: what it was built from cannot be named, so it cannot be vouched for. A question is
+        the asker's own text and is always shown. For a caller no gate applies to, every turn.
         """
-        readers = await self._reader_set()
         if readers is None:
             return turns
-        cited = {citation.document_id for turn in turns for citation in turn.citations}
+        named = {
+            document_id
+            for turn in turns
+            for document_id in (
+                *(citation.document_id for citation in turn.citations),
+                *(turn.context_documents or ()),
+            )
+        }
         store = await self._backend.documents()
         readable = (
-            await store.readable_document_ids(cited, readers)
+            await store.readable_document_ids(named, readers)
             if isinstance(store, ReaderStore)
             else frozenset[str]()
         )
-        return [
-            turn
-            for turn in turns
-            if all(citation.document_id in readable for citation in turn.citations)
-        ]
+
+        def shown(turn: Turn) -> bool:
+            if turn.role != "assistant":
+                return True
+            if turn.context_documents is None:
+                return False
+            built = {*turn.context_documents, *(c.document_id for c in turn.citations)}
+            return built <= readable
+
+        return [turn for turn in turns if shown(turn)]
 
     async def _reader_gates_in_force(self) -> bool:
         """Whether any document of this workspace is restricted to some of its readers."""
@@ -8042,6 +8146,7 @@ class ApplicationService:
         """
         store = await self._reader_admin("grant a source")
         named = _source_and_groups(source, groups)
+        await self._require_known_source(named)
         granted = await store.grant_source(named, list(groups))
         await self._audit("readers.source_granted", details={"source": named, "groups": granted})
         return r.SourceReaders(source=named, groups=granted, restricted=bool(granted))
@@ -8059,6 +8164,29 @@ class ApplicationService:
         granted = await store.revoke_source(named, list(groups))
         await self._audit("readers.source_revoked", details={"source": named, "groups": granted})
         return r.SourceReaders(source=named, groups=granted, restricted=bool(granted))
+
+    async def _require_known_source(self, source: str) -> None:
+        """Refuse a grant on a source this workspace has never heard of.
+
+        A source is known when it is a configured connector instance or when a document here
+        names it. A grant on a misspelled source would report the source restricted while every
+        document of the real one stayed readable by everyone.
+
+        Raises:
+            UnknownEntityError: Neither. The message lists the sources that are known.
+        """
+        documents = await self._backend.documents()
+        known = set(self.settings.connectors) | set(
+            (await documents.document_statistics()).get("by_source", {})
+        )
+        if source not in known:
+            listed = ", ".join(repr(name) for name in sorted(known)) or "none"
+            msg = (
+                f"no source {source!r} in workspace {self.workspace!r}: it is neither a "
+                f"configured connector nor the source of any document. Known sources: "
+                f"{listed}. A grant on a name nothing uses would restrict nothing."
+            )
+            raise UnknownEntityError(msg)
 
     async def _reader_admin(self, action: str) -> ReaderStore:
         """This workspace's reader store, for an administrator.
@@ -9318,6 +9446,10 @@ class ApplicationService:
             ),
         )
 
+    async def _generation(self) -> int | None:
+        """The store's generation now, so a refusal on the way out can tell a race from a leak."""
+        return _generation_of(await self._backend.documents())
+
     async def _reader_set(self) -> frozenset[str] | None:
         """The caller's reader set in this workspace (:mod:`manicule.core.readers`).
 
@@ -9346,6 +9478,26 @@ class ApplicationService:
         if listed is None or not admits(readers, listed.access):
             return None
         return listed
+
+    async def _visible_all(
+        self, documents: Sequence[Document], readers: frozenset[str] | None
+    ) -> list[Document]:
+        """The documents of ``documents`` the caller may read, as :meth:`_visible` decides.
+
+        One store read for all of them rather than one each, under a reader set already
+        resolved.
+        """
+        if readers is None:
+            return list(documents)
+        store = await self._backend.documents()
+        listed = await _documents_in(
+            store, self.workspace, [document.id for document in documents], readers=readers
+        )
+        return [
+            listed[document.id]
+            for document in documents
+            if document.id in listed and admits(readers, listed[document.id].access)
+        ]
 
     async def _require_readable_source(self, source: str) -> None:
         """Refuse to write into a source the caller may not read.
@@ -9422,7 +9574,7 @@ class ApplicationService:
         return frozenset(resolved)
 
     async def _require_scoped_context(
-        self, retrieved: RetrievalResult, readers: frozenset[str] | None
+        self, retrieved: RetrievalResult, readers: frozenset[str] | None, *, since: int | None
     ) -> dict[str, Document]:
         """Prove every retrieved passage belongs to this workspace, before anything leaves.
 
@@ -9436,10 +9588,11 @@ class ApplicationService:
         return await self._require_scoped_chunks(
             (candidate.chunk for candidate in (*retrieved.context.passages, *retrieved.candidates)),
             readers,
+            since=since,
         )
 
     async def _require_scoped_chunks(
-        self, chunks: Iterable[Chunk], readers: frozenset[str] | None
+        self, chunks: Iterable[Chunk], readers: frozenset[str] | None, *, since: int | None = None
     ) -> dict[str, Document]:
         """Resolve each chunk's document through the scoped store and check its identity.
 
@@ -9459,7 +9612,7 @@ class ApplicationService:
             UnreadableDocumentError: A chunk points at a document the caller may not read.
         """
         return await self._require_scoped_in(
-            await self._backend.documents(), self.workspace, chunks, readers
+            await self._backend.documents(), self.workspace, chunks, readers, since=since
         )
 
     @staticmethod
@@ -9468,6 +9621,8 @@ class ApplicationService:
         workspace: str,
         chunks: Iterable[Chunk],
         readers: frozenset[str] | None,
+        *,
+        since: int | None = None,
     ) -> dict[str, Document]:
         """:meth:`_require_scoped_chunks` for ``workspace``, through ``store`` — its own handle.
 
@@ -9488,7 +9643,22 @@ class ApplicationService:
             )
             raise CrossWorkspaceError(msg)
         require_owned(workspace, found.values())
-        require_readable(readers, found.values())
+        try:
+            require_readable(readers, found.values())
+        except UnreadableDocumentError as refused:
+            unreadable = [d.id for d in found.values() if not admits(readers, d.access)]
+            moved = since is not None and _generation_of(store) != since
+            if moved and not await _documents_in(store, workspace, unreadable, readers=readers):
+                # The store, asked again now, excludes every one of them too: a grant landed
+                # between retrieval and this check. That is an ordinary race, not a store that
+                # ignored the reader set — which would still be returning them — and nothing
+                # was returned either way.
+                msg = (
+                    "who may read some of this workspace's documents changed while this request "
+                    "was running, so nothing was returned. Retry the same request."
+                )
+                raise StorageBusyError(msg) from refused
+            raise
         return found
 
     async def _scoped_documents(
@@ -10436,6 +10606,11 @@ def _source_and_groups(source: str, groups: Sequence[str]) -> str:
         msg = f"name at least one reader group to grant or revoke {named!r} for"
         raise ValueError(msg)
     return named
+
+
+def _generation_of(store: object) -> int | None:
+    """The generation counter of ``store``, or ``None`` for one that keeps none."""
+    return store.generation if isinstance(store, SupportsGeneration) else None
 
 
 async def _reader_set_of(store: object) -> frozenset[str] | None:

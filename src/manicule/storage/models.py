@@ -1404,6 +1404,14 @@ class Message(Base):
     """
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    context_documents: Mapped[JsonValue | None] = mapped_column(JSON)
+    """The ids of every document whose passages were put in front of the model for this answer.
+
+    What a stored answer is checked against before a restricted reader is shown it: its text was
+    built from all of these, cited or not. ``NULL`` for a turn written before this was recorded,
+    which a restricted reader is never shown, because what it was built from cannot be named.
+    An empty list is an answer built from no passage at all.
+    """
 
     __table_args__ = (
         CheckConstraint("role IN ('user', 'assistant', 'system')", name="role_is_known"),

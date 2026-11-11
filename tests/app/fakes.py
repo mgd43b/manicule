@@ -732,8 +732,9 @@ class FakeConversations:
         feedback: Feedback,
         reason: FeedbackReason | None = None,
         comment: str = "",
+        owner: str | None = None,
     ) -> bool:
-        del reason, comment
+        del reason, comment, owner
         if not message_id.startswith("msg"):
             return False
         self.feedback.append((message_id, feedback.value))

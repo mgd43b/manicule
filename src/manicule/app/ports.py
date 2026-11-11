@@ -715,6 +715,7 @@ class Conversing(Protocol):
         feedback: Feedback,
         reason: FeedbackReason | None = None,
         comment: str = "",
+        owner: str | None = None,
     ) -> bool: ...
 
     async def create_share(self, link: ShareLink, *, maximum_ttl_s: int) -> bool: ...

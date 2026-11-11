@@ -83,6 +83,12 @@ class StoredMessage(BaseModel):
         "with no retrieval at all, which is why this is nullable and why feedback lives on "
         "the message rather than on the retrieval row.",
     )
+    context_documents: tuple[str, ...] | None = Field(
+        default=None,
+        description="Every document whose passages were put in front of the model for this "
+        "answer, cited or not. ``None`` when nobody recorded it; empty when the answer was "
+        "built from no passage.",
+    )
 
 
 class ConversationRecord(BaseModel):
@@ -142,8 +148,11 @@ class ConversationStore(Protocol):
         feedback: Feedback,
         reason: FeedbackReason | None = None,
         comment: str = "",
+        owner: str | None = None,
     ) -> bool:
         """Rate an answer. Returns whether a row actually matched.
+
+        ``owner`` narrows the match to answers in conversations that person started.
 
         The return value is the correction: reporting success without checking that anything
         matched means feedback on a mistyped id is silently accepted and never seen again.
