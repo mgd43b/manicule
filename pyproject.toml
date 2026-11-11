@@ -182,7 +182,10 @@ browser-auth = [
 serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #12 — the browser UI.
   # Typer derives the command line from type hints, so the signature of a service call and
   # the shape of the command that reaches it cannot drift. MIT.
-  "typer>=0.15",
+  # Capped below 0.29, which vendors Click and makes `TyperOption(...)` require a
+  # `type_descriptor`: `cli/main.py` builds the shared `--json`/`--workspace` options with it,
+  # so `manicule --help` raises on a fresh install that resolves 0.29. Lift the cap with the port.
+  "typer>=0.15,<0.29",
   # Rich renders the tables, progress and diagnostics. MIT.
   "rich>=13.9",
   # FastMCP is decorators over functions: the tool surface is the service surface, with no
