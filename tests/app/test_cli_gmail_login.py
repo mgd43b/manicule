@@ -220,7 +220,7 @@ def test_the_gmail_options_are_refused_for_a_confluence_source(
     result = login("wiki", "--token-file", str(tmp_path / "token"))
 
     assert result.exit_code != 0
-    assert "not a Gmail source" in _plain(result.output)
+    assert "not a Gmail or Outlook source" in _plain(result.output)
 
 
 def test_overwriting_needs_a_file_to_overwrite(google: FakeGoogleSignIn) -> None:

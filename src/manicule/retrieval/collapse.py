@@ -36,6 +36,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from manicule.core.mail_ids import MAIL_THREAD_ID_KEY
 from manicule.retrieval.config import CollapseConfig
 from manicule.retrieval.prefilter import join_filter
 
@@ -205,11 +206,16 @@ class CollapseStage:
             scope.model_copy(update={"document_ids": wanted}), limit=len(wanted)
         )
         key = self._config.thread_key
-        return {
-            document.id: (document.source, str(document.metadata[key]))
-            for document in documents
-            if document.metadata.get(key) not in (None, "")
-        }
+        threads: dict[str, tuple[str, str]] = {}
+        for document in documents:
+            # The configured field first, then the one every mail connector other than Gmail
+            # records, so the default configuration collapses an Outlook conversation too.
+            value = document.metadata.get(key)
+            if value in (None, ""):
+                value = document.metadata.get(MAIL_THREAD_ID_KEY)
+            if value not in (None, ""):
+                threads[document.id] = (document.source, str(value))
+        return threads
 
 
 __all__ = ["EDIT", "SHINGLE", "CollapseStage", "body_trigrams", "shingles", "trigrams"]

@@ -371,7 +371,7 @@ refusal.
 Two more refusals hold on every address, **loopback included**, and `--no-authentication` does
 not waive either. A team installation (§4.1) with `security.auth.mode = "none"` is refused. So is
 an installation with `none` that holds a **sensitive source**: an enabled connector instance of a
-sensitive type (`gmail` and `mbox`), or any document, in any state, from a source such a
+sensitive type (`gmail`, `outlook`, `mbox` and `trilium`), or any document, in any state, from a source such a
 connector has synced, or any document of a mail media type (`message/rfc822`,
 `application/vnd.ms-outlook`) from whichever connector indexed it, in any workspace of the data
 directory. Disabling the connector or deleting

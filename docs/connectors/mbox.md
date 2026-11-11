@@ -409,8 +409,8 @@ from five years ago that an old laptop still has. Indexed twice, every query ret
 and `ask` quotes it twice as if two sources agreed.
 
 **`skip_known_message_ids` (default `true`)** makes discovery skip a message whose `Message-ID`
-is already held by **another mail source**: another configured instance of type `gmail` or
-`mbox`, enabled or not (its documents stay in the index either way), and not itself. **A message this source already holds is never skipped** (`find_document`
+is already held by **another mail source**: another configured instance of type `gmail`,
+`outlook` or `mbox`, enabled or not (its documents stay in the index either way), and not itself. **A message this source already holds is never skipped** (`find_document`
 by identity, asked only of the few messages whose `Message-ID` is known elsewhere), so turning the
 option on, or syncing Gmail later, never makes a document this source indexed disappear from a full
 walk (§5.4). Mail the other source holds is, for the purpose of this option, what that
@@ -423,7 +423,9 @@ How the other source's `Message-ID` values are known:
   `…#search/rfc822msgid:<percent-encoded id>` (`gmail.md` §2), and has no `mail_message_id`. The
   connector reads the link, which every Gmail document already has and which needs no change to
   the Gmail connector and no re-fetch of a mailbox. A Gmail message without a `Message-ID` was
-  given the `#all/<gmail id>` link, carries no id, and can never match.
+  given the `#all/<gmail id>` link, carries no id, and can never match;
+- **an `outlook` document** records `mail_message_id` in its metadata, as an `mbox` document does
+  ([`outlook.md`](outlook.md) §2), taken from the fetched message's `Message-ID` header.
 
 The ids are read from the document store once per walk, the first time a message with a
 `Message-ID` needs judging, into an on-disk table beside the one §5.3 uses. The read is a new

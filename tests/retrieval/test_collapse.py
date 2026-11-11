@@ -291,6 +291,35 @@ async def test_the_field_naming_a_conversation_is_configured(store: SqliteDocSto
     assert configured == ranked[:1]
 
 
+async def test_a_source_that_is_not_gmail_collapses_on_the_shared_mail_thread_key(
+    store: SqliteDocStore,
+) -> None:
+    """The Outlook connector records Graph's ``conversationId`` as ``mail_thread_id``, which the
+    default configuration reads after ``gmail_thread_id``, so its reply chains collapse too."""
+    first = await message(store, "m1", {"mail_thread_id": "c1"})
+    second = await message(store, "m2", {"mail_thread_id": "c1"})
+    other = await message(store, "m3", {"mail_thread_id": "c2"})
+    ranked = [
+        candidate(first, ORIGINAL, 0.9),
+        candidate(second, quoted(ORIGINAL), 0.8),
+        candidate(other, quoted(ORIGINAL), 0.7),
+    ]
+
+    kept = await CollapseStage(docstore=store).run(a_query(), ranked)
+
+    assert kept == [ranked[0], ranked[2]], "same conversation collapses, another does not"
+
+
+async def test_the_configured_key_wins_over_the_shared_one(store: SqliteDocStore) -> None:
+    first = await message(store, "m1", {"gmail_thread_id": "t1", "mail_thread_id": "c1"})
+    second = await message(store, "m2", {"gmail_thread_id": "t2", "mail_thread_id": "c1"})
+    ranked = [candidate(first, ORIGINAL, 0.9), candidate(second, quoted(ORIGINAL), 0.8)]
+
+    kept = await CollapseStage(docstore=store).run(a_query(), ranked)
+
+    assert kept == ranked, "different Gmail threads are never compared, whatever else is recorded"
+
+
 class RecordingStore:
     """The real store, with every document read it is asked for written down."""
 

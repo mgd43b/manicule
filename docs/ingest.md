@@ -3011,9 +3011,9 @@ for documents filed under a connector *type* while an instance of that type is c
 `collection-membership`, for a corpus no collection holds — which the pipeline also reports per
 run, as `collected`/`uncollected` on `IngestReport` (§13.1); and `reconciliation-overdue` and
 `reconciliation-proposals`, for the cadence and the guard-2 refusals of §11.
-A fifth check sits beside them but asks a different question: `gmail-credential` is about a
-source's credential rather than about what the pipeline stored, and it contacts Google, which
-none of the others do.
+A fifth and a sixth sit beside them but ask a different question: `gmail-credential` and
+`outlook-credential` are about a source's credential rather than about what the pipeline stored,
+and they contact Google and Microsoft, which none of the others do.
 
 | Check | Detects |
 |---|---|

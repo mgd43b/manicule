@@ -217,6 +217,7 @@ Only GitHub has a real change token. Each connector below gets proper incrementa
 | **Swagger** | fetch, no change signal | Fetch and hash the spec; chunk **per endpoint** with parameters and schemas | httpx + `openapi-spec-validator` |
 | **Web crawler** | content hash | **[Git-backed site first, then HTTP](docs/connectors/web-crawler.md)**; Conditional GET (ETag / If-Modified-Since) plus content hash; honor `robots.txt` | httpx + **protego** + selectolax |
 | **Web search** | Tavily, query time | unchanged — no sync | httpx |
+| **Outlook** | not in OpenDocuments | **per-folder message delta** with one stored link per folder and a complete-walk fallback for a folder whose state is gone, immutable ids, whole MIME through the `message/rfc822` parser, the calendar listed as a rolling window and rendered as iCalendar; delegated read-only sign-in as a public client; **built against a synthetic Graph, never run live**, see [`docs/connectors/outlook.md`](docs/connectors/outlook.md) | httpx |
 | **Gmail** | not in OpenDocuments | **History API** (`history.list` from a stored `historyId`) with a complete-walk fallback, per-message raw RFC 5322 through the `message/rfc822` parser, read-only scope; **built** apart from `connector login` ([#464](https://github.com/mgd43b/manicule/issues/464)), see [`docs/connectors/gmail.md`](docs/connectors/gmail.md) | httpx |
 
 Plus local filesystem with watch mode (**watchfiles**, Rust-backed) and web upload.

@@ -76,9 +76,13 @@ __all__ = [
     "GMAIL_AUTH_URL",
     "GMAIL_READONLY_SCOPE",
     "FileSink",
+    "Loopback",
     "StreamSink",
     "TokenSink",
+    "ignore_message",
     "mint_refresh_token",
+    "open_browser_quietly",
+    "pkce_challenge",
 ]
 
 GMAIL_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -236,11 +240,11 @@ class StreamSink:
         self.stream.flush()
 
 
-def _ignore(message: str) -> None:
+def ignore_message(message: str) -> None:
     del message
 
 
-def _open(open_browser: Callable[[str], object], url: str) -> None:
+def open_browser_quietly(open_browser: Callable[[str], object], url: str) -> None:
     """Start the browser. Failing to is not an error: the address was announced for that case."""
     with contextlib.suppress(Exception):
         open_browser(url)
@@ -249,7 +253,7 @@ def _open(open_browser: Callable[[str], object], url: str) -> None:
 async def mint_refresh_token(
     config: GmailConfig,
     *,
-    announce: Callable[[str], None] = _ignore,
+    announce: Callable[[str], None] = ignore_message,
     open_browser: Callable[[str], object] | None = None,
     timeout_seconds: float = DEFAULT_SIGN_IN_TIMEOUT_SECONDS,
     transport: httpx.AsyncBaseTransport | None = None,
@@ -290,7 +294,7 @@ async def mint_refresh_token(
 
     verifier = secrets.token_urlsafe(64)
     state = secrets.token_urlsafe(32)
-    async with _Loopback(state) as loopback:
+    async with Loopback(state) as loopback:
         url = f"{GMAIL_AUTH_URL}?" + urlencode(
             {
                 "client_id": config.client_id,
@@ -299,7 +303,7 @@ async def mint_refresh_token(
                 "scope": GMAIL_READONLY_SCOPE,
                 "access_type": "offline",
                 "prompt": "consent",
-                "code_challenge": _challenge(verifier),
+                "code_challenge": pkce_challenge(verifier),
                 "code_challenge_method": "S256",
                 "state": state,
                 "login_hint": config.account,
@@ -314,7 +318,10 @@ async def mint_refresh_token(
         # exit may wait on that. The loop's default executor would be joined by `asyncio.run`
         # on the way out, which is exactly the wait this avoids.
         threading.Thread(
-            target=_open, args=(open_browser, url), name="gmail-login-browser", daemon=True
+            target=open_browser_quietly,
+            args=(open_browser, url),
+            name="gmail-login-browser",
+            daemon=True,
         ).start()
         announce(f"Waiting up to {timeout_seconds:g} seconds for the sign-in to finish.")
         try:
@@ -338,7 +345,7 @@ async def mint_refresh_token(
     )
 
 
-def _challenge(verifier: str) -> str:
+def pkce_challenge(verifier: str) -> str:
     """The PKCE ``S256`` challenge: the unpadded URL-safe base64 of the verifier's SHA-256."""
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -442,7 +449,7 @@ def _json_object(response: httpx.Response) -> dict[str, object]:
     return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else {}
 
 
-class _Loopback:
+class Loopback:
     """A listener on ``127.0.0.1`` that accepts exactly one authorization redirect.
 
     **Bound to the loopback address only**, on a port the operating system picks, so it is not
@@ -454,24 +461,31 @@ class _Loopback:
     A request is also refused unless its ``Host`` is the address this socket was opened on,
     which keeps a web page from a hostile name that resolves here (DNS rebinding) from talking
     to it.
+
+    ``host`` is the name the redirect address and that ``Host`` check use. The socket is on
+    ``127.0.0.1`` whatever it is: Microsoft's portal only registers a ``localhost`` redirect, so
+    the Outlook sign-in names ``localhost`` here and the browser, which tries IPv4 as well as IPv6,
+    reaches the same socket. ``provider`` is the name the failure messages use.
     """
 
-    def __init__(self, state: str) -> None:
+    def __init__(self, state: str, *, host: str = "127.0.0.1", provider: str = "Google") -> None:
         self.state = state
         self.redirect_uri = ""
+        self._host = host
+        self._provider = provider
         self._port = 0
         self._server: asyncio.Server | None = None
         self._result: asyncio.Future[SecretStr] | None = None
         self._writers: set[asyncio.StreamWriter] = set()
 
-    async def __aenter__(self) -> _Loopback:
+    async def __aenter__(self) -> Loopback:
         result: asyncio.Future[SecretStr] = asyncio.get_running_loop().create_future()
         self._result = result
         self._server = await asyncio.start_server(
             self._serve, host="127.0.0.1", port=0, limit=_REQUEST_HEAD_LIMIT
         )
         self._port = self._server.sockets[0].getsockname()[1]
-        self.redirect_uri = f"http://127.0.0.1:{self._port}"
+        self.redirect_uri = f"http://{self._host}:{self._port}"
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -529,7 +543,7 @@ class _Loopback:
         }
         if len(parts) != 3 or parts[0] != "GET":  # noqa: PLR2004 - method, target, version
             return HTTPStatus.METHOD_NOT_ALLOWED, ""
-        if headers.get("host") != f"127.0.0.1:{self._port}":
+        if headers.get("host") != f"{self._host}:{self._port}":
             return HTTPStatus.BAD_REQUEST, ""
         target = urlsplit(parts[1])
         params = parse_qs(target.query)
@@ -559,7 +573,10 @@ class _Loopback:
             if reason == "access_denied":
                 msg = "the sign-in was declined in the browser, so nothing was issued."
             elif error:
-                msg = f"Google ended the sign-in with an error ({reason}), so nothing was issued."
+                msg = (
+                    f"{self._provider} ended the sign-in with an error ({reason}), so nothing "
+                    f"was issued."
+                )
             else:
                 msg = "the redirect carried neither a code nor an error, so nothing was issued."
             result.set_exception(CredentialError(msg))

@@ -78,7 +78,7 @@ def test_only_the_mail_and_notes_connectors_are_registered_as_sensitive() -> Non
     from manicule.plugins import discover  # noqa: PLC0415
 
     registry = discover().registry
-    private = {"gmail", "mbox", "trilium"}
+    private = {"gmail", "mbox", "outlook", "trilium"}
     assert registry.sensitive_names(ComponentKind.CONNECTOR) == private
     assert not any(record.sensitive for record in registry.records() if record.name not in private)
 
@@ -422,7 +422,7 @@ async def test_a_data_directory_whose_path_has_uri_metacharacters_is_still_read(
     assert held_sources(root) == (MAIL,)
 
 
-def test_the_runtime_names_the_gmail_instances_it_hands_the_pipeline(tmp_path: Path) -> None:
+def test_the_runtime_names_the_mail_instances_it_hands_the_pipeline(tmp_path: Path) -> None:
     """The pipeline marks only what the runtime names, so this is where a gap would fail open."""
     from manicule.app.runtime import Runtime  # noqa: PLC0415
 
@@ -430,10 +430,11 @@ def test_the_runtime_names_the_gmail_instances_it_hands_the_pipeline(tmp_path: P
         data_dir=tmp_path,
         connectors={
             "mail": ConnectorSettings(type="gmail"),
+            "work": ConnectorSettings(type="outlook"),
             "notes": ConnectorSettings(type="filesystem"),
         },
     )
-    assert Runtime(settings).sensitive_instances() == {"mail"}
+    assert Runtime(settings).sensitive_instances() == {"mail", "work"}
 
 
 async def test_doctor_redacts_the_home_directory_in_an_unreadable_database_message(

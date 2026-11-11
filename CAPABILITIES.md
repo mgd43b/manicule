@@ -508,6 +508,21 @@ is a feature list entry, not a feature.
   other source, which reports counts only. An installation that holds a mailbox
   refuses to serve with authentication off (#462). `connector login` mints the
   refresh token (#461). `docs/connectors/gmail.md`.
+- `connectors.<name>` with `type = "outlook"` — one Microsoft 365 mailbox and its calendar, read-only
+  through Microsoft Graph (`Mail.Read`, `Calendars.Read`, delegated, as a public client: there is no
+  client secret). Graph's message delta is per folder, so the watermark is one delta link per
+  folder and a sync costs what changed; a message is fetched once as its whole MIME and indexed
+  through the existing `message/rfc822` parser. Scope is folders: Junk Email, Deleted Items, Drafts,
+  Outbox and Sync Issues (and their subfolders) are always out and `exclude_folders` names the rest
+  by path. The calendar is a rolling window (`calendar_days_back`, `calendar_days_forward`) listed
+  afresh each sync, an event is rendered as iCalendar for the existing calendar parser, and its
+  `changeKey` is its version. A deletion, a move into an excluded folder or an event leaving the
+  window leaves the index at the next reconciliation. `account` pins the mailbox (matched against
+  the sign-in name or the primary address) and a token for any other is refused. Microsoft rotates
+  refresh tokens; `refresh_token_file` keeps the rotated one current. Registered as sensitive like
+  `gmail`. `connector login` mints the token; `doctor` has an `outlook-credential` check.
+  **Built against a synthetic Graph and never run against a live tenant**; the design says which of
+  Microsoft's behaviors that leaves unverified. `docs/connectors/outlook.md`.
 - `connectors.<name>` with `type = "mbox"` — old mail archives: every message in the unix mbox
   files under a root (Thunderbird folders, Mutt and Pine archives, Apple Mail exports; the file
   is recognized by its first bytes, not its name) as one `message/rfc822` document, so the mail
@@ -515,8 +530,8 @@ is a feature list entry, not a feature.
   never has to fit the 256 MB fetch limit. A message is identified by a digest of its bytes
   rather than its `Message-ID`, so reordering a file or filing a message in several leaves one
   document. An unchanged file costs a `stat`; a message that left every file leaves the index at
-  the next reconciliation. `skip_known_message_ids` (default on) skips a message another `gmail`
-  or `mbox` source already holds. Registered as sensitive like `gmail`, and any source holding a
+  the next reconciliation. `skip_known_message_ids` (default on) skips a message another `gmail`,
+  `outlook` or `mbox` source already holds. Registered as sensitive like `gmail`, and any source holding a
   `message/rfc822` or `application/vnd.ms-outlook` document refuses an unauthenticated server
   too, whichever connector indexed it. Outlook PST has no reader: the documented recipe
   converts with `readpst` outside manicule. `docs/connectors/mbox.md`.

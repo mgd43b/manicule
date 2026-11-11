@@ -58,8 +58,10 @@ vectors are filtered during hydration and reclaimed by the normal sweep. The sam
 applies when parsing, middleware or chunking concludes that a document has no chunks.
 
 > [!IMPORTANT]
-> **Seven sources are built**: a local directory tree, Confluence (live, or from a directory of
-> mirrored pages), a pinned Git checkout of a site you own, a Google Workspace mailbox, old
+> **Eight sources are built**: a local directory tree, Confluence (live, or from a directory of
+> mirrored pages), a pinned Git checkout of a site you own, a Google Workspace mailbox, a Microsoft
+> 365 mailbox and calendar ([`docs/connectors/outlook.md`](docs/connectors/outlook.md); built against
+> a synthetic Graph and not yet run against a live tenant), and old
 > mail archives in unix mbox files ([`docs/connectors/mbox.md`](docs/connectors/mbox.md), which
 > also says how to index an Outlook PST), and a Trilium Notes server
 > ([`docs/connectors/trilium.md`](docs/connectors/trilium.md)). Gmail is read-only and syncs from Gmail's own change

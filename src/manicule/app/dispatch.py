@@ -401,6 +401,10 @@ READ_ONLY_OPS: frozenset[str] = frozenset(
         # would refuse the command on exactly the machine it exists for — the one with a browser
         # — when the server is somewhere else.
         "connector_login_gmail",
+        # Minting an Outlook refresh token: the same reasoning, word for word. It writes a file
+        # the operator names (or a pipe), touches nothing in the data directory and needs no
+        # server.
+        "connector_login_outlook",
         # Installing the browser extension's messaging host. It writes two files — a shim and
         # a manifest per browser — and neither is corpus state: the shim lands in a directory
         # of its own beneath the data directory and the manifests land in the browsers'. There
