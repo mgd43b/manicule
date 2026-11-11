@@ -360,6 +360,13 @@ class ReadersMixin(WorkspaceScoped):
             )
         return frozenset(str(found_id) for found_id in found)
 
+    async def may_read_source(self, source: str, readers: frozenset[str]) -> bool:
+        """Whether ``readers`` may read a document of ``source`` here — the same rule as
+        :func:`readable`, asked of a source rather than of its documents."""
+        async with self._sessions() as session:
+            granted = set(await self._granted(session, source))
+        return not granted or bool(granted & group_ids(readers))
+
     async def readable_totals(self, readers: frozenset[str]) -> ReadableTotals:
         """How much of this workspace a caller holding ``readers`` may read, counted now.
 

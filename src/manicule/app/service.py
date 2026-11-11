@@ -3240,6 +3240,7 @@ class ApplicationService:
         # unlikely rather than impossible — and "unlikely" is not what a path check is for.
         _require_segment(collection, "collection name")
         content = _authored_markdown(body, slug=slug)
+        await self._require_readable_source(authoring.source)
 
         store = await self._backend.organization()
         found = await store.find_collection(collection)
@@ -9345,6 +9346,27 @@ class ApplicationService:
         if listed is None or not admits(readers, listed.access):
             return None
         return listed
+
+    async def _require_readable_source(self, source: str) -> None:
+        """Refuse to write into a source the caller may not read.
+
+        Authoring reports whether a slug is already taken and can overwrite what holds it, so a
+        caller writing into a source restricted away from them would learn what it holds and
+        could replace text they may not read.
+
+        Raises:
+            PolicyError: The source is granted to reader groups the caller is in none of.
+        """
+        readers = await self._reader_set()
+        store = await self._backend.documents()
+        if readers is None or not isinstance(store, ReaderStore):
+            return
+        if not await store.may_read_source(source, readers):
+            msg = (
+                f"source {source!r} is restricted to reader groups this caller is not in, so "
+                f"this caller cannot write into it: authoring reads what a slug already holds."
+            )
+            raise PolicyError(msg)
 
     async def _require_readable_ids(self, document_ids: Sequence[str]) -> None:
         """Refuse an operation naming a document the caller may not read, as if it were absent.

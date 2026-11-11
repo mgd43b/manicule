@@ -19,7 +19,7 @@ from manicule.app.caller import Caller, acting_as
 from manicule.app.runtime import Runtime
 from manicule.app.service import ApplicationService
 from manicule.app.tenancy import UnreadableDocumentError
-from manicule.config.settings import Role, Settings
+from manicule.config.settings import AuthoringSettings, ConnectorSettings, Role, Settings
 from manicule.container import keys
 from manicule.core.errors import PolicyError, UnknownEntityError
 from manicule.core.ids import document_id
@@ -39,6 +39,7 @@ ANSWER = "It runs at dawn [[cite:1]] and costs money [[cite:2]]."
 it is in the context, is cited."""
 OPEN = {"schedule": "The orchard irrigation schedule runs at dawn."}
 RESTRICTED = {"budget": "The orchard irrigation budget is confidential."}
+AUTHORED = "authored"
 OPEN_ID = document_id(WORKSPACE, "open", "schedule")
 RESTRICTED_ID = document_id(WORKSPACE, "restricted", "budget")
 
@@ -54,9 +55,15 @@ def _runtime(environment: Path) -> Runtime:
         keys.GENERATOR.named("scripted"),
         lambda _: ScriptedGenerator(script=(ANSWER,)),
     )
+    authored = environment / "authored"
+    authored.mkdir(exist_ok=True)
     settings = Settings(
         data_dir=environment / "data",
         workspace=WORKSPACE,
+        connectors={
+            AUTHORED: ConnectorSettings(type="filesystem", options={"root": str(authored)})
+        },
+        authoring=AuthoringSettings(source=AUTHORED, collections=("memories",)),
         embedding={"provider": "local"},  # pyright: ignore[reportArgumentType]
         llm={"generator": "scripted"},  # pyright: ignore[reportArgumentType]
         rag={"chunker": "block"},  # pyright: ignore[reportArgumentType]
@@ -419,6 +426,22 @@ async def test_sharing_is_refused_while_any_source_is_restricted(
     with pytest.raises(PolicyError, match="cannot be shared"):
         await service.conversation_share(conversation.id)
     assert (await service.shared_conversation(link.token)).count == 0
+
+
+async def test_a_reader_cannot_author_into_a_source_they_may_not_read(
+    service: ApplicationService, restricted: People, manicule_environment: Path
+) -> None:
+    """Authoring says whether a slug is taken and can overwrite what holds it."""
+    await service.collection_create("memories")
+    await service.source_grant(AUTHORED, ["editors"])
+
+    with (
+        acting_as(Caller(role=Role.MEMBER, user_id=restricted.vic)),
+        pytest.raises(PolicyError, match="cannot write into it"),
+    ):
+        await service.document_create(collection="memories", slug="ledger", body="figures")
+
+    assert list((manicule_environment / "authored").rglob("*.md")) == []
 
 
 # --- administration ------------------------------------------------------------------------

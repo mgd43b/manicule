@@ -324,6 +324,16 @@ async def test_a_grant_moves_the_generation_and_a_membership_change_does_not(
     assert store.generation > after_grant
 
 
+async def test_a_source_is_readable_by_the_same_rule_its_documents_are(
+    store: SqliteDocStore,
+) -> None:
+    member = await _restrict(store)
+
+    assert await store.may_read_source("open", frozenset())
+    assert not await store.may_read_source("restricted", frozenset())
+    assert await store.may_read_source("restricted", frozenset({member}))
+
+
 async def test_readable_totals_count_only_what_the_reader_set_may_read(
     store: SqliteDocStore,
 ) -> None:
