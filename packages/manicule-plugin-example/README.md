@@ -15,10 +15,13 @@ and exists for two reasons:
 ## Bringing a source of your own
 
 `DirectoryConnector` is the one to copy for a connector that will never be upstreamed: a directory
-of text files read incrementally by modification time, with the three things a connector can get
-quietly wrong done correctly — a watermark that advances only when an enumeration finishes, a
-`reconcile` that reports what still exists, and a `version_token` computed without fetching.
-`tests/test_example_plugin.py` runs `assert_connector_contract` against it.
+of text files, walked in full on every sync, with a version token per file that decides what is
+read again. It does the things a connector can get quietly wrong: a token that names the root and
+that `fetch` returns as proof of the revision it read (durable acquisition refuses a body without
+it), a watermark that is set only when a walk completes, and a `reconcile` that fails rather than
+return a partial inventory. `tests/test_example_plugin.py` runs `assert_connector_contract`
+against it, and `tests/connectors/test_example_connector_pipeline.py` drives it through the real
+ingest pipeline.
 [`docs/writing-a-connector.md`](../../docs/writing-a-connector.md) is the walkthrough.
 
 ```toml

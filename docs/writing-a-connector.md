@@ -77,35 +77,48 @@ PLUGIN = AcmePlugin()
 | Member | Obligation |
 |---|---|
 | `name` | The **instance** name, `context.instance`, not the type. It becomes the `source` half of every document's identity, so two instances of one type must not share it. |
-| `discover(watermark)` | Yield `DiscoveredDoc` for what was created or changed since `watermark`; `None` means everything. Give each a `version_token` computed **without fetching**: an unchanged document is never downloaded. |
-| `fetch(ref)` | Return one document's bytes as a `RawDocument` with an honest `media_type`. Parsing is not your job; the parser chain for that media type does it. |
-| `reconcile()` | Yield every source id that **still exists**. Incremental sync cannot see a deletion, so this is the only way a removed document leaves the index. It is mandatory so nobody can omit it quietly. |
+| `discover(watermark)` | Yield `DiscoveredDoc` for what exists or has changed; `None` means everything. Give each a `version_token` computed **without fetching**: an unchanged document is never downloaded. |
+| `fetch(ref)` | Return one document's bytes as a `RawDocument` with an honest `media_type`, **and the revision it read in `metadata["version_token"]`** (below). Parsing is not your job; the parser chain for that media type does it. |
+| `reconcile()` | Yield every source id that **still exists**. A watermark sync cannot see a deletion, so this is the only way a removed document leaves the index. It is mandatory so nobody can omit it quietly. |
 | `watermark` | A read-only property: how far the last **completed** enumeration got, or `None`. |
 
-Two of these are worth a paragraph each, because both fail silently.
+Five of these are worth a paragraph each, because every one fails silently or late.
+
+**`fetch` must prove which revision it read.** Durable acquisition (`storage.retain_source_bytes`,
+on by default) stores the bytes before indexing them, and refuses a body that carries no proof it
+is at least as new as what discovery saw. Put the *same* token `discover` produced in
+`metadata["version_token"]`, computed from the source's state around the read, and refuse a
+document that changed while you were reading it. A connector that omits this passes
+`assert_connector_contract` and still indexes nothing: every document sits in retry.
+`tests/connectors/test_example_connector_pipeline.py` drives a connector through the real pipeline
+for exactly this reason. Build the token in one function that both methods call; two copies agree
+until somebody edits one.
+
+**A version token is a claim about *this* source, so name the source in it.** If the same
+identifier, size and timestamp can mean different bytes under another base URL or root
+directory, a source repointed at the new location keeps the old one's content, because the token
+did not move. Fold a digest of whatever locates the data into the token.
 
 **Advance the watermark when the enumeration ends, never as you yield.** If `discover` is
 interrupted, a watermark that already moved sits *past* documents nobody received; the next sync
 starts there and never sees them again, with no error. Set it after the loop, as
-`DirectoryConnector` does. If your source has no change signal, leave it `None` and re-enumerate
-fully; that is a legitimate connector, and it shows in `doctor` rather than being hidden.
+`DirectoryConnector` does.
 
-**Tie the watermark to the configuration that produced it.** If the base URL, a space filter
-or a root directory changes, the stored position says nothing about the new scope, and honoring
-it skips everything older than that position, permanently and without an error. Record a
-fingerprint of the scope-defining options in `Watermark.metadata` and treat a watermark whose
-fingerprint differs as `None`. `DirectoryConnector._position` is the short version; the mbox and
-Git-site connectors do the same with `scope_fingerprint`.
+**Only resume from a position if your source has a real change feed.** A cursor — a modification
+time, an "updated since" query — misses anything that appears *behind* it: a file copied in with
+its old timestamp, a page restored from backup, an item edited while the walk was running. If you
+do use one, bind it to the configuration that produced it (record a scope fingerprint in
+`Watermark.metadata` and treat a watermark with a different one as `None`, as the mbox and
+Git-site connectors do), and overlap it slightly, because the gap between "yielded" and
+"committed" is real and is only made survivable (the Confluence connector reaches five minutes
+back). A source without a change feed should enumerate fully and let the version token do the
+skipping, which is what `DirectoryConnector` does: the walk costs one `stat` per file and nothing
+is read for an unchanged one.
 
-**Know what your change signal cannot see.** A modification time or an "updated since" cursor
-misses anything that appears *behind* the position: a file copied in with its old timestamp, a
-page restored from backup. `reconcile` only finds deletions. If your source can do that, return
-`None` and enumerate fully, as `DirectoryConnector`'s docstring describes.
-
-**Overlap the position slightly.** The gap between "yielded" and "committed" is real and is not
-eliminated, only made survivable: start each sync a little before the stored position (the
-Confluence connector reaches five minutes back). Re-enumerating a few documents costs a
-version-token comparison, and change detection discards what has not changed.
+**An inventory is complete or it is an error.** `reconcile` decides deletion, and a listing that
+quietly omitted something looks identical to a source whose files were deleted. Raise on an
+unreachable root, a directory you cannot list, a permission failure; ignore only a file that
+genuinely vanished between being listed and being read.
 
 The lifecycle hooks (`setup`, `teardown`, `health`) are optional. Add `setup` when you need to
 `await` something before the first call — opening a session, say. Factories run on a worker
@@ -151,8 +164,12 @@ async def test_it_honors_the_contract():
 
 It checks that `discover`, `fetch` and `reconcile` agree with one another, that `reconcile` does
 not omit anything `discover` returned, and that an abandoned enumeration leaves the watermark
-where it was. Point the connector at a recorded fixture or a local fake of the source, never the
-live service. `tests/connectors/fake_confluence.py` shows how far that can go.
+where it was. It does **not** check what the ingest pipeline asks of a connector on top of the
+protocol, such as the revision proof `fetch` must return. Drive the connector through
+`IngestPipeline` as well, with durable acquisition on; the repository's
+`tests/connectors/test_example_connector_pipeline.py` is the shortest version. Point the
+connector at a recorded fixture or a local fake of the source, never the live service.
+`tests/connectors/fake_confluence.py` shows how far that can go.
 
 ## 5. Things that will bite you
 
