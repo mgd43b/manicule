@@ -19,6 +19,12 @@ deleted.
 
 The refusal is loud and carries no content from the offending row. A leak reported by quoting
 what leaked is still a leak.
+
+**Readers are checked here the same way.** A workspace can restrict documents to some of its
+readers (:mod:`manicule.core.readers`), and the store applies that restriction as a predicate
+too. :func:`require_readable` is its second check: it reads the gates the document came back
+carrying and compares them with the caller's reader set, and consults nothing else. A store that
+forgot the predicate, or a path that produced a document without reading its gates, fails it.
 """
 
 from __future__ import annotations
@@ -27,9 +33,12 @@ from typing import TYPE_CHECKING, Protocol
 
 from manicule.core.errors import ManiculeError
 from manicule.core.ids import document_id
+from manicule.core.readers import admits
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+
+    from manicule.core.readers import DocumentAccess
 
 
 class CrossWorkspaceError(ManiculeError):
@@ -86,6 +95,55 @@ def require_owned[T: Owned](workspace: str, documents: Iterable[T]) -> Sequence[
     return checked
 
 
+class UnreadableDocumentError(ManiculeError):
+    """Something on its way to a caller came from a document that caller may not read.
+
+    Raised rather than filtered, for :class:`CrossWorkspaceError`'s reason: by the time this
+    runs, the store has already been asked to exclude the document, so finding one here is a
+    defect, and an answer quietly assembled from what was left would be a ranking computed
+    over a corpus the caller was never meant to see.
+    """
+
+
+class Gated(Protocol):
+    """The one field a reader check reads."""
+
+    @property
+    def access(self) -> DocumentAccess | None: ...
+
+
+def require_readable[T: Gated](
+    readers: frozenset[str] | None, documents: Iterable[T]
+) -> Sequence[T]:
+    """Return ``documents`` unchanged, having proved the caller may read every one of them.
+
+    Args:
+        readers: The caller's reader set, ``None`` for a caller no gate applies to.
+        documents: What a store returned, each carrying the gates it was read with.
+
+    Returns:
+        The same documents, in the same order.
+
+    Raises:
+        UnreadableDocumentError: One of them carries a gate the caller's reader set does not
+            open, or carries no gates at all because the path that produced it did not read
+            them. The message says how many, and **never** which, or what they hold.
+    """
+    checked = list(documents)
+    if readers is None:
+        return checked
+    refused = sum(1 for document in checked if not admits(readers, document.access))
+    if refused:
+        msg = (
+            f"{refused} of {len(checked)} document(s) on their way to this caller are ones "
+            f"the caller may not read. The store was asked to exclude them, so this is a "
+            f"store that ignored the reader set or a path that did not read a document's "
+            f"gates. Nothing was returned."
+        )
+        raise UnreadableDocumentError(msg)
+    return checked
+
+
 def require_owns(workspace: str, document: Owned) -> None:
     """Prove one document is this tenant's.
 
@@ -97,8 +155,11 @@ def require_owns(workspace: str, document: Owned) -> None:
 
 __all__ = [
     "CrossWorkspaceError",
+    "Gated",
     "Owned",
+    "UnreadableDocumentError",
     "belongs_to",
     "require_owned",
     "require_owns",
+    "require_readable",
 ]

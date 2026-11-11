@@ -56,6 +56,16 @@ class Filter(BaseModel):
     langs: frozenset[str] = frozenset()
     updated_after: datetime | None = None
     updated_before: datetime | None = None
+    readers: frozenset[str] | None = Field(
+        default=None,
+        description="The caller's reader set (:mod:`manicule.core.readers`): the principals "
+        "they hold, of which a document must admit one through every gate it carries. "
+        "``None`` restricts nothing — a caller no gate applies to. ``frozenset()`` is a caller "
+        "holding no principal, who reads only documents that carry no gate; the two are "
+        "opposite instructions, as an unset and an empty collection are. A document-level "
+        "field, so it is applied by the hydrating join and the lexical statement and never "
+        "reaches the vector store, which has no column for it.",
+    )
 
     @model_validator(mode="after")
     def _timestamps_are_aware(self) -> Self:

@@ -112,11 +112,15 @@ async def dashboard(request: Request, service: Service, caller: Reader) -> HTMLR
     **Served from a snapshot** (:mod:`manicule.web.snapshots`), because the counts and the
     diagnosis are O(index) and a refresh must not start another walk. The page says when the
     snapshot was taken. None of the three is the reader's own — they are the workspace's — so
-    one snapshot per workspace serves every reader.
+    one snapshot per workspace serves every reader who sees the same counts. While some of the
+    workspace's documents are restricted to some of its readers the counts are narrowed to what
+    each reader may read (:meth:`~manicule.app.service.ApplicationService.stats`), so the
+    snapshot is keyed by :meth:`~manicule.app.service.ApplicationService.counts_scope` too: one
+    reader's counts are never served to another.
     """
     cache: SnapshotCache = request.app.state.dashboard_snapshots
     snapshot = await cache.get(
-        service.workspace,
+        f"{service.workspace}\x1f{await service.counts_scope()}",
         lambda: panels(
             service,
             {

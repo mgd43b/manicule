@@ -530,8 +530,14 @@ class FakeOrganization:
         return removed
 
     async def collection_documents(
-        self, collection_id: str, *, limit: int = 100, offset: int = 0
+        self,
+        collection_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        readers: frozenset[str] | None = None,
     ) -> Sequence[Document]:
+        del readers
         held = [
             self.documents[identifier]
             for identifier in self.members.get(collection_id, [])
@@ -618,9 +624,14 @@ class LeakyOrganization(FakeOrganization):
 
     @override
     async def collection_documents(
-        self, collection_id: str, *, limit: int = 100, offset: int = 0
+        self,
+        collection_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        readers: frozenset[str] | None = None,
     ) -> Sequence[Document]:
-        del limit, offset
+        del limit, offset, readers
         return [
             self.documents[identifier]
             for identifier in self.members.get(collection_id, [])
@@ -676,19 +687,21 @@ class FakeConversations:
     async def create_conversation(
         self, *, user_id: str | None = None, title: str | None = None
     ) -> str:
-        del user_id
         identifier = f"conv_{len(self.records)}"
         moment = datetime.now(UTC)
         self.records[identifier] = ConversationRecord(
-            id=identifier, title=title, created_at=moment, updated_at=moment
+            id=identifier, title=title, created_at=moment, updated_at=moment, user_id=user_id
         )
         self.turns[identifier] = []
         return identifier
 
     async def list_conversations(
-        self, *, limit: int = 50, offset: int = 0
+        self, *, limit: int = 50, offset: int = 0, owner: str | None = None
     ) -> Sequence[ConversationRecord]:
-        ordered = sorted(self.records.values(), key=lambda item: item.id)
+        ordered = sorted(
+            (item for item in self.records.values() if owner is None or item.user_id == owner),
+            key=lambda item: item.id,
+        )
         return ordered[offset : offset + limit]
 
     async def get_conversation(self, conversation_id: str) -> ConversationRecord | None:

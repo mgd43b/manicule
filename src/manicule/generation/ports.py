@@ -104,6 +104,9 @@ class ConversationRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
     messages: int = Field(default=0, ge=0)
+    user_id: str | None = None
+    """The person who started it, or ``None`` for the operator at this machine and for every
+    conversation started before ownership was recorded."""
 
 
 @runtime_checkable

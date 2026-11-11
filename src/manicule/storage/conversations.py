@@ -140,9 +140,12 @@ class SqliteConversationStore:
         return conversation_id
 
     async def list_conversations(
-        self, *, limit: int = 50, offset: int = 0
+        self, *, limit: int = 50, offset: int = 0, owner: str | None = None
     ) -> Sequence[ConversationRecord]:
         """This workspace's live conversations, most recently touched first.
+
+        ``owner`` narrows the page to the conversations one person started, in the statement
+        rather than afterwards, so that a page is still a page.
 
         The turn count comes from a correlated subquery rather than from a second pass, so a
         page of twenty conversations is one statement. Soft-deleted ones are absent for the
@@ -162,6 +165,7 @@ class SqliteConversationStore:
                     .where(
                         models.Conversation.workspace_id == self._workspace_id,
                         models.Conversation.deleted_at.is_(None),
+                        *(() if owner is None else (models.Conversation.user_id == owner,)),
                     )
                     .order_by(models.Conversation.updated_at.desc(), models.Conversation.id)
                     .limit(max(limit, 0))
@@ -508,6 +512,7 @@ def _to_record(row: models.Conversation, messages: int) -> ConversationRecord:
         created_at=row.created_at,
         updated_at=row.updated_at,
         messages=messages,
+        user_id=row.user_id,
     )
 
 

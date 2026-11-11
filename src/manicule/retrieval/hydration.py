@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from manicule.core.content import DocumentStatus
+from manicule.core.readers import admits
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -30,7 +31,8 @@ async def visible_documents(
     visible to a search — its chunks' vectors and text need not agree yet.
 
     ``join`` carries the whole document-level restriction, so this call is simultaneously the
-    tenancy boundary and the post-filter for any field that was too numerous to push down.
+    tenancy boundary, the reader boundary (:attr:`~manicule.core.retrieval.Filter.readers`) and
+    the post-filter for any field that was too numerous to push down.
     That is deliberate: a post-filter written separately would be a second predicate to keep
     in step with the first.
     """
@@ -42,10 +44,15 @@ async def visible_documents(
     documents = await docstore.list_documents(
         join.model_copy(update={"document_ids": wanted}), limit=len(wanted)
     )
+    # The reader set is applied twice here, and the second is not the first written again. The
+    # store's statement excludes what the caller may not read; the gates each document came back
+    # carrying are then checked on the row itself, so a store that dropped the predicate — or
+    # one that returned documents without reading their gates — still admits nothing it should
+    # not. Dropped rather than raised: this is a join, and an excluded row is what a join drops.
     return {
         document.id: document.publication_id
         for document in documents
-        if document.status is DocumentStatus.INDEXED
+        if document.status is DocumentStatus.INDEXED and admits(join.readers, document.access)
     }
 
 

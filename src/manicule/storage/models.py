@@ -279,6 +279,78 @@ class AuthSession(Base):
     )
 
 
+# --- readers -----------------------------------------------------------------------------
+
+
+class ReaderGroup(Base):
+    """A named set of people an administrator can grant a source to.
+
+    Workspace-scoped like a collection or a tag: a group means nothing outside the workspace it
+    was made in, and its id is what a reader set carries (``group:<id>``), so a cross-workspace
+    search can hold several workspaces' groups in one set without their names colliding.
+    """
+
+    __tablename__ = "reader_groups"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_reader_groups_workspace_id_name"),
+    )
+
+
+class ReaderGroupMember(Base):
+    """One person in one reader group.
+
+    Removed with the person or the group. Removing a member narrows what they read, which is
+    the safe direction for a cascade to move.
+    """
+
+    __tablename__ = "reader_group_members"
+
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("reader_groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (Index("ix_reader_group_members_user_id", "user_id"), WITHOUT_ROWID)
+
+
+class SourceReaderGrant(Base):
+    """A source of this workspace readable by one reader group.
+
+    A source with no grant is readable by every reader of the workspace; a source with any
+    grant is readable only by members of a granted group. Evaluated when a query runs rather
+    than copied onto each document at sync, so that a grant or a revocation takes effect on the
+    next query instead of the next sync.
+
+    **The group's foreign key has no ``ON DELETE`` action, deliberately.** A cascade would
+    delete the grant with the group, and deleting a source's last grant opens it to everyone:
+    removing a restriction must be an act somebody chose, never a side effect of tidying up a
+    group. The constraint is checked at the end of the statement, so a workspace deleted whole
+    still takes its groups and its grants together.
+    """
+
+    __tablename__ = "source_reader_grants"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    source: Mapped[str] = mapped_column(Text, primary_key=True)
+    group_id: Mapped[str] = mapped_column(ForeignKey("reader_groups.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (Index("ix_source_reader_grants_group_id", "group_id"), WITHOUT_ROWID)
+
+
 # --- retained source bytes ---------------------------------------------------------------
 
 

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from manicule.generation.answering import SupportsAnswer as Answering
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
     from datetime import datetime
     from pathlib import Path
 
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from manicule.core.organization import Collection as DocumentCollection
     from manicule.core.organization import CollectionRule, Restoration, Tag, TrashEntry
     from manicule.core.protocols import Connector, Generator
+    from manicule.core.readers import ReadableTotals, ReaderGroup
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Filter, Query
     from manicule.core.source_lifecycle import LifecycleOutcome, LifecyclePlan
@@ -654,7 +655,12 @@ class Organizing(Protocol):
     ) -> int: ...
 
     async def collection_documents(
-        self, collection_id: str, *, limit: int = 100, offset: int = 0
+        self,
+        collection_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        readers: frozenset[str] | None = None,
     ) -> Sequence[Document]: ...
 
     async def ensure_tag(self, name: str, *, color: str | None = None) -> Tag: ...
@@ -691,7 +697,7 @@ class Conversing(Protocol):
     ) -> str: ...
 
     async def list_conversations(
-        self, *, limit: int = 50, offset: int = 0
+        self, *, limit: int = 50, offset: int = 0, owner: str | None = None
     ) -> Sequence[ConversationRecord]: ...
 
     async def get_conversation(self, conversation_id: str) -> ConversationRecord | None: ...
@@ -1011,6 +1017,56 @@ class Users(Protocol):
         ...
 
 
+@runtime_checkable
+class ReaderStore(Protocol):
+    """Reader groups, source grants, and what one reader set may read, for one workspace.
+
+    Optional, and in one direction only: a document store without it can hold no grant, so
+    every document it holds is readable by every reader of its workspace — which is exactly
+    what an installation that configured no readers reads anyway.
+    """
+
+    async def has_reader_gates(self) -> bool:
+        """Whether any document here could be refused to any reader of this workspace."""
+        ...
+
+    async def reader_principals(self, user_id: str) -> frozenset[str]:
+        """The principals one person holds here: themself, and each reader group they are in."""
+        ...
+
+    async def readable_document_ids(
+        self, document_ids: Iterable[str], readers: frozenset[str]
+    ) -> frozenset[str]:
+        """Which of ``document_ids``, in any state, ``readers`` may read here."""
+        ...
+
+    async def readable_totals(self, readers: frozenset[str]) -> ReadableTotals:
+        """The workspace's counts, over only what ``readers`` may read."""
+        ...
+
+    async def create_reader_group(self, name: str) -> ReaderGroup: ...
+
+    async def list_reader_groups(self) -> Sequence[ReaderGroup]: ...
+
+    async def find_reader_group(self, name_or_id: str) -> ReaderGroup | None: ...
+
+    async def delete_reader_group(self, name_or_id: str) -> ReaderGroup: ...
+
+    async def add_reader_group_members(
+        self, name_or_id: str, user_ids: Sequence[str]
+    ) -> ReaderGroup: ...
+
+    async def remove_reader_group_members(
+        self, name_or_id: str, user_ids: Sequence[str]
+    ) -> ReaderGroup: ...
+
+    async def grant_source(self, source: str, groups: Sequence[str]) -> tuple[str, ...]: ...
+
+    async def revoke_source(self, source: str, groups: Sequence[str]) -> tuple[str, ...]: ...
+
+    async def source_grants(self) -> dict[str, tuple[str, ...]]: ...
+
+
 class RetainedBytes(Protocol):
     """Reading back the bytes a connector delivered, and nothing else.
 
@@ -1131,6 +1187,7 @@ __all__ = [
     "MemberChange",
     "OpenedWorkspace",
     "Organizing",
+    "ReaderStore",
     "RetainedBytes",
     "Retrieving",
     "RetrievingAcross",

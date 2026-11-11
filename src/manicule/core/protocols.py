@@ -874,9 +874,19 @@ class CollectionStore(Protocol):
         ...
 
     async def collection_documents(
-        self, collection_id: str, *, limit: int = 100, offset: int = 0
+        self,
+        collection_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        readers: frozenset[str] | None = None,
     ) -> Sequence[Document]:
-        """Live members, manual and rule-selected together, newest first."""
+        """Live members, manual and rule-selected together, newest first.
+
+        ``readers`` narrows the members to those a caller holding that reader set may read
+        (:mod:`manicule.core.readers`); ``None`` narrows nothing. A store that keeps no reader
+        gates holds no member any reader is refused, so it may ignore it.
+        """
         ...
 
     async def collections_for(self, document_id: str) -> Sequence[Collection]:
