@@ -1,6 +1,6 @@
 """Reuse of another workspace's stored vectors, without sharing a row with it.
 
-``docs/storage.md`` §6.2.1 is the design this implements. The same source synced into two
+``docs/storage.md`` §6.2.6 is the design this implements. The same source synced into two
 workspaces is two documents with two sets of chunks, because a document's identity carries its
 workspace (:func:`~manicule.core.ids.document_id`), and that is not negotiable. What it does not
 have to be is two sets of forward passes: a vector is a pure function of its embedding input
@@ -32,7 +32,7 @@ document as embedded (:class:`~manicule.ingest.embedding.EmbeddingWork`), and th
 vectors borrowed is written only to an operator's ledger. What cannot be hidden is time: a
 document that borrowed every vector indexes faster than one that did not, and with reuse always
 on that difference is observable to anybody who can time a sync. That is an accepted cost,
-stated in ``docs/storage.md`` §6.2.1 rather than discovered.
+stated in ``docs/storage.md`` §6.2.6 rather than discovered.
 """
 
 from __future__ import annotations
@@ -69,8 +69,13 @@ class Donors(Protocol):
     since is not one any more.
     """
 
-    async def donors(self) -> Sequence[Donor]:
-        """Every other workspace whose recorded embedding fingerprint is this one's."""
+    async def donors(self, *, source: str, source_id: str) -> Sequence[Donor]:
+        """The other workspaces that may hold vectors for the document ``(source, source_id)``.
+
+        A narrowing, never a guarantee: a donor returned here is still asked, and its store's
+        own verdict decides whether anything is lent. Returning every other workspace is
+        correct and merely slower.
+        """
         ...
 
 
@@ -130,7 +135,7 @@ class SharedVectors:
         remaining: list[Chunk] = list(chunks)
         if not remaining:
             return found
-        for donor in await self._donors.donors():
+        for donor in await self._donors.donors(source=source, source_id=source_id):
             if not remaining:
                 break
             try:

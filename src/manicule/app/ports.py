@@ -235,7 +235,7 @@ class CountsVectorReuse(Protocol):
 
     async def vectors_from_other_workspaces(self) -> int:
         """How many vectors this workspace copied from another one's store (``docs/storage.md``
-        §6.2.1). Read only on behalf of the operator at this machine."""
+        §6.2.6). Read only on behalf of the operator at this machine."""
         ...
 
 

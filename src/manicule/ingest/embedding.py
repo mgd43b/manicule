@@ -233,7 +233,7 @@ async def embed_checked_chunks(
 class VectorLender(Protocol):
     """Vectors another workspace already holds, offered in place of a model call.
 
-    The cross-workspace half of :func:`embed_or_reuse` (``docs/storage.md`` §6.2.1), as the one
+    The cross-workspace half of :func:`embed_or_reuse` (``docs/storage.md`` §6.2.6), as the one
     question that function needs answered. :class:`manicule.ingest.shared_vectors.SharedVectors`
     is the implementation; a protocol here so that this module, which every embedding route
     imports, does not import the workspace machinery the answer needs.
@@ -284,7 +284,7 @@ class EmbeddingWork:
     """Chunks this workspace held no reusable vector for: the embedding work this document cost.
 
     Includes any chunk whose vector was copied from another workspace that already held the same
-    embedding input (``docs/storage.md`` §6.2.1). That copy is invisible here on purpose: this
+    embedding input (``docs/storage.md`` §6.2.6). That copy is invisible here on purpose: this
     record reaches callers scoped to one workspace, and a count that fell when another tenant
     already held a text would tell them so. The operator's count of copied vectors is kept
     apart, by the lender.
@@ -462,7 +462,7 @@ async def embed_or_reuse(
         timings: Where to record the time the vector store's lookup took, as ``stored_vectors``.
         lender: Where to look, after this workspace's own store, for a vector another workspace
             of this installation already holds for exactly the same embedding input
-            (``docs/storage.md`` §6.2.1). Asked only about chunks this store could not supply,
+            (``docs/storage.md`` §6.2.6). Asked only about chunks this store could not supply,
             only when ``reuse`` is true, and only after the oversize refusal has run over them.
             What it lends is placed exactly as a model output would be and **reported exactly
             as one**: the chunks count as ``embedded`` under the same classification, and

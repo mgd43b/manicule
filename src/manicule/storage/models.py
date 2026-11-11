@@ -1550,7 +1550,7 @@ class IndexState(Base):
 class VectorReuseLedger(Base):
     """How many vectors each workspace copied from another instead of embedding them.
 
-    The operator's count for ``docs/storage.md`` §6.2.1, and the only place the fact is
+    The operator's count for ``docs/storage.md`` §6.2.6, and the only place the fact is
     recorded. One row per *receiving* workspace, keyed by it and by nothing else: the workspace
     that lent is deliberately not recorded, because "which other tenant already held this
     text" is exactly what reuse must not let anybody learn, and a column naming it would be a

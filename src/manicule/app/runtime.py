@@ -1239,7 +1239,7 @@ class Runtime:
             # fingerprint that recorded a state configuration could not actually reach would be
             # a lie told in a column rather than a setting quietly doing nothing.
             detect_glossary=settings.rag.glossary.detect_on_ingest,
-            # Always on: no setting turns it off (`docs/storage.md` §6.2.1). What it costs a
+            # Always on: no setting turns it off (`docs/storage.md` §6.2.6). What it costs a
             # document that no other workspace holds is one read per other indexed workspace.
             shared_vectors=SharedVectors(
                 _RuntimeDonors(
@@ -2706,8 +2706,10 @@ class _RuntimeDonors:
     fingerprint: EmbedFingerprint
     middleware: Sequence[str]
 
-    async def donors(self) -> Sequence[Donor]:
-        return await self.registry.donors(self.fingerprint, self.middleware)
+    async def donors(self, *, source: str, source_id: str) -> Sequence[Donor]:
+        return await self.registry.donors(
+            self.fingerprint, self.middleware, source=source, source_id=source_id
+        )
 
 
 class _VectorReuseLedger:
@@ -2715,7 +2717,7 @@ class _VectorReuseLedger:
 
     Satisfies :class:`~manicule.ingest.shared_vectors.BorrowLedger`. One upsert per document
     that borrowed anything, in the engine's writer queue like every other write here. It names
-    the receiving workspace and nothing else (``docs/storage.md`` §6.2.1).
+    the receiving workspace and nothing else (``docs/storage.md`` §6.2.6).
     """
 
     def __init__(self, runtime: Runtime) -> None:
@@ -2800,7 +2802,7 @@ class _Workspaces:
         self._runtime = runtime
         self._stores: dict[str, SqliteDocStore] = {}
         self._vectors: dict[str, _OpenedVectors] = {}
-        # Handles opened to lend vectors to this workspace's ingest (`docs/storage.md` §6.2.1),
+        # Handles opened to lend vectors to this workspace's ingest (`docs/storage.md` §6.2.6),
         # cached apart from the search handles above. They are prepared with this pipeline's
         # middleware declaration, which a search never loads, and a shared slot would tear one
         # kind down to open the other while a caller of the first was still using it.
@@ -2922,31 +2924,62 @@ class _Workspaces:
         }
 
     async def donors(
-        self, fingerprint: EmbedFingerprint, middleware: Sequence[str]
+        self,
+        fingerprint: EmbedFingerprint,
+        middleware: Sequence[str],
+        *,
+        source: str,
+        source_id: str,
     ) -> Sequence[Donor]:
-        """Read handles on every other workspace that could lend this one a vector.
+        """Read handles on every other workspace that could lend this one ``source_id``'s vectors.
 
-        ``docs/storage.md`` §6.2.1. A workspace qualifies when it has recorded an index built by
-        exactly ``fingerprint``'s model; anything else is **skipped, never refused**. That is
-        the difference from :meth:`open`: a search names its workspaces and a missing one makes
-        the answer partial, while a donor is an optimization nobody asked for by name, and a
+        ``docs/storage.md`` §6.2.6. A workspace qualifies when it has recorded an index built by
+        exactly ``fingerprint``'s model and holds a live document for the same
+        ``(source, source_id)``; anything else is **skipped, never refused**. That is the
+        difference from :meth:`open`: a search names its workspaces and a missing one makes the
+        answer partial, while a donor is an optimization nobody asked for by name, and a
         workspace that cannot lend leaves the document to the model rather than failing it.
+
+        **The document check is what keeps a first sync cheap.** It is one primary-key read of
+        ``documents`` for every candidate at once, and it means a vector store is asked only by
+        the workspaces that could possibly answer. Without it, every document of every sync
+        would cost one identity lookup in every other indexed workspace's vectors, almost all of
+        them finding nothing. A document the check admits can still lend nothing: the vector
+        store's own verdict decides that.
 
         Ordered by name, so which donor answers first does not depend on how rows came back.
         """
+        from sqlalchemy import select  # noqa: PLC0415
+
         from manicule.core.embedding import EmbedFingerprint as Fingerprint  # noqa: PLC0415
+        from manicule.core.ids import document_id  # noqa: PLC0415
         from manicule.ingest.shared_vectors import Donor as Lending  # noqa: PLC0415
+        from manicule.storage import models  # noqa: PLC0415
 
         runtime = self._runtime
         async with self._lock:
             known = await self._known_states()
+            eligible = {
+                document_id(name, source, source_id): name
+                for name, (recorded, _namespace, _epoch) in known.items()
+                if name != runtime.workspace
+                and recorded is not None
+                and Fingerprint.model_validate_json(recorded).matches(fingerprint)
+            }
+            if not eligible:
+                return []
+            async with runtime.require_engine().connect() as connection:
+                holding = {
+                    str(row.workspace_id)
+                    for row in await connection.execute(
+                        select(models.Document.workspace_id).where(
+                            models.Document.id.in_(sorted(eligible)),
+                            models.Document.deleted_at.is_(None),
+                        )
+                    )
+                }
             found: list[Donor] = []
-            for name in sorted(known):
-                recorded, _namespace, _epoch = known[name]
-                if name == runtime.workspace or recorded is None:
-                    continue
-                if not Fingerprint.model_validate_json(recorded).matches(fingerprint):
-                    continue
+            for name in sorted(holding & set(eligible.values())):
                 try:
                     vectors = await self._vectors_for(
                         name,

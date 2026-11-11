@@ -3902,7 +3902,7 @@ class ApplicationService:
         """Counts, grouped the three ways anybody asks for."""
         store = await self._backend.documents()
         statistics = await store.document_statistics()
-        # Only for the operator at this machine (`docs/storage.md` §6.2.1). An administrator
+        # Only for the operator at this machine (`docs/storage.md` §6.2.6). An administrator
         # over the network is still scoped to this workspace, and the count is a measurement of
         # what *other* workspaces held.
         borrowed = (

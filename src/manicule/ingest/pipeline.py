@@ -1146,7 +1146,7 @@ class IngestPipeline:
         self._store = store
         self._sensitive_sources, self._marked_sensitive = frozenset(sensitive_sources), set[str]()
         # Other workspaces' stored vectors, consulted for what this one's store cannot supply
-        # (`docs/storage.md` §6.2.1). Always on where the runtime provides it; `None` is a
+        # (`docs/storage.md` §6.2.6). Always on where the runtime provides it; `None` is a
         # pipeline built without a view of any other workspace, which is every unit test.
         self._shared_vectors = shared_vectors
         # Explicit protocol injection keeps the legacy bounded path available to protocol-only

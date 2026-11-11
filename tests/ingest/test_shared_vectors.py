@@ -1,6 +1,6 @@
 """Reusing another workspace's stored vectors without sharing a row with it.
 
-``docs/storage.md`` §6.2.1. Every count here comes from
+``docs/storage.md`` §6.2.6. Every count here comes from
 :class:`~tests.ingest.fakes.CountingEmbedder`, which records one entry per batch it is handed:
 the claim under test is about forward passes avoided, and only the embedder can see one.
 
@@ -49,7 +49,8 @@ class StaticDonors:
     def __init__(self, donors: Sequence[Donor]) -> None:
         self._donors = list(donors)
 
-    async def donors(self) -> Sequence[Donor]:
+    async def donors(self, *, source: str, source_id: str) -> Sequence[Donor]:
+        del source, source_id
         return self._donors
 
 

@@ -2711,7 +2711,7 @@ class Stats(Payload):
     vectors_from_other_workspaces: int | None = Field(default=None, ge=0)
     """Vectors this workspace copied from another workspace's store instead of embedding them.
 
-    **The operator's number, and nobody else's** (``docs/storage.md`` §6.2.1). Filled only for
+    **The operator's number, and nobody else's** (``docs/storage.md`` §6.2.6). Filled only for
     the operator at this machine, who holds every workspace already; ``None`` for every caller
     reached over the network, administrators included, because a count that rose when another
     tenant already held a text would tell a workspace-scoped caller that it did. ``0`` and

@@ -1438,7 +1438,10 @@ only the chunks that store could not supply. It does so only when reuse is on, s
 including the tokenizer's own count where the embedder has one. A chunk the model would refuse is
 refused whether or not another workspace holds a vector for it. The connector sync and the
 re-parse sweeps go through the pipeline and borrow. `reindex --repair` and the offline rebuild
-call `embed_or_reuse` without a lender and do not. On the embedded backend the runtime opens
+call `embed_or_reuse` without a lender and do not. Before any vector store is read, the runtime
+keeps only the workspaces that hold a live document under the re-addressed id, which costs one
+primary-key read of `documents` for all of them together. An unrelated corpus therefore costs no
+read of another workspace's vectors. On the embedded backend the runtime opens
 each other workspace's published LanceDB generation read-only, as a spanning search does
 (`retrieval.md` §3.2), and prepares it with this installation's embed-text middleware
 declaration so the identities it derives are the ones that workspace recorded. On Qdrant it uses

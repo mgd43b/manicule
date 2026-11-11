@@ -2199,7 +2199,7 @@ async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
         await _drop(server_store, server_client, 8)
 
 
-# --- lending to another workspace (docs/storage.md §6.2.1) -----------------------------------
+# --- lending to another workspace (docs/storage.md §6.2.6) -----------------------------------
 
 
 class _Donors:
@@ -2208,7 +2208,8 @@ class _Donors:
     def __init__(self, *donors: Donor) -> None:
         self._donors = donors
 
-    async def donors(self) -> tuple[Donor, ...]:
+    async def donors(self, *, source: str, source_id: str) -> tuple[Donor, ...]:
+        del source, source_id
         return self._donors
 
 

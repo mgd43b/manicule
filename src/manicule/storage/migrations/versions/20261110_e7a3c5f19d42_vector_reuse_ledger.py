@@ -1,6 +1,6 @@
 """a ledger of vectors copied between workspaces instead of embedded
 
-``docs/storage.md`` §6.2.1: a workspace ingesting an embedding input another workspace already
+``docs/storage.md`` §6.2.6: a workspace ingesting an embedding input another workspace already
 holds a readable vector for copies that vector rather than calling the model. Callers scoped
 to a workspace are never told it happened; the count of copied vectors is kept here, one row
 per receiving workspace, for the operator.

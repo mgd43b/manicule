@@ -1,6 +1,6 @@
 """Cross-workspace vector reuse through the production runtime, on the embedded backend.
 
-``docs/storage.md`` §6.2.1. The ingest-level tests hold the reuse rule to its counts; these hold
+``docs/storage.md`` §6.2.6. The ingest-level tests hold the reuse rule to its counts; these hold
 the assembly to it: the runtime finds the other workspace, opens its published LanceDB handle
 for reading, and the second workspace's sync of a source the first already holds reaches the
 model for nothing. What it stores is checked through the same integrity path a freshly written
@@ -112,3 +112,27 @@ async def test_a_second_workspace_reaches_the_model_for_nothing_it_already_holds
 
     async with _runtime(tmp_path, "alpha", CountingEmbedder()) as first:
         assert (await ApplicationService(first).stats()).vectors_from_other_workspaces == 0
+
+
+async def test_only_a_workspace_holding_the_document_is_asked(tmp_path: Path) -> None:
+    """The cheap check before any vector store is read: does the other workspace hold it at all.
+
+    A workspace indexed under the same model but holding other documents is not a donor for
+    this one, so a first sync of an unrelated corpus costs no read of its vectors.
+    """
+    async with _runtime(tmp_path, "alpha", CountingEmbedder()) as first:
+        await _sync(first)
+    async with _runtime(tmp_path, "gamma", CountingEmbedder()) as unrelated:
+        connector = fakes.DictConnector({"elsewhere": "Text nobody else holds."}, name=SOURCE)
+        connector.media_types = {"elsewhere": "text/markdown"}
+        await (await unrelated.pipeline()).run(connector)
+
+    model = CountingEmbedder()
+    async with _runtime(tmp_path, "beta", model) as second:
+        await second.pipeline()
+        registry = second._workspaces  # pyright: ignore[reportPrivateUsage] - the unit under test
+        held = await registry.donors(model.fingerprint, (), source=SOURCE, source_id="page-0")
+        nowhere = await registry.donors(model.fingerprint, (), source=SOURCE, source_id="absent")
+
+    assert [donor.workspace for donor in held] == ["alpha"]
+    assert nowhere == []
