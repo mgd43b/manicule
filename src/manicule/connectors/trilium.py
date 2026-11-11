@@ -21,13 +21,15 @@ operation names; whatever names a person's thoughts stays in the document it bel
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
 import logging
 import re
+import time
 from collections import deque
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
@@ -53,7 +55,14 @@ from manicule.core.sources import DiscoveredDoc, DocRef, SourceId, Watermark
 if TYPE_CHECKING:
     from manicule.connectors.trilium_client import TriliumClient
 
-__all__ = ["HTML", "MARKDOWN", "PLAIN", "SWEEP_EXPRESSION", "TriliumConnector"]
+__all__ = [
+    "HTML",
+    "INVENTORY_MAX_AGE_SECONDS",
+    "MARKDOWN",
+    "PLAIN",
+    "SWEEP_EXPRESSION",
+    "TriliumConnector",
+]
 
 _log = logging.getLogger("manicule.connectors.trilium")
 
@@ -67,6 +76,20 @@ PLAIN: Final = "text/plain"
 _INDEXED_TYPES: Final = frozenset({"text", "code", "mermaid"})
 """The note types whose content is text worth searching (§3). Everything else is a container, a
 saved query, a drawing or UI configuration."""
+
+_KNOWN_TYPES: Final = frozenset(
+    {
+        "text", "code", "render", "file", "image", "search", "relationMap", "book", "noteMap",
+        "mermaid", "webView", "shortcut", "doc", "contentWidget", "launcher",
+    }
+)  # fmt: skip
+"""Every ``Note.type`` ETAPI's published description lists. A type outside it is a Trilium newer
+than this connector, and it is reported rather than quietly left out (§3)."""
+
+INVENTORY_MAX_AGE_SECONDS: Final = 600.0
+"""How long ``fetch`` trusts the last sweep before taking a fresh one (§6.3). Scope, exclusion and
+protection are judged on a sweep, so a label added or a note protected since must reach a read
+within a bounded time and not whenever the next discovery happens to run."""
 
 _ARCHIVED_LABEL: Final = "archived"
 _ROOT: Final = "root"
@@ -103,7 +126,10 @@ class _Inventory:
     protected: int = 0
     out_of_scope: int = 0
     unindexed_type: int = 0
+    unplaced: int = 0
+    unknown_types: set[str] = field(default_factory=set[str])
     newest: str = ""
+    swept_at: float = 0.0
 
 
 class TriliumConnector:
@@ -119,6 +145,7 @@ class TriliumConnector:
         *,
         name: str = TRILIUM_CONNECTOR_NAME,
         max_note_bytes: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Args:
         config: The validated settings, token resolved.
@@ -128,12 +155,15 @@ class TriliumConnector:
             ``plugin._source_name``).
         max_note_bytes: ``ingest.max_fetch_bytes``. A note longer than this is refused while
             it streams rather than after it has been loaded (§6.3). ``None`` means no limit.
+        clock: Monotonic time, for how old the sweep ``fetch`` relies on may be.
         """
         self.name = name
         self._config = config
         self._client = client
         self._max_note_bytes = max_note_bytes
+        self._clock = clock
         self._inventory: _Inventory | None = None
+        self._sweeping = asyncio.Lock()
         self._reached: Watermark | None = None
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -197,8 +227,21 @@ class TriliumConnector:
             )
             raise ConnectorError(msg)
         inventory = _judge(response, self._config)
+        inventory.swept_at = self._clock()
         self._inventory = inventory
         return inventory
+
+    async def _recent(self) -> _Inventory:
+        """The last sweep if it is young enough to judge a read by, otherwise a fresh one.
+
+        Under a lock, so concurrent reads that arrive with no usable sweep share one request and
+        not one each.
+        """
+        async with self._sweeping:
+            held = self._inventory
+            if held is not None and self._clock() - held.swept_at < INVENTORY_MAX_AGE_SECONDS:
+                return held
+            return await self._sweep()
 
     async def discover(self, watermark: Watermark | None) -> AsyncIterator[DiscoveredDoc]:
         """Yield every note in scope.
@@ -215,13 +258,21 @@ class TriliumConnector:
             yield self._discovered(note)
         _log.info(
             "trilium %s: %d notes in scope; skipped %d protected, %d out of scope, %d of a "
-            "type that is not indexed",
+            "type that is not indexed, %d not reachable from the top of the tree",
             self.name,
             len(inventory.notes),
             inventory.protected,
             inventory.out_of_scope,
             inventory.unindexed_type,
+            inventory.unplaced,
         )
+        if inventory.unknown_types:
+            _log.warning(
+                "trilium %s: notes of a type this connector does not know were left out: %s. "
+                "The server is newer than the connector",
+                self.name,
+                ", ".join(sorted(inventory.unknown_types)),
+            )
         # Only after the enumeration has run to the end. A watermark stored for a partial one is
         # how documents go missing permanently.
         self._reached = Watermark(
@@ -252,7 +303,7 @@ class TriliumConnector:
                 having changed.
         """
         await self._client.setup()
-        inventory = self._inventory if self._inventory is not None else await self._sweep()
+        inventory = await self._recent()
         note = inventory.notes.get(ref.source_id)
         if note is None:
             msg = "the note is not one this source serves"
@@ -269,7 +320,7 @@ class TriliumConnector:
             "trilium_type": note.note_type,
             "trilium_mime": note.mime,
             "trilium_parent_note_ids": list(note.parents),
-            "trilium_labels": dict(note.labels),
+            "trilium_labels": _grouped(note.labels),
             "version_token": _version_token(note),
             PROVENANCE_KEY: self._provenance(note),
         }
@@ -343,7 +394,10 @@ def _judge(response: list[Mapping[str, object]], config: TriliumConfig) -> _Inve
 
     inventory = _Inventory()
     for note_id, entry in sorted(entries.items()):
-        if note_id == _ROOT or note_id not in depth:
+        if note_id == _ROOT or _is_system(note_id):
+            continue
+        if note_id not in depth:
+            inventory.unplaced += 1
             continue
         family = list(_ancestry(note_id, parents))
         if entry.protected:
@@ -357,6 +411,8 @@ def _judge(response: list[Mapping[str, object]], config: TriliumConfig) -> _Inve
             continue
         if entry.note_type not in _INDEXED_TYPES:
             inventory.unindexed_type += 1
+            if entry.note_type not in _KNOWN_TYPES:
+                inventory.unknown_types.add(_clean(entry.note_type))
             continue
         inventory.notes[note_id] = _Note(
             note_id=note_id,
@@ -432,6 +488,10 @@ def _text(item: Mapping[str, object], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _is_system(note_id: str) -> bool:
+    return note_id.startswith(_SYSTEM_PREFIX)
+
+
 def _ancestry(note_id: str, parents: Mapping[str, tuple[str, ...]]) -> Iterator[str]:
     """``note_id`` and every note above it on any path, each once.
 
@@ -470,7 +530,7 @@ def _shallowest_paths(
     depth: dict[str, int] = {}
     queue: deque[str] = deque()
     for note_id, above in sorted(parents.items()):
-        if note_id.startswith(_SYSTEM_PREFIX):
+        if _is_system(note_id):
             continue
         if not any(parent in parents for parent in above):
             depth[note_id] = 0
@@ -478,7 +538,7 @@ def _shallowest_paths(
     while queue:
         current = queue.popleft()
         for child in sorted(children.get(current, ())):
-            if child not in depth and not child.startswith(_SYSTEM_PREFIX):
+            if child not in depth and not _is_system(child):
                 depth[child] = depth[current] + 1
                 queue.append(child)
     best: dict[str, str] = {}
@@ -498,7 +558,9 @@ def _breadcrumb(
 ) -> tuple[str, ...]:
     """The titles from the top of the tree down to this note's parent (§4).
 
-    ``root`` is not a level, and the note's own title is not in it: the chunker appends that.
+    ``root`` is not a level, and the note's own title is not in it: the chunker appends that. A
+    protected note is not a level either: its title is the placeholder ETAPI substitutes, and a
+    citation reading ``[protected]`` names nothing.
     Capped at the deepest hierarchy a record may carry, keeping the levels nearest the note.
     """
     titles: list[str] = []
@@ -506,8 +568,9 @@ def _breadcrumb(
     seen: set[str] = {note_id}
     while current is not None and current not in seen:
         seen.add(current)
-        if current != _ROOT:
-            titles.append(_clean(entries[current].title) if current in entries else _UNTITLED)
+        above = entries.get(current)
+        if current != _ROOT and not (above is not None and above.protected):
+            titles.append(_clean(above.title) if above is not None else _UNTITLED)
         current = best_parent.get(current)
     titles.reverse()
     return tuple(titles[-MAX_SECTION_DEPTH:])
@@ -549,6 +612,15 @@ def _version_token(note: _Note) -> str:
         separators=(",", ":"),
     )
     return hashlib.blake2b(material.encode(), digest_size=20).hexdigest()
+
+
+def _grouped(labels: tuple[tuple[str, str], ...]) -> dict[str, JsonValue]:
+    """Label values by name. Trilium allows several labels with one name (``#tag=a #tag=b``), so a
+    plain mapping would keep the last and lose the rest."""
+    grouped: dict[str, list[str]] = {}
+    for name, value in labels:
+        grouped.setdefault(name, []).append(value)
+    return {name: list(values) for name, values in grouped.items()}
 
 
 def _html_document(title: str, body: bytes) -> bytes:

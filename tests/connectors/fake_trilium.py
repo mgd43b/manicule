@@ -18,9 +18,10 @@ Every host is ``example.org``. Titles and content are invented.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -51,7 +52,7 @@ class FakeNote:
     mime: str = "text/html"
     content: str = "<p>body</p>"
     protected: bool = False
-    labels: Mapping[str, str] = field(default_factory=lambda: {})
+    labels: Mapping[str, str | Sequence[str]] = field(default_factory=lambda: {})
     modified: str = _STAMP
     created: str = _STAMP
 
@@ -77,6 +78,9 @@ class FakeTrilium:
         """When set, a content request is answered by a 200 sign-in page of ``text/html``."""
         self.throttle: list[str | None] = []
         """Each entry is one 429 to send first, with that ``Retry-After`` (``None`` for none)."""
+        self.failures: list[int | None] = []
+        """Each entry is one failure to send first: a status code, or ``None`` to drop the
+        connection."""
         self.extra_results: list[dict[str, object]] = []
         """Entries appended to a search response as they are, for a shape ETAPI would not send."""
         self.requests: list[tuple[str, str]] = []
@@ -115,13 +119,25 @@ class FakeTrilium:
     # --- serving -------------------------------------------------------------------------
 
     def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handle)
+        """The transport. It yields to the event loop before answering, as a network does, so a
+        test of concurrent callers actually interleaves them."""
+
+        async def answer(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0)
+            return self.handle(request)
+
+        return httpx.MockTransport(answer)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append((request.url.path, request.url.query.decode()))
         self.authorizations.append(request.headers.get("authorization", ""))
         if self.proxy_redirect is not None:
             return httpx.Response(302, headers={"location": self.proxy_redirect})
+        if self.failures:
+            failure = self.failures.pop(0)
+            if failure is None:
+                raise httpx.ConnectError("connection dropped", request=request)
+            return httpx.Response(failure)
         if self.throttle:
             wait = self.throttle.pop(0)
             return httpx.Response(429, headers={} if wait is None else {"retry-after": wait})
@@ -162,15 +178,16 @@ class FakeTrilium:
             "blobId": note.blob_id,
             "attributes": [
                 {
-                    "attributeId": f"{note.note_id}-{name}",
+                    "attributeId": f"{note.note_id}-{name}-{position}",
                     "noteId": note.note_id,
                     "type": "label",
                     "name": name,
                     "value": value,
-                    "position": 10,
+                    "position": 10 * (position + 1),
                     "isInheritable": False,
                 }
-                for name, value in note.labels.items()
+                for name, given in note.labels.items()
+                for position, value in enumerate([given] if isinstance(given, str) else given)
             ],
             "parentNoteIds": list(note.parents),
             "childNoteIds": children,

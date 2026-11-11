@@ -102,6 +102,9 @@ ETAPI's `Note.type` is one of `text`, `code`, `render`, `file`, `image`, `search
 | `mermaid` | yes | `text/plain` |
 | everything else | no | containers (`book`, `doc`), saved queries (`search`), drawings and maps, images, UI configuration, and `file` notes |
 
+A `type` outside ETAPI's published list is a Trilium newer than the connector, and it is
+reported at warning level by name and not left out quietly.
+
 `file` notes (an attached PDF or office document) are left out of this version rather than
 indexed behind a setting. They would go through the parser chain as bytes, but they need a size
 and type policy that notes do not, and nothing in this design depends on adding them (§8).
@@ -142,7 +145,8 @@ change, and a citation must not.
 **A note under several parents is one document.** The connector delivers it once, with its
 **breadcrumb taken from the shortest path to the top, ties broken by the smaller `noteId`**, so two
 runs agree. The breadcrumb is the record's `section_path`: the titles from the top down to the
-note's parent, without `root` and without the note's own title. Every parent is recorded in
+note's parent, without `root`, without the note's own title, and without a protected ancestor,
+whose ETAPI title is the placeholder `[protected]` and names nothing. Every parent is recorded in
 metadata as `trilium_parent_note_ids`.
 
 **The version token is a digest of everything that is part of the document's text:** the
@@ -153,8 +157,8 @@ changes the heading and the breadcrumb without changing a byte of content, and
 still be re-read. Discovery does not fetch to decide; it compares tokens, as `DiscoveredDoc`
 requires.
 
-**Metadata carries** `trilium_note_id`, `trilium_type`, `trilium_mime`, `trilium_labels` (each
-label's name and value), `trilium_parent_note_ids`, and in the provenance record the title, the
+**Metadata carries** `trilium_note_id`, `trilium_type`, `trilium_mime`, `trilium_labels` (the
+values of each label name, as a list, because Trilium allows several labels with one name), `trilium_parent_note_ids`, and in the provenance record the title, the
 canonical address, `blobId` as the version, `utcDateCreated` and `utcDateModified` as the
 note's own dates, and the breadcrumb. A title the record cannot hold (a control character) is
 cleaned of it, and a record that cannot be built at all leaves the note indexed with an
@@ -186,8 +190,9 @@ made the clone and fixed by removing the label.
 a session the user unlocked with a password. ETAPI does not offer that session, so the content is
 unavailable, and the connector does not try: it skips every note with `isProtected: true` before
 any request for its content. The title of a protected note is the literal `[protected]` in ETAPI
-responses; it is not used. Each sweep logs **how many protected notes were skipped** (a count, as
-the mbox connector logs its skips), because "my notes are indexed" is otherwise silently untrue
+responses; it is not used. Each sweep logs **how many protected notes were skipped**, with the counts of notes out of
+scope, of a type that is not indexed, and not reachable from the top of the tree (a count, as the
+mbox connector logs its skips), because "my notes are indexed" is otherwise silently untrue
 for exactly the notes a person was most careful with.
 
 Changing any scope setting changes the **scope fingerprint**, as `MboxConfig.scope_fingerprint`
@@ -209,13 +214,15 @@ either, and every run is a full inventory.
 **One request returns every note's metadata and no content.** `Note` objects carry `noteId`,
 `title`, `type`, `mime`, `isProtected`, `blobId`, `utcDateModified`, `parentNoteIds` and
 `attributes`, which is everything §3 to §5 decide on. The sweep is a single `GET /notes` with a
-`search` expression that matches every note, ordered by `utcDateModified`. Content is requested
+`search` expression that matches every note, with no ordering asked of the server. Content is requested
 (`GET /notes/{id}/content`) only for a note the pipeline decided to fetch, because its token
 changed.
 
 **A response that might be short is refused.** The request carries `limit = max_notes`. A response
 with that many notes may have been cut off, and `reconcile` deletes what it does not see, so the
-sweep raises and says to raise `max_notes`. Raising deletes nothing. A sweep that cannot be
+sweep raises and says to raise `max_notes`. Raising deletes nothing. The sweep is one response with
+no cursor, so `request_timeout_seconds` defaults to 120 and not the 30 an ordinary API call gets,
+and a very large vault holds that response in memory while it is read. A sweep that cannot be
 proved complete is worse than none, which is `mbox.md` §5.4's rule: absence is deletion. The
 alternative, splitting the sweep by subtree when it reaches the limit, was rejected for a server
 cap nobody has observed (§10).
@@ -240,8 +247,11 @@ informational; a run that ends early offers none, as the protocol requires.
 ### 6.3 `fetch`
 
 `fetch` reads `GET /notes/{id}/content` and returns the bytes with the media type §3 chose. It
-answers from the most recent sweep's tree, and runs a sweep if there has not been one, so it needs
-no state in the discovery journal beyond the note id. **A note the sweep did not
+judges the note against the most recent sweep's tree, **which it takes afresh once that sweep is
+ten minutes old** (`INVENTORY_MAX_AGE_SECONDS`), so a label added or a note protected after
+discovery reaches a read within a bounded time and not whenever the next discovery runs. Reads
+that arrive with no usable sweep share one request. It needs no state in the discovery journal
+beyond the note id. **A note the sweep did not
 admit is not served even if a reference names it**: deleted, protected, excluded, or moved out of
 every root since, it raises `NotFoundError`, and the pipeline reads that as the inventory having
 changed. The same exception is raised for a note that was swept and then deleted or protected
@@ -293,7 +303,9 @@ not see.
 `example.org` or invented. It reproduces: a note cloned under several parents; an ancestor renamed
 (§6.2); a protected note; an archived note; an excluded subtree with a clone escaping it; a
 bookmarked note cloned into the system tree; a search silently cut off at a limit; a note deleted
-or protected between the sweep and the fetch; a 429 with `Retry-After`; a redirect to another host
+or protected between the sweep and the fetch; a label added after discovery; concurrent reads
+with no sweep; retry exhaustion for 429, 5xx and a dropped connection; a note exactly at the fetch
+cap; a 429 with `Retry-After`; a redirect to another host
 and one on the same origin; a proxy sign-in page served as a note's content; a token rejected; and
 a server under a context path. `tests/connectors/test_trilium_pipeline.py` drives the connector
 through the real pipeline and HTML parser: a note is indexed under its title, an unchanged one is

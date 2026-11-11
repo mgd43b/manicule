@@ -6,6 +6,7 @@ real retry loop, headers and query encoding are the ones exercised.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 
@@ -17,9 +18,16 @@ from manicule.connectors.errors import (
     ConnectorError,
     NotFoundError,
     RateLimitedError,
+    RemoteError,
     UntrustedLinkError,
 )
-from manicule.connectors.trilium import HTML, MARKDOWN, PLAIN, TriliumConnector
+from manicule.connectors.trilium import (
+    HTML,
+    INVENTORY_MAX_AGE_SECONDS,
+    MARKDOWN,
+    PLAIN,
+    TriliumConnector,
+)
 from manicule.connectors.trilium_client import NoteProtectedError, TriliumClient
 from manicule.core.provenance import PROVENANCE_KEY, Provenance
 from manicule.core.sources import DiscoveredDoc
@@ -39,10 +47,13 @@ def connector_for(
     *,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     max_note_bytes: int | None = None,
+    clock: Callable[[], float] = lambda: 0.0,
 ) -> TriliumConnector:
     resolved = settings if settings is not None else config(base_url=server.base_url)
     client = TriliumClient(resolved, transport=server.transport(), sleep=sleep or Waits())
-    return TriliumConnector(resolved, client, name="notes", max_note_bytes=max_note_bytes)
+    return TriliumConnector(
+        resolved, client, name="notes", max_note_bytes=max_note_bytes, clock=clock
+    )
 
 
 async def drain[T](stream: AsyncIterator[T]) -> list[T]:
@@ -491,3 +502,147 @@ async def test_a_proxy_sign_in_page_served_as_a_note_s_content_is_not_indexed() 
 
     with pytest.raises(ConnectorError, match="sign-in page"):
         await connector.fetch(found["script"].ref)
+
+
+# --- review findings -------------------------------------------------------------------------
+
+
+class Clock:
+    """A monotonic clock a test moves by hand."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_a_read_is_judged_on_a_sweep_no_older_than_the_limit() -> None:
+    """A label added after discovery must reach a read, within a bounded time."""
+    server = vault()
+    clock = Clock()
+    connector = connector_for(server, clock=clock)
+    found = await discovered(connector)
+
+    server.notes["plan"].labels = {"manicule-skip": ""}
+    await connector.fetch(found["plan"].ref)  # still inside the age limit: served from the sweep
+
+    clock.now = INVENTORY_MAX_AGE_SECONDS + 1
+    with pytest.raises(NotFoundError):
+        await connector.fetch(found["plan"].ref)
+
+
+async def test_concurrent_reads_with_no_sweep_share_one_request() -> None:
+    server = vault()
+    connector = connector_for(server)
+    refs = [(await discovered(connector_for(server)))[n].ref for n in ("plan", "garden")]
+    server.requests.clear()
+
+    await asyncio.gather(*(connector.fetch(ref) for ref in refs))
+
+    searches = [path for path, _ in server.requests if path == "/etapi/notes"]
+    assert len(searches) == 1
+
+
+async def test_a_protected_folder_is_not_a_level_in_its_children_s_breadcrumb() -> None:
+    server = vault()
+    server.add(FakeNote("vault", "Vault", parents=("work",), type="book", protected=True))
+    server.add(FakeNote("child", "Child", parents=("vault",)))
+    connector = connector_for(server)
+    found = await discovered(connector)
+
+    raw = await connector.fetch(found["child"].ref)
+
+    provenance = Provenance.from_metadata({PROVENANCE_KEY: raw.metadata[PROVENANCE_KEY]})
+    assert provenance is not None
+    assert provenance.source is not None
+    assert provenance.source.section_path == ("Work",)
+
+
+async def test_labels_that_share_a_name_are_all_kept() -> None:
+    server = vault()
+    server.notes["plan"].labels = {"tag": ["a", "b"]}
+    connector = connector_for(server)
+    found = await discovered(connector)
+
+    raw = await connector.fetch(found["plan"].ref)
+
+    assert raw.metadata["trilium_labels"] == {"tag": ["a", "b"]}
+
+
+async def test_a_note_that_cannot_be_reached_from_the_top_is_counted_not_dropped_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = vault()
+    server.add(FakeNote("a", "A", parents=("b",)))
+    server.add(FakeNote("b", "B", parents=("a",)))  # a cycle: Trilium cannot make one
+    with caplog.at_level("INFO", logger="manicule.connectors.trilium"):
+        found = await discovered(connector_for(server))
+
+    assert "a" not in found
+    assert "2 not reachable" in caplog.text
+
+
+async def test_a_note_type_the_connector_does_not_know_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = vault()
+    server.add(FakeNote("fresh", "Fresh", parents=("work",), type="markdownNext"))
+    with caplog.at_level("WARNING", logger="manicule.connectors.trilium"):
+        found = await discovered(connector_for(server))
+
+    assert "fresh" not in found
+    assert "markdownNext" in caplog.text
+
+
+# --- retries and the fetch cap, at their edges ------------------------------------------------
+
+
+async def test_a_server_error_is_retried_and_then_succeeds() -> None:
+    server = vault()
+    server.failures = [503, 502]
+    waits = Waits()
+
+    found = await discovered(connector_for(server, sleep=waits))
+
+    assert "plan" in found
+    assert len(waits.seconds) == 2
+
+
+async def test_a_server_error_on_every_attempt_stops_the_run() -> None:
+    server = vault()
+    server.failures = [503] * 10
+
+    with pytest.raises(RemoteError, match="503"):
+        await discovered(connector_for(server, config(max_retries=2)))
+    assert len(server.requests) == 3
+
+
+async def test_a_dropped_connection_is_retried_and_then_named() -> None:
+    server = vault()
+    server.failures = [None, None, None]
+
+    with pytest.raises(ConnectorError, match="could not reach"):
+        await discovered(connector_for(server, config(max_retries=2)))
+
+
+async def test_throttling_on_every_attempt_stops_the_run() -> None:
+    server = vault()
+    server.throttle = ["1"] * 10
+
+    with pytest.raises(RateLimitedError):
+        await discovered(connector_for(server, config(max_retries=2)))
+    assert len(server.requests) == 3
+
+
+async def test_a_note_exactly_at_the_fetch_cap_is_read_and_one_byte_over_is_not() -> None:
+    server = vault()
+    server.edit("plan", "x" * 100)
+    connector = connector_for(server, max_note_bytes=100)
+    found = await discovered(connector)
+    assert await connector.fetch(found["plan"].ref)
+
+    server.edit("plan", "x" * 101)
+    found = await discovered(connector)
+    with pytest.raises(ConnectorError, match="fetch cap"):
+        await connector.fetch(found["plan"].ref)

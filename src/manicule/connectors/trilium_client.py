@@ -142,8 +142,6 @@ class TriliumClient:
             (
                 ("search", expression),
                 ("limit", str(limit)),
-                ("orderBy", "utcDateModified"),
-                ("orderDirection", "desc"),
                 ("includeArchivedNotes", "true"),
             ),
         )

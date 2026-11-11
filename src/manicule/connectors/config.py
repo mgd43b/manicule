@@ -445,7 +445,13 @@ class TriliumConfig(BaseModel):
         "with exactly this many is presumed truncated and refused rather than trusted: a short "
         "inventory would delete the notes it missed (docs/connectors/trilium.md §6.1).",
     )
-    request_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    request_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0.0,
+        description="How long one request may take. The sweep is a single response holding "
+        "every note's metadata and ETAPI has no cursor to split it, so a large vault needs "
+        "longer than an ordinary API call.",
+    )
     max_retries: int = Field(
         default=5,
         ge=0,
