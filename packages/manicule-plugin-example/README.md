@@ -2,7 +2,8 @@
 
 The smallest complete plugin. Copy it to start a new one.
 
-It provides one component of three kinds — a parser, a middleware and a retrieval stage —
+It provides one component of four kinds — a connector, a parser, a middleware and a retrieval
+stage —
 and exists for two reasons:
 
 1. **It is the plugin-authoring documentation**, in the form that cannot go out of date,
@@ -10,6 +11,24 @@ and exists for two reasons:
 2. **manicule's own test suite depends on it.** Entry-point discovery is verified against a
    real installed distribution rather than a stand-in, so the path third-party plugins take
    is the path that is exercised on every commit.
+
+## Bringing a source of your own
+
+`DirectoryConnector` is the one to copy for a connector that will never be upstreamed: a directory
+of text files, walked in full on every sync, with a version token per file that decides what is
+read again. It does the things a connector can get quietly wrong: a token that names the root and
+that `fetch` returns as proof of the revision it read (durable acquisition refuses a body without
+it), a watermark that is set only when a walk completes, and a `reconcile` that fails rather than
+return a partial inventory. `tests/test_example_plugin.py` runs `assert_connector_contract`
+against it, and `tests/connectors/test_example_connector_pipeline.py` drives it through the real
+ingest pipeline.
+[`docs/writing-a-connector.md`](../../docs/writing-a-connector.md) is the walkthrough.
+
+```toml
+[connectors.notes]
+type = "example-directory"
+options = { root = "~/notes" }
+```
 
 ## What a plugin is
 

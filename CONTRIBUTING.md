@@ -245,7 +245,9 @@ says so loudly in the pull request.
 ## Writing a plugin
 
 Start from `packages/manicule-plugin-example`. It is the smallest complete plugin, and CI
-builds it, installs it and loads it, so it cannot go stale.
+builds it, installs it and loads it, so it cannot go stale. For a source of your own that will
+not be upstreamed, [`docs/writing-a-connector.md`](docs/writing-a-connector.md) is the guide, and
+the example's `DirectoryConnector` is its worked code.
 `packages/manicule-plugin-wikilinks` is the one to read next: a plugin doing real work, with a
 component that writes rows, a configuration model that bounds a query, and a fingerprint of its
 own so a change to its rules makes the corpus visibly stale rather than quietly wrong.

@@ -45,6 +45,7 @@ def test_the_example_plugin_registers_through_the_public_path() -> None:
     found = discover()
 
     assert "example" in found.names
+    assert found.registry.has(ComponentKind.CONNECTOR, "example-directory")
     assert found.registry.has(ComponentKind.PARSER, "example")
     assert found.registry.has(ComponentKind.MIDDLEWARE, "trim")
     assert found.registry.has(ComponentKind.RETRIEVAL_STAGE, "passthrough")
