@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import stat
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, override
@@ -62,6 +63,19 @@ def service() -> ApplicationService:
     return ApplicationService(backend)
 
 
+def settled(visits: list[int], count: int = 1, *, timeout: float = 10.0) -> list[int]:
+    """The visits, once ``count`` are recorded.
+
+    The browser stub runs on the command's own browser thread, and the command returns, or raises,
+    as soon as its socket has answered, while that thread is still reading the answer; asserting
+    on the list directly races the thread appending to it (it did, on CI).
+    """
+    deadline = time.monotonic() + timeout
+    while len(visits) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return list(visits)
+
+
 def browser(graph: FakeGraph, visits: list[int], **choices: Any) -> Callable[[str], bool]:
     """A browser that sends the person's choice to the loopback socket the command opened."""
 
@@ -110,7 +124,7 @@ async def test_the_whole_flow_writes_the_minted_token_to_a_private_file(
         "Calendars.Read",
     }
     assert written not in issued.model_dump_json(), "the result never carries the token"
-    assert visits == [200]
+    assert settled(visits) == [200]
 
 
 async def test_the_request_microsoft_is_sent_is_a_public_client_code_flow_with_pkce(
@@ -165,7 +179,7 @@ async def test_a_forged_redirect_is_refused_before_its_code_is_looked_at(
 
     assert not target.exists()
     assert graph.exchanges == 0
-    assert visits == [400]
+    assert settled(visits) == [400]
 
 
 async def test_a_token_for_another_account_is_discarded_and_neither_address_is_printed(
