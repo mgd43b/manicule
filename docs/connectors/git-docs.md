@@ -96,7 +96,9 @@ ref of its own and handed to the reader as a path and a ref name.
   origin so a redirect to another host carries nothing. Git's own error text is kept because it
   finds the problem, with the token removed in both forms it can take.
 - **Only `https` is spoken** (`GIT_ALLOW_PROTOCOL`), hooks point nowhere, credential helpers are
-  disabled and nothing can prompt. SSH is absent on purpose: it needs a key file and a trusted
+  disabled and nothing can prompt. The commit a fetch brought is resolved to its id while the
+  mirror's lock is still held, and the reader is given that id and never the ref, which names
+  whatever the next fetch brings. SSH is absent on purpose: it needs a key file and a trusted
   `known_hosts`, which is two more things to provision into a container and two more ways for a
   fetch to hang.
 - **One ref per revision.** Two sources on one remote share its mirror and may name different
@@ -143,6 +145,11 @@ checkout while a sync runs cannot hand it half of two states.
   does not declare that its manifests are full inventories. It reports instead, after each run,
   whether that run listed the tree (`walked_full_inventory`), as the mail connectors do, so only a
   run that did is evidence for deletion and coverage.
+- **A reference survives a restart.** The durable pipeline can resume an interrupted run and fetch
+  its journaled references without discovering again. A reference names its commit, so a process
+  that holds no inventory for it rebuilds one from that commit's tree, from the mirror or the local
+  repository, with no fetch and no lookup of the revision. If the repository no longer holds the
+  commit, the error says to sync again.
 - **A reference is checked against its inventory** before a blob is read. The inventory, not the
   reference, is the authority; a forged one is refused.
 - **Reconciliation** inside a sync reuses that sync's inventory. Anywhere else (a scheduled pass, a

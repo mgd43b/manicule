@@ -83,7 +83,7 @@ async def test_a_refresh_brings_the_tip_and_a_second_one_brings_the_next_commit(
 
     ref = await mirror.refresh("HEAD")
     first = git(mirror.directory, "rev-parse", ref)
-    assert ref == tip_ref("HEAD")
+    assert ref == git(origin, "rev-parse", "HEAD"), "the commit, not the ref that names it"
     assert first == git(origin, "rev-parse", "HEAD")
 
     (origin / "guide.md").write_text("# Guide, revised\n", encoding="utf-8")

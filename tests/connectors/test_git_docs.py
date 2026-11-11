@@ -479,6 +479,69 @@ async def test_a_reference_that_disagrees_with_its_inventory_is_refused(reposito
         await connector.teardown()
 
 
+async def test_a_reference_issued_before_a_restart_can_still_be_fetched(
+    repository: Path,
+) -> None:
+    """The durable pipeline resumes an interrupted run after a restart and fetches the journaled
+    references without discovering again. A fresh process holds no inventories, so the commit a
+    reference names must be enough to rebuild one."""
+    before = GitDocsConnector(config_for(repository))
+    after = GitDocsConnector(config_for(repository))
+    try:
+        guide = next(doc for doc in await discovered(before) if doc.source_id == "docs/guide.md")
+        (repository / "docs" / "guide.md").write_text("# Newer\n", encoding="utf-8")
+        commit(repository, "after the reference was issued")
+
+        raw = await after.fetch(guide.ref)
+
+        assert raw.content == b"# Guide\n", "the commit the reference names, not the current one"
+        forged = guide.ref.model_copy(
+            update={"metadata": {**guide.ref.metadata, "git_blob": "0" * 40}}
+        )
+        with pytest.raises(GitSourceError, match="contradicts"):
+            await after.fetch(forged)
+    finally:
+        await before.teardown()
+        await after.teardown()
+
+
+async def test_a_reference_to_a_commit_the_repository_no_longer_holds_says_to_sync_again(
+    repository: Path,
+) -> None:
+    connector = GitDocsConnector(config_for(repository))
+    try:
+        guide = next(doc for doc in await discovered(connector) if doc.source_id == "docs/guide.md")
+        gone = guide.ref.model_copy(
+            update={"metadata": {**guide.ref.metadata, "git_commit": "1" * 40}}
+        )
+        garbage = guide.ref.model_copy(
+            update={"metadata": {**guide.ref.metadata, "git_commit": "--upload-pack=evil"}}
+        )
+
+        fresh = GitDocsConnector(config_for(repository))
+        with pytest.raises(GitSourceError, match="Sync again"):
+            await fresh.fetch(gone)
+        with pytest.raises(GitSourceError, match="not a commit id"):
+            await fresh.fetch(garbage)
+        await fresh.teardown()
+    finally:
+        await connector.teardown()
+
+
+async def test_a_remote_reference_issued_before_a_restart_is_read_from_the_mirror(
+    tmp_path: Path, repository: Path
+) -> None:
+    before = remote_connector(tmp_path, repository)
+    after = remote_connector(tmp_path, repository)
+    try:
+        guide = next(doc for doc in await discovered(before) if doc.source_id == "docs/guide.md")
+
+        assert (await after.fetch(guide.ref)).content == b"# Guide\n"
+    finally:
+        await before.teardown()
+        await after.teardown()
+
+
 async def test_a_local_path_that_is_not_a_directory_is_a_startup_refusal(tmp_path: Path) -> None:
     connector = GitDocsConnector(config_for(tmp_path / "missing"))
 

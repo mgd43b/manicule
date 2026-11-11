@@ -42,7 +42,11 @@ import signal
 from typing import TYPE_CHECKING, Final, cast
 from urllib.parse import urlsplit
 
-from manicule.connectors.git_reader import GitSourceError, hardened_git_environment
+from manicule.connectors.git_reader import (
+    GitSourceError,
+    PinnedGitReader,
+    hardened_git_environment,
+)
 from manicule.connectors.git_remote import require_fetchable_revision
 from manicule.core.errors import ConfigError
 
@@ -123,10 +127,13 @@ class GitMirror:
         return self._directory
 
     async def refresh(self, revision: str) -> str:
-        """Fetch ``revision`` into its own ref (:func:`tip_ref`) and return that ref's name.
+        """Fetch ``revision`` into its own ref (:func:`tip_ref`) and return the commit it names.
 
         Serialized, because two fetches into one repository fight over its locks and a source
-        and a scheduled reconciliation can ask at once.
+        and a scheduled reconciliation can ask at once. **The ref is resolved to a commit id while
+        the lock is still held**, and the caller reads that id, never the ref: another source on
+        the same remote and revision may fetch again the moment the lock is released, and a ref is
+        a name for whatever the last fetch brought.
 
         Raises:
             GitFetchError: The remote could not be reached, refused the credential, or has no such
@@ -144,7 +151,9 @@ class GitMirror:
         async with self._lock:
             await self._initialize(executable)
             await self._fetch(executable, revision)
-        return tip_ref(revision)
+            return await PinnedGitReader(
+                self._directory, revision=tip_ref(revision), executable=executable
+            ).resolve()
 
     async def _initialize(self, executable: str) -> None:
         head = self._directory / "HEAD"

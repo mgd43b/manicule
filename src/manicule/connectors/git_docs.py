@@ -42,6 +42,7 @@ import contextvars
 import hashlib
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -79,6 +80,7 @@ _POLICY = "git-docs-v1"
 _COMMIT = "git_commit"
 _OBJECT_ID = "git_blob"
 _PATH = "git_path"
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _MEDIA_TYPE = "media_type"
 _VERSION_TOKEN = "version_token"  # noqa: S105 - a change token, not a credential
 BMAD_LAYOUT = "bmad_layout"
@@ -263,9 +265,9 @@ class GitDocsConnector:
 
     async def _reader_for(self) -> PinnedGitReader:
         if self._mirror is not None:
-            ref = await self._mirror.refresh(self._config.revision)
+            commit = await self._mirror.refresh(self._config.revision)
             return PinnedGitReader(
-                self._mirror.directory, revision=ref, max_blob_bytes=self._config.max_bytes
+                self._mirror.directory, revision=commit, max_blob_bytes=self._config.max_bytes
             )
         assert self._local is not None  # noqa: S101 - one of the two is set in __init__
         return PinnedGitReader(
@@ -485,14 +487,50 @@ class GitDocsConnector:
         self._enumerated = True
         self._walked_full = full
 
+    async def _inventory_at(self, commit: str) -> _Inventory:
+        """Rebuild the inventory of a commit this process did not pin, from what is on disk.
+
+        The durable pipeline can resume an interrupted run after a restart and fetch the journaled
+        references **without discovering again**, so the in-memory inventories a fresh process
+        holds are empty and every such fetch would fail on every retry. A reference names its
+        commit, and a commit is immutable, so the inventory is rebuilt from that commit's tree: no
+        fetch, and no revision lookup that could answer with a newer commit. The reference is
+        still checked against the rebuilt inventory exactly as one issued in this process is.
+
+        Raises:
+            GitSourceError: The commit id is malformed, or the repository no longer holds it (a
+                local history was rewritten, or a mirror was pruned), in which case a new sync,
+                which fetches and lists again, is the way forward.
+        """
+        if not _COMMIT_ID.fullmatch(commit):
+            raise GitSourceError("git-docs reference names something that is not a commit id")
+        async with self._lock:
+            existing = self._inventories.get(commit)
+            if existing is not None:
+                return existing
+            repository = self._mirror.directory if self._mirror is not None else self._local
+            assert repository is not None  # noqa: S101 - one of the two is set in __init__
+            reader = PinnedGitReader(
+                repository, revision=commit, max_blob_bytes=self._config.max_bytes
+            )
+            try:
+                inventory = await self._list(reader)
+            except GitSourceError as exc:
+                msg = (
+                    f"commit {commit[:12]} is no longer in the repository, so a reference to "
+                    f"it cannot be read. Sync again to list the current commit"
+                )
+                raise GitSourceError(msg) from exc
+            return await self._remember(inventory)
+
     async def fetch(self, ref: DocRef) -> RawDocument:
         """Read the exact blob a reference names from the commit that issued it."""
         commit = ref.metadata.get(_COMMIT)
         if not isinstance(commit, str):
             raise GitSourceError("git-docs reference has no pinned commit")
-        inventory = self._inventories.get(commit)
-        document = inventory.by_identity.get(ref.source_id) if inventory is not None else None
-        if inventory is None or document is None:
+        inventory = self._inventories.get(commit) or await self._inventory_at(commit)
+        document = inventory.by_identity.get(ref.source_id)
+        if document is None:
             raise GitSourceError("git-docs reference does not belong to a known inventory")
         expected = {
             _OBJECT_ID: document.entry.object_id,
