@@ -1643,7 +1643,7 @@ requires-dist = [
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "tree-sitter", marker = "extra == 'parsers'", specifier = ">=0.23" },
     { name = "tree-sitter-language-pack", marker = "extra == 'parsers'", specifier = ">=0.7" },
-    { name = "typer", marker = "extra == 'serve'", specifier = ">=0.15" },
+    { name = "typer", marker = "extra == 'serve'", specifier = ">=0.15,<0.29" },
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.32" },
     { name = "watchfiles", marker = "extra == 'ingest'", specifier = ">=0.24" },
     { name = "websockets", marker = "extra == 'serve'", specifier = ">=13.0" },
