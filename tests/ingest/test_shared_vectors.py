@@ -387,3 +387,87 @@ async def test_a_document_that_does_not_commit_is_not_counted() -> None:
     assert "indexed" not in report.by_status
     assert model.batches == [], "the vectors were borrowed; only storing them failed"
     assert ledger.recorded == []
+
+
+class SwitchableVectors(fakes.MemoryVectors):
+    """A store whose writes can be made to fail after it already holds a document."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse = False
+
+    @override
+    async def upsert(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Vector],
+        *,
+        publication_id: str = "legacy",
+    ) -> None:
+        if self.refuse:
+            msg = "the vector store is unavailable"
+            raise RuntimeError(msg)
+        await super().upsert(chunks, vectors, publication_id=publication_id)
+
+
+async def test_a_failed_update_of_an_indexed_document_is_not_counted() -> None:
+    """A failed update keeps the old revision served: still ``indexed``, and nothing borrowed used.
+
+    The demotion of an already-indexed document leaves its status ``indexed`` and names the
+    failure in ``failed_stage``, so status alone cannot tell the ledger whether the copy landed.
+    """
+    first, _, held, _ = await _workspace("alpha")
+    await first.run(fakes.DictConnector(PAGES, name=SOURCE))
+    model = fakes.CountingEmbedder()
+    vectors = SwitchableVectors()
+    await vectors.ensure_ready(model.fingerprint)
+    ledger = RecordingLedger()
+    shared = SharedVectors(
+        StaticDonors([Donor(workspace="alpha", vectors=held)]),
+        fingerprint=model.fingerprint,
+        ledger=ledger,
+    )
+    second, store, _ = build(
+        vectors=vectors, embedder=model, workspace="beta", shared_vectors=shared
+    )
+    await second.run(fakes.DictConnector(PAGES, name=SOURCE))
+    assert sum(ledger.recorded) == CHUNKS
+
+    edited = {**PAGES, "page-0": PAGES["page-0"] + "\nA line both workspaces now hold."}
+    await first.run(fakes.DictConnector(edited, name=SOURCE))
+    vectors.refuse = True
+    connector = fakes.DictConnector(edited, name=SOURCE)
+    outcomes = [
+        outcome
+        async for discovered in connector.discover(None)
+        if discovered.ref.source_id == "page-0"
+        for outcome in await second.ingest(connector, discovered)
+    ]
+
+    (updated,) = outcomes
+    assert updated.status.value == "indexed", "the previous revision is still served"
+    assert updated.failed_stage is not None, "and the update failed"
+    assert model.batches == [], "the edited page's vectors were all borrowed"
+    assert sum(ledger.recorded) == CHUNKS, "the failed update added nothing to the ledger"
+    del store
+
+
+async def test_forward_calls_match_across_several_batches() -> None:
+    """The reported count is the unaided count even when borrowing removes whole batches."""
+    pipeline, store, _, _ = await _workspace("beta")
+    await pipeline.run(fakes.DictConnector(PAGES, name=SOURCE))
+    chunks = [chunk for chunks in store.chunks.values() for chunk in chunks]
+    lent = {chunk.id: (1.0, 0.0, 0.0, 0.0, 0.0) for chunk in chunks[: len(chunks) // 2 + 1]}
+
+    async def cost(lender: RecordingLender | None) -> tuple[EmbeddingWork, list[int]]:
+        model = fakes.CountingEmbedder()
+        empty = fakes.MemoryVectors()
+        await empty.ensure_ready(model.fingerprint)
+        _, work = await embed_or_reuse(model, chunks, vectors=empty, lender=lender, maximum=3)
+        return work, model.batches
+
+    borrowing, borrowed_batches = await cost(RecordingLender(lent))
+    alone, alone_batches = await cost(None)
+
+    assert len(borrowed_batches) < len(alone_batches) == alone.forward_calls
+    assert borrowing == alone

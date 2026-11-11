@@ -168,6 +168,9 @@ async def embed_checked_chunks(
         target_batch_tokens=target_batch_tokens,
         maximum=maximum,
     )
+    # The one place batches are cut. `_batches` reports the count this produces for a chunk set
+    # some of whose vectors were borrowed, so both read the same plan.
+    plan = _batch_starts(len(chunks), size)
     # **Batched by length, and returned in the caller's order.** A batch is padded to its
     # longest member — `runtimes/tokenization.py` says so, and masks the padding out of the
     # pooling so a vector does not depend on its batch. What the padding still costs is the
@@ -207,7 +210,7 @@ async def embed_checked_chunks(
     # calls above — which measure the *unprefixed* text — are comparing against what is
     # actually left for it.
     scheme = embedder.fingerprint.prefix_scheme
-    for start in range(0, len(order), size):
+    for start in plan:
         positions = order[start : start + size]
         batch = [chunks[index] for index in positions]
         if on_batch is not None:
@@ -479,51 +482,49 @@ async def embed_or_reuse(
     if not chunks:
         return [], EmbeddingWork()
 
-    # One visit to the stage for both lookups, the store's own and the other workspaces', so
-    # that how many times the stage ran says nothing about whether a second lookup happened.
     with timings.timing(Stage.STORED_VECTORS) if timings is not None else nullcontext():
         verdicts = await vectors.stored_vectors(chunks)
-        held = previous or {}
+    held = previous or {}
 
-        reused: dict[int, Vector] = {}
-        pending: list[Chunk] = []
-        positions: list[int] = []
-        counts = dict.fromkeys(VectorState, 0)
-        backfilled = 0
-        repaired = 0
-        first_seen = 0
-        refreshed = 0
-        # Whether the caller looked and found the index holding nothing for these chunks at
-        # all. **Not "this chunk id is new"**, which is a different and wrong test: a chunk id
-        # is derived from its text, so a chunk whose text moved arrives with an id the index
-        # has never seen and would be counted as growth when it is exactly the change being
-        # measured.
-        nothing_held = previous is not None and not previous
+    reused: dict[int, Vector] = {}
+    pending: list[Chunk] = []
+    positions: list[int] = []
+    counts = dict.fromkeys(VectorState, 0)
+    backfilled = 0
+    repaired = 0
+    first_seen = 0
+    refreshed = 0
+    # Whether the caller looked and found the index holding nothing for these chunks at
+    # all. **Not "this chunk id is new"**, which is a different and wrong test: a chunk id
+    # is derived from its text, so a chunk whose text moved arrives with an id the index
+    # has never seen and would be counted as growth when it is exactly the change being
+    # measured.
+    nothing_held = previous is not None and not previous
 
-        for position, chunk in enumerate(chunks):
-            verdict = verdicts[chunk.id]
-            counts[verdict.state] += 1
-            if verdict.is_reusable and reuse:
-                reused[position] = verdict.vector
-                backfilled += 0 if verdict.identity_recorded else 1
-                continue
-            if verdict.is_reusable:
-                refreshed += 1
-            elif verdict.state is VectorState.CORRUPT or (
-                verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
-            ):
-                repaired += 1
-            elif nothing_held:
-                first_seen += 1
-            pending.append(chunk)
-            positions.append(position)
+    for position, chunk in enumerate(chunks):
+        verdict = verdicts[chunk.id]
+        counts[verdict.state] += 1
+        if verdict.is_reusable and reuse:
+            reused[position] = verdict.vector
+            backfilled += 0 if verdict.identity_recorded else 1
+            continue
+        if verdict.is_reusable:
+            refreshed += 1
+        elif verdict.state is VectorState.CORRUPT or (
+            verdict.state is VectorState.ABSENT and held.get(chunk.id) == chunk.embed_text
+        ):
+            repaired += 1
+        elif nothing_held:
+            first_seen += 1
+        pending.append(chunk)
+        positions.append(position)
 
-        # Held to the check the model call would make, before anything is borrowed: a chunk the
-        # model would refuse is refused whether or not another workspace holds a vector for it,
-        # so a borrowed vector can never be the reason a document indexed that otherwise would
-        # not have.
-        measured = _measured(embedder, pending, chunk_fingerprint)
-        borrowed = await _borrow(lender, pending) if reuse and lender is not None else {}
+    # Held to the check the model call would make, before anything is borrowed: a chunk the
+    # model would refuse is refused whether or not another workspace holds a vector for it, so a
+    # borrowed vector can never be the reason a document indexed that otherwise would not have.
+    # Tokenizer time, so it is not timed as a store lookup.
+    measured = _measured(embedder, pending, chunk_fingerprint)
+    borrowed = await _borrow(lender, pending, timings=timings) if reuse else {}
 
     model_positions = [
         position for index, position in enumerate(positions) if index not in borrowed
@@ -585,25 +586,41 @@ async def embed_or_reuse(
     )
 
 
-async def _borrow(lender: VectorLender, pending: Sequence[Chunk]) -> dict[int, Vector]:
+async def _borrow(
+    lender: VectorLender | None, pending: Sequence[Chunk], *, timings: StageTimings | None
+) -> dict[int, Vector]:
     """What ``lender`` holds for ``pending``, by position in ``pending``.
 
     Keyed by position rather than by chunk id, because positions are what the caller pairs the
     answer with; a lender that answered about an id it was never asked about is ignored rather
     than trusted to have meant one of these.
+
+    Timed as its own visit to the store-lookup stage. The visit is made whenever a lender exists
+    and something is pending, whatever the answer, so the visit count says nothing about whether
+    another workspace held the text.
     """
-    if not pending:
+    if lender is None or not pending:
         return {}
-    lent = await lender.lend(pending)
+    with timings.timing(Stage.STORED_VECTORS) if timings is not None else nullcontext():
+        lent = await lender.lend(pending)
     return {index: lent[chunk.id] for index, chunk in enumerate(pending) if chunk.id in lent}
 
 
+def _batch_starts(count: int, size: int) -> range:
+    """Where each batch of ``count`` chunks starts, at ``size`` chunks a batch."""
+    return range(0, count, size)
+
+
 def _batches(count: int, *, budget_tokens: int, target_batch_tokens: int, maximum: int) -> int:
-    """How many forward passes :func:`embed_checked_chunks` makes for ``count`` chunks."""
+    """How many forward passes :func:`embed_checked_chunks` makes for ``count`` chunks.
+
+    Derived from :func:`_batch_starts`, the plan that function itself iterates, so the count a
+    borrowing document reports cannot drift from the count an unaided one makes.
+    """
     size = batch_size(
         budget_tokens=budget_tokens, target_batch_tokens=target_batch_tokens, maximum=maximum
     )
-    return -(-count // size)
+    return len(_batch_starts(count, size))
 
 
 CACHE_HIT_METRIC: Final = "embedding_cache_hits"

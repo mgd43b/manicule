@@ -40,7 +40,9 @@ stated in ``docs/storage.md`` §6.2.6 rather than discovered.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -115,6 +117,32 @@ class SharedVectors:
         self._donors = donors
         self._fingerprint = fingerprint
         self._ledger = ledger
+        # Handles already found to be in this space. A handle is reopened whenever its
+        # workspace's index state moves, so a confirmed handle stays confirmed; asking again for
+        # every document would cost a networked backend two round trips per donor per document.
+        self._confirmed: weakref.WeakSet[object] = weakref.WeakSet()
+
+    async def _same_space(self, donor: Donor) -> bool:
+        """Whether ``donor``'s recorded embedding is the borrowing workspace's, checked once."""
+        try:
+            if donor.vectors in self._confirmed:
+                return True
+        except TypeError:  # pragma: no cover - a store that cannot be weakly referenced
+            pass
+        try:
+            recorded = await donor.vectors.fingerprint()
+        except Exception as exc:  # noqa: BLE001 - a donor's failure is not this document's
+            _LOG.warning(
+                "could not read another workspace's embedding fingerprint for reuse; "
+                "embedding instead: %s",
+                type(exc).__name__,
+            )
+            return False
+        if recorded is None or not recorded.matches(self._fingerprint):
+            return False
+        with contextlib.suppress(TypeError):
+            self._confirmed.add(donor.vectors)
+        return True
 
     def for_document(self, source: str, source_id: str) -> DocumentLender:
         """A lender for the chunks of the document ``(source, source_id)`` names here."""
@@ -149,16 +177,7 @@ class SharedVectors:
         for donor in donors:
             if not remaining:
                 break
-            try:
-                recorded = await donor.vectors.fingerprint()
-            except Exception as exc:  # noqa: BLE001 - a donor's failure is not this document's
-                _LOG.warning(
-                    "could not read another workspace's embedding fingerprint for reuse; "
-                    "embedding instead: %s",
-                    type(exc).__name__,
-                )
-                continue
-            if recorded is None or not recorded.matches(self._fingerprint):
+            if not await self._same_space(donor):
                 continue
             addressed = document_id(donor.workspace, source, source_id)
             proxies: list[Chunk] = [

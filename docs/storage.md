@@ -1451,7 +1451,10 @@ declaration so the identities it derives are the ones that workspace recorded. O
 index, one built by another model, or one whose handle cannot be opened is skipped, never
 refused, and so is a workspace whose lookup fails for any reason. A failure is logged at
 warning on the operator's log and never becomes the borrowing document's status. The model is
-still there. The ledger counts a document's copied vectors only once that document commits.
+still there. The ledger counts a document's copied vectors only once that document commits
+successfully. A failed update of an already-indexed document, which leaves the previous revision
+served, adds nothing. The count is cumulative: it tallies forward passes that were not made, so a
+later reset of the workspace's index does not reduce it.
 
 **The copy is written as a fresh vector.** The borrowing workspace stores the vector through its
 own `upsert`, under its own chunk id, publication and identity, and computes its own checksum

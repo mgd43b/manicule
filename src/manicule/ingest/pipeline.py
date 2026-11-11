@@ -4287,7 +4287,14 @@ class IngestPipeline:
             )
         # Only a committed document used the vectors it borrowed, so only it is counted. The
         # count goes to the operator's ledger and nowhere a caller of this workspace can see.
-        if lender is not None and outcome.status is DocumentStatus.INDEXED:
+        # A failed update of an already-indexed document is demoted back to INDEXED with the
+        # failure named in `failed_stage`, its previous revision still served; it used none of
+        # what it borrowed, so it is not counted either.
+        if (
+            lender is not None
+            and outcome.status is DocumentStatus.INDEXED
+            and outcome.failed_stage is None
+        ):
             await lender.settle()
         return replace(outcome, embedding=work)
 

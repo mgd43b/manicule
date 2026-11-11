@@ -9,7 +9,7 @@ vector is, and the operator's count is checked to be the operator's alone.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from manicule.app.caller import Caller, acting_as
 from manicule.app.runtime import Runtime
@@ -136,3 +136,54 @@ async def test_only_a_workspace_holding_the_document_is_asked(tmp_path: Path) ->
 
     assert [donor.workspace for donor in held] == ["alpha"]
     assert nowhere == []
+
+
+async def test_a_superseded_donor_handle_is_not_closed_under_a_reader(tmp_path: Path) -> None:
+    """Several documents lend at once, so a handle another document may still be reading stays
+    open until the registry closes; and a donor that cannot be opened is tried once per state."""
+    from sqlalchemy import update  # noqa: PLC0415
+
+    from manicule.storage import models  # noqa: PLC0415
+
+    async with _runtime(tmp_path, "alpha", CountingEmbedder()) as first:
+        await _sync(first)
+
+    model = CountingEmbedder()
+    closed: list[str] = []
+    async with _runtime(tmp_path, "beta", model) as second:
+        await second.pipeline()
+        registry = second._workspaces  # pyright: ignore[reportPrivateUsage] - the unit under test
+        (before,) = await registry.donors(model.fingerprint, (), source=SOURCE, source_id="page-0")
+        original = cast("Any", before.vectors).teardown
+
+        async def recording_teardown() -> None:
+            closed.append("old")
+            await original()
+
+        before.vectors.teardown = recording_teardown  # pyright: ignore[reportAttributeAccessIssue]
+        async with second.require_engine().begin() as connection:
+            await connection.execute(
+                update(models.Workspace)
+                .where(models.Workspace.id == "alpha")
+                .values(derived_reset_epoch=models.Workspace.derived_reset_epoch + 1)
+            )
+        await registry.donors(model.fingerprint, (), source=SOURCE, source_id="page-0")
+        assert closed == [], "a superseded handle is retired, not closed under its readers"
+
+        attempts: list[str] = []
+
+        async def failing(*args: object, **kwargs: object) -> object:
+            del kwargs
+            attempts.append(str(args[0]))
+            msg = "the vector directory is gone"
+            raise RuntimeError(msg)
+
+        registry._donor_vectors.clear()  # pyright: ignore[reportPrivateUsage] - force a reopen
+        registry._vectors_for = failing  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+        for _ in range(3):
+            assert (
+                await registry.donors(model.fingerprint, (), source=SOURCE, source_id="page-0")
+                == []
+            )
+        assert attempts == ["alpha"], "one failed open per index state, not one per document"
+    assert closed == ["old"], "the retired handle is closed with the registry"

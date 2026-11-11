@@ -2822,6 +2822,13 @@ class _Workspaces:
         # middleware declaration, which a search never loads, and a shared slot would tear one
         # kind down to open the other while a caller of the first was still using it.
         self._donor_vectors: dict[str, _OpenedVectors] = {}
+        # Donor handles superseded by a newer index state. Closed with the registry rather than
+        # when superseded: several documents lend at once, and closing a handle under one of
+        # them would fail its read part-way and quietly send it to the model.
+        self._retired_donors: list[VectorStore] = []
+        # The index state each donor last failed to open under, so a workspace whose vectors are
+        # missing is tried once per state rather than once per document of every sync.
+        self._donor_failures: dict[str, tuple[str | None, str | None, int]] = {}
         self._lock = asyncio.Lock()
 
     async def open(self, names: Sequence[str]) -> Sequence[OpenedWorkspace]:
@@ -2869,9 +2876,14 @@ class _Workspaces:
 
     async def aclose(self) -> None:
         """Release every vector handle this registry opened. The engine is the runtime's."""
-        opened = [*self._vectors.values(), *self._donor_vectors.values()]
+        opened = [
+            *self._vectors.values(),
+            *self._donor_vectors.values(),
+            *(_OpenedVectors(state=("", None, 0), vectors=old) for old in self._retired_donors),
+        ]
         self._vectors.clear()
         self._donor_vectors.clear()
+        self._retired_donors.clear()
         failures: list[Exception] = []
         for handle in opened:
             teardown = getattr(handle.vectors, "teardown", None)
@@ -2971,43 +2983,54 @@ class _Workspaces:
         from manicule.storage import models  # noqa: PLC0415
 
         runtime = self._runtime
-        async with self._lock:
-            known = await self._known_states()
-            eligible = {
-                document_id(name, source, source_id): name
-                for name, (recorded, _namespace, _epoch) in known.items()
-                if name != runtime.workspace and _recorded_matches(recorded, fingerprint)
-            }
-            if not eligible:
-                return []
-            async with runtime.require_engine().connect() as connection:
-                holding = {
-                    str(row.workspace_id)
-                    for row in await connection.execute(
-                        select(models.Document.workspace_id).where(
-                            models.Document.id.in_(sorted(eligible)),
-                            models.Document.deleted_at.is_(None),
-                        )
+        # Both reads outside the registry lock: they are plain reads of the shared engine, and
+        # holding the lock across them would queue every document of a sync, and any spanning
+        # search, behind work that answers nothing for most of them. Only opening a handle,
+        # which mutates the cache, is serialized.
+        known = await self._known_states()
+        eligible = {
+            document_id(name, source, source_id): name
+            for name, (recorded, _namespace, _epoch) in known.items()
+            if name != runtime.workspace and _recorded_matches(recorded, fingerprint)
+        }
+        if not eligible:
+            return []
+        async with runtime.require_engine().connect() as connection:
+            holding = {
+                str(row.workspace_id)
+                for row in await connection.execute(
+                    select(models.Document.workspace_id).where(
+                        models.Document.id.in_(sorted(eligible)),
+                        models.Document.deleted_at.is_(None),
                     )
-                }
-            found: list[Donor] = []
+                )
+            }
+        found: list[Donor] = []
+        async with self._lock:
             for name in sorted(holding & set(eligible.values())):
+                state = known[name]
+                if self._donor_failures.get(name) == state:
+                    continue
                 try:
                     vectors = await self._vectors_for(
                         name,
-                        known[name],
+                        state,
                         fingerprint,
                         middleware=middleware,
                         cache=self._donor_vectors,
+                        retire=self._retired_donors,
                     )
                 except Exception as exc:  # noqa: BLE001 - a donor that cannot be opened lends nothing
+                    self._donor_failures[name] = state
                     _LOG.warning(
-                        "skipped another workspace as a source of reusable vectors: %s",
+                        "skipped another workspace as a source of reusable vectors until its "
+                        "index changes: %s",
                         type(exc).__name__,
                     )
                     continue
+                self._donor_failures.pop(name, None)
                 found.append(Lending(workspace=name, vectors=vectors))
-            return found
+        return found
 
     @staticmethod
     def _require_searchable(
@@ -3067,13 +3090,16 @@ class _Workspaces:
         *,
         middleware: Sequence[str] = (),
         cache: dict[str, _OpenedVectors] | None = None,
+        retire: list[VectorStore] | None = None,
     ) -> VectorStore:
         """``name``'s vectors, opened for reading in ``searching``'s space.
 
         ``middleware`` is the embed-text declaration a handle folds into every embedding-input
         identity it derives. A search derives none and passes nothing; a lender's handle has
         to derive the identities ``name``'s own ingest recorded, so it is given the declaration
-        this installation ingests under. ``cache`` is which slot the handle lives in.
+        this installation ingests under. ``cache`` is which slot the handle lives in, and
+        ``retire``, when given, is where a superseded handle goes instead of being closed now,
+        for a caller whose handles may still be in use when the state moves.
 
         The embedded backend opens the workspace's own directory, bound to its index identity
         and reset epoch as this runtime's own handle is. Any other backend is asked to open it,
@@ -3095,9 +3121,12 @@ class _Workspaces:
             return cached.vectors
         if cached is not None:
             del opened[name]
-            teardown = getattr(cached.vectors, "teardown", None)
-            if teardown is not None:
-                await teardown()
+            if retire is not None:
+                retire.append(cached.vectors)
+            else:
+                teardown = getattr(cached.vectors, "teardown", None)
+                if teardown is not None:
+                    await teardown()
 
         configured = await self._runtime.container.aget(keys.VECTOR_STORE)
         vectors: VectorStore

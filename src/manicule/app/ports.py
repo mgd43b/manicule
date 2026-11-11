@@ -229,13 +229,20 @@ class OpenedWorkspace:
 class CountsVectorReuse(Protocol):
     """A backend that keeps the operator's count of vectors borrowed from other workspaces.
 
-    Optional on the terms :class:`SpansWorkspaces` is: a backend that serves one workspace has
-    no other workspace to borrow from, and reports nothing rather than a zero it never counted.
+    Optional on the terms :class:`SpansWorkspaces` is: a backend that cannot reach any other
+    workspace does not implement it, and the count is then reported as absent rather than as a
+    zero nobody counted. A backend that implements it answers ``0`` for a workspace that has
+    borrowed nothing, including one that is currently the only workspace on the installation,
+    because it did count and the answer was none.
     """
 
     async def vectors_from_other_workspaces(self) -> int:
-        """How many vectors this workspace copied from another one's store (``docs/storage.md``
-        §6.2.6). Read only on behalf of the operator at this machine."""
+        """How many vectors this workspace has copied from another one's store, cumulatively.
+
+        ``docs/storage.md`` §6.2.6. A tally of forward passes that were not made, so it is not
+        reduced when the workspace's derived index is later reset: those passes were still saved.
+        Read only on behalf of the operator at this machine.
+        """
         ...
 
 
