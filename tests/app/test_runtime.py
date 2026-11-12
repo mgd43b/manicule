@@ -1290,6 +1290,26 @@ async def test_recording_a_query_does_not_wait_for_the_database_writer(runtime: 
     assert rows[0]["query"] == "retry policy"
 
 
+async def test_a_page_of_query_logs_is_not_held_behind_a_stuck_write(runtime: Runtime) -> None:
+    """Reading telemetry waits briefly for this process's queued rows, and no longer.
+
+    A write queued behind another writer can wait as long as that writer holds SQLite. The
+    admin page asked for meanwhile answers with what is stored rather than waiting with it.
+    """
+    telemetry = await runtime.telemetry()
+    engine = runtime.require_engine()
+    async with engine.connect() as holder:
+        await holder.exec_driver_sql("BEGIN IMMEDIATE")
+        await telemetry.record_query(
+            "stuck", profile="balanced", chunk_ids=[], confidence=None, elapsed_ms=1
+        )
+        _, total = await asyncio.wait_for(telemetry.query_logs(limit=10), timeout=3.0)
+        assert total == 0, "the page waited for a write that could not land"
+        await holder.rollback()
+    await telemetry.settle()
+    assert (await telemetry.query_logs(limit=10))[1] == 1
+
+
 async def test_a_queued_query_row_lands_before_the_runtime_closes(
     manicule_environment: Path,
 ) -> None:

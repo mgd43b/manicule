@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from sqlalchemy import ColumnElement, Select, and_, delete, false, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -847,9 +847,27 @@ async def resolve_filter(
     )
 
 
+@runtime_checkable
+class ResolvesCollectionIds(Protocol):
+    """A collection store that can name its members' ids without building the documents.
+
+    A capability checked by shape, not a class: any store offering it gets the cheap path, and
+    one that does not is still answered, through ``collection_documents``.
+    """
+
+    async def collection_document_ids(self, collection_id: str, *, limit: int) -> set[str]: ...
+
+
+@runtime_checkable
+class ResolvesTagIds(Protocol):
+    """A tag store that can name tagged documents' ids without building the documents."""
+
+    async def document_ids_with_tags(self, tag_ids: Sequence[str], *, limit: int) -> set[str]: ...
+
+
 async def _member_ids(collections: CollectionStore, collection_id: str) -> set[str]:
     """A collection's member ids, asking for ids alone when the store can answer that."""
-    if isinstance(collections, CollectionsMixin):
+    if isinstance(collections, ResolvesCollectionIds):
         return await collections.collection_document_ids(
             collection_id, limit=MAX_RESOLVED_DOCUMENTS + 1
         )
@@ -861,7 +879,7 @@ async def _member_ids(collections: CollectionStore, collection_id: str) -> set[s
 
 async def _tagged_document_ids(tags: TagStore, tag_ids: Sequence[str]) -> set[str]:
     """Ids of the documents carrying any of ``tag_ids``, as ids alone when the store can."""
-    if isinstance(tags, TagsMixin):
+    if isinstance(tags, ResolvesTagIds):
         return await tags.document_ids_with_tags(tag_ids, limit=MAX_RESOLVED_DOCUMENTS + 1)
     tagged = await tags.documents_with_tags(tag_ids, limit=MAX_RESOLVED_DOCUMENTS + 1)
     return {document.id for document in tagged}

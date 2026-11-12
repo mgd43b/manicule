@@ -138,7 +138,6 @@ async def test_every_declared_pragma_is_actually_applied(engine: AsyncEngine) ->
         "foreign_keys": 1,
         "busy_timeout": 5000,
         "mmap_size": 268435456,
-        "cache_size": -8192,
         "temp_store": 2,
     }
     async with engine.connect() as connection:

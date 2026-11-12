@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, cast, override
 import pytest
 from pydantic import JsonValue
 from sqlalchemy import delete, event, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import manicule.storage.rebuild as rebuild_storage
 from manicule.core.acquisition import (
@@ -812,6 +813,35 @@ async def staged_glossary_generation(
         now=NOW,
     )
     return rebuilds, checkpoint, tuple(documents)
+
+
+async def test_staging_checks_replay_digests_without_loading_staged_rows(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staging batch reads the digests it compares, never the staged rows whole.
+
+    Each staged row carries a replacement document and all its chunks as its payload. Loading
+    one per item to compare a digest read the largest column of the table one round trip at a
+    time; the batch's digests now come back in one query.
+    """
+    real_get = AsyncSession.get
+
+    async def refusing(
+        self: AsyncSession, entity: object, *args: object, **kwargs: object
+    ) -> object:
+        if entity is models.DerivedGenerationItem:
+            raise AssertionError("a staged row was loaded whole to compare its digest")
+        return await real_get(self, entity, *args, **kwargs)  # pyright: ignore[reportArgumentType] - forwarded as-is
+
+    monkeypatch.setattr(AsyncSession, "get", refusing)
+
+    _, checkpoint, documents = await staged_glossary_generation(store, engine, data_dir)
+
+    assert len(documents) == 2
+    assert checkpoint.generation_id
 
 
 async def test_atomic_publication_flushes_glossary_parents_before_alias_evidence_pages(

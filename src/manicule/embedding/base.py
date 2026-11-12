@@ -20,6 +20,7 @@ class boundary: the platform gets the forward pass, and cannot reach the output.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import heapq
 import itertools
 from abc import ABC, abstractmethod
@@ -81,10 +82,24 @@ class _Lanes:
                 raise
         else:
             self._busy = True
+        loop = asyncio.get_running_loop()
+        submitted = executor.submit(work)
         try:
-            return await asyncio.get_running_loop().run_in_executor(executor, work)
+            return await asyncio.wrap_future(submitted, loop=loop)
         finally:
-            self._release()
+            if submitted.done():
+                self._release()
+            else:
+                # Canceled while the thread is still running it. The worker is not free until the
+                # thread is, and handing the turn on now would queue the next call inside the
+                # executor's own first-in-first-out queue, where no lane order applies.
+                submitted.add_done_callback(lambda _: self._release_from_thread(loop))
+
+    def _release_from_thread(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Release from the executor's thread, onto the loop that owns the waiters."""
+        # A loop that has closed has no waiters left to hand the worker to.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(self._release)
 
     def _release(self) -> None:
         while self._waiting:

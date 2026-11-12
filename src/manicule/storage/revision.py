@@ -14,7 +14,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Connection
@@ -31,10 +30,15 @@ def current_revision(connection: Connection) -> str | None:
     :data:`HEAD_REVISION`, and the caller takes the migrating path, where Alembic says what is
     wrong in its own words.
     """
-    try:
-        rows = connection.execute(text("SELECT version_num FROM alembic_version")).all()
-    except OperationalError:
+    # Asked of the catalog rather than inferred from a failed SELECT. Catching the failure would
+    # read a locked, damaged or unreadable database as one that was never migrated, and send a
+    # reader into the lock-and-upgrade path against it instead of reporting what went wrong.
+    present = connection.execute(
+        text("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'alembic_version'")
+    ).first()
+    if present is None:
         return None
+    rows = connection.execute(text("SELECT version_num FROM alembic_version")).all()
     if not rows:
         return None
     if len(rows) > 1:

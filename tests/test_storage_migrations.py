@@ -18,6 +18,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from pydantic import TypeAdapter
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from manicule.app.service import _reembed_run_report  # pyright: ignore[reportPrivateUsage]
@@ -1893,5 +1894,10 @@ async def test_the_revision_a_database_records_is_read_without_alembic(engine: A
     try:
         async with blank.connect() as connection:
             assert await connection.run_sync(recorded_revision) is None
+            # A database that fails to answer is not one that was never migrated. Reading the
+            # failure as "no revision" would send a reader into the lock and the upgrade.
+            await connection.execute(text("CREATE TABLE alembic_version (other TEXT)"))
+            with pytest.raises(OperationalError):
+                await connection.run_sync(recorded_revision)
     finally:
         await blank.dispose()

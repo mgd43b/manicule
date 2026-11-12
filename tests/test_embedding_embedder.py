@@ -451,3 +451,37 @@ async def test_a_single_text_takes_the_urgent_lane_and_a_batch_the_bulk_one(
         assert lanes == [_Lanes.URGENT, _Lanes.BULK]
     finally:
         await embedder.teardown()
+
+
+async def test_a_canceled_pass_keeps_the_worker_until_its_thread_is_done() -> None:
+    """Canceling a caller cannot stop the thread running its pass, so the worker is not free.
+
+    Handing the turn on at once queued the next call inside the executor's own first-in,
+    first-out queue, where a query arriving next would wait behind a queued ingest batch again.
+    """
+    lanes = _Lanes()
+    worker = ThreadPoolExecutor(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    ran: list[str] = []
+
+    def blocking() -> None:
+        started.set()
+        release.wait(5)
+        ran.append("canceled pass")
+
+    try:
+        running = asyncio.create_task(lanes.run(worker, blocking, _Lanes.BULK))
+        await asyncio.to_thread(started.wait, 5)
+        running.cancel()
+        await asyncio.sleep(0)
+        bulk = asyncio.create_task(lanes.run(worker, lambda: ran.append("bulk"), _Lanes.BULK))
+        await asyncio.sleep(0)
+        query = asyncio.create_task(lanes.run(worker, lambda: ran.append("query"), _Lanes.URGENT))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(bulk, query), 5)
+    finally:
+        worker.shutdown(wait=True)
+    assert running.cancelled()
+    assert ran == ["canceled pass", "query", "bulk"]

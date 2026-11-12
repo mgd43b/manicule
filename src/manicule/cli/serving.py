@@ -286,7 +286,16 @@ async def _serve(
         )
         # Beside the transport rather than ahead of it, so the address is listening at once and a
         # request that arrives first simply builds what this is building, under the same lock.
-        warming = asyncio.create_task(_warm(runtime), name="manicule-warm")
+        #
+        # Not over stdio. A stdio server is started by its client, often one per conversation,
+        # and many of those only list or read; loading gigabytes of weights for each one would
+        # spend on every session what only a searching session needs. A network server is
+        # long-lived and shared, so paying once at start is the cheaper place.
+        warming = (
+            asyncio.create_task(_warm(runtime), name="manicule-warm")
+            if transport != "stdio"
+            else None
+        )
         # The control socket and the scheduler are what make this process *the writer* rather
         # than a process that happens to serve a protocol. They are started after the lock is
         # held and after the address is announced, and closed on every path out — including the
@@ -326,9 +335,10 @@ async def _serve(
             _report(failed("start", service.workspace, error_info(exc)), json_output)
             return EX_CONFIG
         finally:
-            warming.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await warming
+            if warming is not None:
+                warming.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await warming
             pid.unlink(missing_ok=True)
     return 0
 

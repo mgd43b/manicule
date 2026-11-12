@@ -15,6 +15,7 @@ implementation of it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -142,6 +143,9 @@ _QUERY_LOG_BACKLOG: Final = 256
 Generous enough that a writer holding SQLite for a few seconds costs searches nothing, and
 bounded so that a writer that never lets go turns into slow searches rather than into memory
 growing one task per query."""
+
+_QUERY_LOG_READ_WAIT_S: Final = 1.0
+"""How long a read of ``query_logs`` waits for this process's queued writes to land."""
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -3772,10 +3776,12 @@ class _Telemetry:
         the alternative put a SQLite write on every search's response path: with a sync or a
         maintenance writer holding the database, the insert sat in SQLite's busy handler for up
         to ``busy_timeout`` while the caller waited for an answer that was already computed.
-        The id is chosen here, so it is valid the moment this returns; the row it names is
-        visible once :meth:`settle` has run, which :meth:`query_logs` and the runtime's close
-        both do. Past :data:`_QUERY_LOG_BACKLOG` writes in flight, the next one is awaited
-        instead — backpressure rather than an unbounded pile of tasks behind a stalled writer.
+        The id is chosen here, but the row it names exists only once :meth:`settle` has run:
+        a caller about to store the id somewhere that references ``query_logs`` — a message's
+        ``query_log_id`` is a foreign key — settles first. :meth:`query_logs` settles, bounded,
+        and the runtime's close settles fully. Past :data:`_QUERY_LOG_BACKLOG` writes in
+        flight, the next one is awaited instead — backpressure rather than an unbounded pile of
+        tasks behind a stalled writer.
         """
         identifier = secrets.token_hex(8)
         write = self._write_query(
@@ -3828,9 +3834,13 @@ class _Telemetry:
             _LOG.warning("could not record query telemetry: %s: %s", type(exc).__name__, exc)
 
     async def settle(self) -> None:
-        """Wait for every queued ``query_logs`` write, including any queued while waiting."""
+        """Wait for every queued ``query_logs`` write, including any queued while waiting.
+
+        Waiting here never cancels a write: a caller that bounds this with ``asyncio.timeout``
+        stops waiting, and the write still lands.
+        """
         while self._pending:
-            await asyncio.gather(*self._pending, return_exceptions=True)
+            await asyncio.wait(set(self._pending))
 
     async def query_logs(
         self, *, limit: int = 50, offset: int = 0
@@ -3840,8 +3850,11 @@ class _Telemetry:
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
 
-        # Read-your-writes within the process: a page asked for after a search includes it.
-        await self.settle()
+        # Read-your-writes within the process, bounded: a page asked for after a search includes
+        # it, unless the write is stuck behind another writer, when the page is not held for it.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_QUERY_LOG_READ_WAIT_S):
+                await self.settle()
         sessions = session_factory(self._runtime.require_engine())
         scope = models.QueryLog.workspace_id == self._runtime.workspace
         async with sessions() as session:
