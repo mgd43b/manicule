@@ -411,8 +411,8 @@ async def test_a_query_runs_ahead_of_queued_ingest_passes() -> None:
     assert ran == ["running", "query", "bulk-1", "bulk-2"]
 
 
-async def test_a_cancelled_waiter_does_not_keep_the_worker() -> None:
-    """A caller cancelled while queued gives up its turn rather than holding it forever."""
+async def test_a_canceled_waiter_does_not_keep_the_worker() -> None:
+    """A caller canceled while queued gives up its turn rather than holding it forever."""
     lanes = _Lanes()
     worker = ThreadPoolExecutor(max_workers=1)
     release = threading.Event()

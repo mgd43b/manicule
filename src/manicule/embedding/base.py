@@ -74,7 +74,7 @@ class _Lanes:
             try:
                 await turn
             except asyncio.CancelledError:
-                # Handed the worker in the same moment it was cancelled: pass it on, or it
+                # Handed the worker in the same moment it was canceled: pass it on, or it
                 # stays held by a caller that will never use it.
                 if turn.done() and not turn.cancelled():
                     self._release()

@@ -874,8 +874,10 @@ class QdrantVectorStore:
 
         **Answers without requiring :meth:`ensure_ready`**, like :meth:`count` and
         :meth:`delete_document`. The fingerprint it compares against is the one the server
-        records, which is the one the stored vectors were made with. A workspace that holds
-        nothing answers that it holds nothing for every chunk, which is true.
+        records, which is the one the stored vectors were made with — read from the server on an
+        unprepared handle, and the one :meth:`ensure_ready` checked against that record on a
+        prepared one (:meth:`_held_fingerprint`). A workspace that holds nothing answers that it
+        holds nothing for every chunk, which is true.
         """
         verdicts = {chunk.id: StoredVector(state=VectorState.ABSENT) for chunk in chunks}
         if not chunks:
