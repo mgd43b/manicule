@@ -59,6 +59,7 @@ async def test_every_foreign_key_leads_an_index_on_its_child_table(engine: Async
     deleted document, blob or tag into a scan of a table that grows with the corpus. Asked of the
     migrated database, not the models, because that is what SQLite plans against.
     """
+
     def unindexed(sync: Connection) -> list[str]:
         def rows(statement: str) -> list[Row[Any]]:
             return list(sync.exec_driver_sql(statement).fetchall())
