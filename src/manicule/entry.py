@@ -71,6 +71,15 @@ def install_hint(exc: ModuleNotFoundError) -> str | None:
 
 def main() -> None:
     """The console-script entry point, past the guard."""
+    if sys.argv[1:] == ["--version"]:
+        # Answered before the command line is imported, because nothing else is needed: the
+        # version is distribution metadata, and importing the whole program to print one line
+        # cost half a second. Exactly this argument list, so every other combination still
+        # goes through the command line and its own `--version`, which prints the same thing.
+        from manicule.core.version import CORE_VERSION  # noqa: PLC0415
+
+        sys.stdout.write(f"{CORE_VERSION}\n")
+        return
     try:
         # Deferred on purpose, and the deferral *is* this module. At the top of the file this
         # import runs at interpreter start, before the `except` below exists to catch it, and

@@ -18,19 +18,75 @@ by whoever is actually starting a system.
 
 from __future__ import annotations
 
-from manicule.app.bind import Bind, is_every_interface, is_loopback, resolve_bind
-from manicule.app.dispatch import error_info, run_op
-from manicule.app.ports import (
-    Answering,
-    Backend,
-    DocumentSurface,
-    Ingesting,
-    Maintenance,
-    Retrieving,
+from typing import TYPE_CHECKING
+
+from manicule._lazy import lazy_exports
+
+if TYPE_CHECKING:
+    from manicule.app.bind import Bind, is_every_interface, is_loopback, resolve_bind
+    from manicule.app.dispatch import error_info, run_op
+    from manicule.app.ports import (
+        Answering,
+        Backend,
+        DocumentSurface,
+        Ingesting,
+        Maintenance,
+        Retrieving,
+    )
+    from manicule.app.results import (
+        CONTRACT_VERSION,
+        Envelope,
+        ErrorInfo,
+        Payload,
+        failed,
+        succeeded,
+    )
+    from manicule.app.service import DEFAULT_SOURCE, ApplicationService, AskAside, hardware
+    from manicule.app.tenancy import CrossWorkspaceError, belongs_to, require_owned, require_owns
+
+__getattr__, __dir__ = lazy_exports(
+    globals(),
+    {
+        "manicule.app.bind": (
+            "Bind",
+            "is_every_interface",
+            "is_loopback",
+            "resolve_bind",
+        ),
+        "manicule.app.dispatch": (
+            "error_info",
+            "run_op",
+        ),
+        "manicule.app.ports": (
+            "Answering",
+            "Backend",
+            "DocumentSurface",
+            "Ingesting",
+            "Maintenance",
+            "Retrieving",
+        ),
+        "manicule.app.results": (
+            "CONTRACT_VERSION",
+            "Envelope",
+            "ErrorInfo",
+            "Payload",
+            "failed",
+            "succeeded",
+        ),
+        "manicule.app.service": (
+            "DEFAULT_SOURCE",
+            "ApplicationService",
+            "AskAside",
+            "hardware",
+        ),
+        "manicule.app.tenancy": (
+            "CrossWorkspaceError",
+            "belongs_to",
+            "require_owned",
+            "require_owns",
+        ),
+    },
 )
-from manicule.app.results import CONTRACT_VERSION, Envelope, ErrorInfo, Payload, failed, succeeded
-from manicule.app.service import DEFAULT_SOURCE, ApplicationService, AskAside, hardware
-from manicule.app.tenancy import CrossWorkspaceError, belongs_to, require_owned, require_owns
 
 __all__ = [
     "CONTRACT_VERSION",

@@ -844,14 +844,14 @@ class Runtime:
 
         A writer is already holding the lock from :meth:`__aenter__` and simply proceeds.
         """
-        from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic is not cheap
-
         ensure = getattr(store, "ensure_workspace", None)
         if self._writer:
             if not self._migrated:
                 # Before the first read, always. A query against an un-migrated database fails
                 # in whatever way SQLite happens to fail, at whichever statement happens to run
                 # first.
+                from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic
+
                 await upgrade(engine)
                 self._migrated = True
             if ensure is not None:
@@ -880,6 +880,10 @@ class Runtime:
             return
         if not self._migrated:
             if await self._storage_needs_initializing(engine):
+                # Imported only here, where it migrates: a reader that finds the schema current
+                # never pays for Alembic.
+                from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic
+
                 with InstanceLock(self._settings.data_dir):
                     await upgrade(engine)
             self._migrated = True
@@ -925,11 +929,13 @@ class Runtime:
         a reader for no gain, which is the failure mode this whole classification exists to
         avoid.
         """
-        from manicule.storage.migrator import current_revision, head_revision  # noqa: PLC0415
+        # Not `manicule.storage.migrator`: that imports Alembic and reads every migration script
+        # to name the head, which a reader that finds the schema current never needed.
+        from manicule.storage.revision import HEAD_REVISION, current_revision  # noqa: PLC0415
 
         async with engine.connect() as connection:
             at = await connection.run_sync(current_revision)
-        return at != head_revision()
+        return at != HEAD_REVISION
 
     async def _build_vectors(self) -> VectorStore:
         """Wrap the embedded store in the handle that follows SQLite's publication pointer.
