@@ -5,7 +5,7 @@ program's dependencies are known to be there.
 because `tests/test_import_boundary.py` refuses it in core and says why. The consequence is that
 `pip install manicule` on its own produces a `manicule` command whose first act is a nine-line
 traceback ending in `ModuleNotFoundError: No module named 'typer'`. That is a true statement
-about the process and a useless one to the person who typed `manicule --version`: it names a
+about the process and a useless one to the person who typed `manicule --help`: it names a
 library they have never heard of and no action they can take.
 
 This module is what turns it into a sentence. It lives at `manicule.entry` rather than

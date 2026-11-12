@@ -3829,9 +3829,10 @@ class _Telemetry:
                 )
         except Exception as exc:  # noqa: BLE001 - telemetry never fails the read it describes
             # Nobody awaits this task, so an exception left to escape would surface only as
-            # asyncio's "never retrieved" noise. The query text stays out of the message: it is
-            # user content, and `security.storage.redact_logs_content` governs log lines.
-            _LOG.warning("could not record query telemetry: %s: %s", type(exc).__name__, exc)
+            # asyncio's "never retrieved" noise. The type alone, never the message: an insert
+            # failure from SQLAlchemy renders its bound parameters, and one of them is the query
+            # text — user content, which `security.storage.redact_logs_content` keeps out of logs.
+            _LOG.warning("could not record query telemetry: %s", type(exc).__name__)
 
     async def settle(self) -> None:
         """Wait for every queued ``query_logs`` write, including any queued while waiting.

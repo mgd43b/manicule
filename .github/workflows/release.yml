@@ -302,6 +302,9 @@ jobs:
             --find-links dist/manicule-ollama \
             "$(echo dist/manicule/*.whl)[all]" "$(echo dist/manicule-mlx/*.whl)"
           /tmp/smoke/bin/manicule --version
+          # `--version` is answered before the command line is imported, so it proves only that
+          # the console script exists. `--help` imports the command line and everything it needs.
+          /tmp/smoke/bin/manicule --help > /dev/null
 
       - uses: actions/upload-artifact@v7
         with:

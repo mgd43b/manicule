@@ -1310,6 +1310,27 @@ async def test_a_page_of_query_logs_is_not_held_behind_a_stuck_write(runtime: Ru
     assert (await telemetry.query_logs(limit=10))[1] == 1
 
 
+async def test_a_failed_query_log_write_does_not_log_the_query(
+    runtime: Runtime, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The insert's own error message carries its bound parameters, the query text among them."""
+    telemetry = await runtime.telemetry()
+    engine = runtime.require_engine()
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("DROP TABLE query_logs")
+    with caplog.at_level("WARNING"):
+        await telemetry.record_query(
+            "a confidential question",
+            profile="balanced",
+            chunk_ids=[],
+            confidence=None,
+            elapsed_ms=1,
+        )
+        await telemetry.settle()
+    assert "could not record query telemetry" in caplog.text
+    assert "confidential" not in caplog.text
+
+
 async def test_a_queued_query_row_lands_before_the_runtime_closes(
     manicule_environment: Path,
 ) -> None:
