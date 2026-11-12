@@ -8,7 +8,7 @@ old vector from a new one is to compare the numbers.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, cast, override
 
 from manicule.core.content import DocumentStatus
 from manicule.ingest.reindex import NO_RETAINED_BYTES, plan_re_embed, re_embed_all, re_parse
@@ -315,3 +315,34 @@ async def test_a_member_is_embedded_once_in_its_own_turn_not_again_in_its_parent
     assert sum(drifted.batches) == len(before), "every chunk reached the model exactly once"
     assert sweep.chunks == len(before)
     assert all(stored(vectors)[chunk_id] != vector for chunk_id, vector in before.items())
+
+
+async def test_the_corpus_wide_sweeps_page_by_position_not_by_offset() -> None:
+    """A selection that does not shrink is paged with a keyset, never with ``OFFSET``.
+
+    ``OFFSET n`` makes SQLite step over ``n`` rows to find the page, so paging a corpus that way
+    is quadratic: a re-embed of 100k documents in pages of 25 steps over five billion rows. Every
+    page here is asked for by position, and the plan and the run still see the whole selection.
+    """
+    store, vectors, blobs, _, _ = await corpus(PAGES)
+    offsets: list[int] = []
+    original = store.select_documents
+
+    async def recording(**kwargs: object) -> Sequence[object]:
+        offsets.append(cast("int", kwargs.get("offset") or 0))
+        return await original(**kwargs)  # pyright: ignore[reportArgumentType] - forwarded as-is
+
+    store.select_documents = recording  # pyright: ignore[reportAttributeAccessIssue] - a spy
+
+    plan = await plan_re_embed(store=store, batch=1)
+    run = await re_embed_all(
+        store=store,
+        pipeline=drifted_pipeline(store, vectors, blobs, DriftedEmbedder()),
+        blobs=blobs,
+        batch=1,
+    )
+
+    assert plan.selected == run.selected == len(PAGES)
+    assert run.reembedded == len(PAGES)
+    assert len(offsets) > 2 * len(PAGES), "the sweeps did not page at all"
+    assert set(offsets) == {0}, "a page was asked for by skipping rows"
