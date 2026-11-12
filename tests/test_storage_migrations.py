@@ -18,6 +18,8 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from pydantic import TypeAdapter
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from manicule.app.service import _reembed_run_report  # pyright: ignore[reportPrivateUsage]
 from manicule.chunking.chunker import CHUNKER_VERSION
@@ -39,6 +41,8 @@ from manicule.storage.fts import FTS_SHADOW_TABLES
 from manicule.storage.migrator import alembic_config, current, downgrade, head_revision, upgrade
 from manicule.storage.models import Base
 from manicule.storage.reembed import SqliteReembedStore
+from manicule.storage.revision import HEAD_REVISION
+from manicule.storage.revision import current_revision as recorded_revision
 from manicule.storage.vectors import LanceVectorStore
 from tests.fakes import HashEmbedder
 from tests.storage_helpers import make_chunk, make_document
@@ -1868,3 +1872,32 @@ async def test_a_password_hash_column_is_added_empty_and_dropped_without_touchin
             assert len(members) == 1
     finally:
         await engine.dispose()
+
+
+def test_the_recorded_head_is_the_newest_migration() -> None:
+    """A reader decides whether to migrate by comparing against a constant, so it must be right.
+
+    The constant exists so that a command finding its schema current never imports Alembic or
+    reads every script in ``migrations/versions``. A new migration that forgets to update it
+    would make every reader think the schema is behind, take the writer's lock and migrate —
+    harmless, because the upgrade is idempotent, but it would be every command, every time.
+    """
+    assert head_revision() == HEAD_REVISION
+
+
+async def test_the_revision_a_database_records_is_read_without_alembic(engine: AsyncEngine) -> None:
+    """The one-statement read agrees with Alembic's, on a migrated database and a blank one."""
+    async with engine.connect() as connection:
+        assert await connection.run_sync(recorded_revision) == await current(engine)
+
+    blank = create_async_engine("sqlite+aiosqlite://")
+    try:
+        async with blank.connect() as connection:
+            assert await connection.run_sync(recorded_revision) is None
+            # A database that fails to answer is not one that was never migrated. Reading the
+            # failure as "no revision" would send a reader into the lock and the upgrade.
+            await connection.execute(text("CREATE TABLE alembic_version (other TEXT)"))
+            with pytest.raises(OperationalError):
+                await connection.run_sync(recorded_revision)
+    finally:
+        await blank.dispose()

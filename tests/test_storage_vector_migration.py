@@ -527,11 +527,12 @@ async def test_a_destination_whose_identity_record_is_gone_is_still_refused(
 ) -> None:
     """The populated-destination refusal has to survive the destination forgetting itself.
 
-    ``count`` resolves the collection through the fingerprint record, so a destination whose
-    record has gone — a reset that got halfway, a point removed by hand — answers zero while
-    its storage is still full. Asking that question would satisfy the refusal with exactly the
-    case it exists to catch, and rows of unknown provenance would be merged into the corpus
-    being moved. ``rows_in_space`` names the collection from the fingerprint instead.
+    ``count`` on a handle that was never prepared resolves the collection through the
+    fingerprint record, so a destination whose record has gone — a reset that got halfway, a
+    point removed by hand — answers zero from any other process while its storage is still full.
+    Asking that question would satisfy the refusal with exactly the case it exists to catch, and
+    rows of unknown provenance would be merged into the corpus being moved. ``rows_in_space``
+    names the collection from the fingerprint instead.
     """
     chunks = [chunk(f"chunk-{index}", position=index) for index in range(2)]
     source = await seeded(tmp_path / "vectors", chunks, opened)
@@ -552,10 +553,15 @@ async def test_a_destination_whose_identity_record_is_gone_is_still_refused(
         ),
         wait=True,
     )
-    assert await target.count() == 0, "the premise: the store now under-reports itself"
+    # A fresh handle, as the migrating process has: the one that wrote the rows still knows its
+    # fingerprint and would count them.
+    elsewhere = QdrantVectorStore(
+        client, workspace_id=WORKSPACE, collection_prefix=TEST_COLLECTION_PREFIX
+    )
+    assert await elsewhere.count() == 0, "the premise: the store now under-reports itself"
 
     with pytest.raises(VectorMigrationError, match="already holds 1 vector"):
-        await migrate_vectors(source, target, generation="legacy", dry_run=True)
+        await migrate_vectors(source, elsewhere, generation="legacy", dry_run=True)
 
 
 async def test_a_copy_that_lands_short_is_refused_rather_than_reported(

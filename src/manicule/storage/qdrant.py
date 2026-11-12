@@ -874,14 +874,16 @@ class QdrantVectorStore:
 
         **Answers without requiring :meth:`ensure_ready`**, like :meth:`count` and
         :meth:`delete_document`. The fingerprint it compares against is the one the server
-        records, which is the one the stored vectors were made with. A workspace that holds
-        nothing answers that it holds nothing for every chunk, which is true.
+        records, which is the one the stored vectors were made with — read from the server on an
+        unprepared handle, and the one :meth:`ensure_ready` checked against that record on a
+        prepared one (:meth:`_held_fingerprint`). A workspace that holds nothing answers that it
+        holds nothing for every chunk, which is true.
         """
         verdicts = {chunk.id: StoredVector(state=VectorState.ABSENT) for chunk in chunks}
         if not chunks:
             return verdicts
-        fingerprint = await self._recorded_fingerprint()
-        if fingerprint is None or not await self._collection_exists(fingerprint):
+        fingerprint = await self._held_fingerprint()
+        if fingerprint is None:
             return verdicts
 
         by_id = {chunk.id: chunk for chunk in chunks}
@@ -993,8 +995,8 @@ class QdrantVectorStore:
 
     async def delete_document(self, document_id: str) -> None:
         """Remove every vector belonging to a document. Idempotent."""
-        fingerprint = await self._recorded_fingerprint()
-        if fingerprint is None or not await self._collection_exists(fingerprint):
+        fingerprint = await self._held_fingerprint()
+        if fingerprint is None:
             return
         await self._client.delete(
             collection_name=self._collection(fingerprint),
@@ -1021,8 +1023,10 @@ class QdrantVectorStore:
         meant, and the historical parameter name is the narrow protocol's
         (:class:`~manicule.ingest.sweeps.VectorSweepTarget`).
         """
-        fingerprint = await self._recorded_fingerprint()
-        if fingerprint is None or not chunk_ids or not await self._collection_exists(fingerprint):
+        if not chunk_ids:
+            return
+        fingerprint = await self._held_fingerprint()
+        if fingerprint is None:
             return
         ids = [point_id_for(row_id) for row_id in chunk_ids]
         collection = self._collection(fingerprint)
@@ -1035,8 +1039,8 @@ class QdrantVectorStore:
 
     async def count(self) -> int:
         """How many vectors are stored."""
-        fingerprint = await self._recorded_fingerprint()
-        if fingerprint is None or not await self._collection_exists(fingerprint):
+        fingerprint = await self._held_fingerprint()
+        if fingerprint is None:
             return 0
         result = await self._client.count(collection_name=self._collection(fingerprint), exact=True)
         return int(result.count)
@@ -1309,6 +1313,22 @@ class QdrantVectorStore:
 
     async def _collection_exists(self, fingerprint: EmbedFingerprint) -> bool:
         return await self._client.collection_exists(self._collection(fingerprint))
+
+    async def _held_fingerprint(self) -> EmbedFingerprint | None:
+        """The fingerprint whose collection holds this workspace's vectors, if it exists.
+
+        A prepared handle already knows it: :meth:`ensure_ready` read the server's record and
+        refused anything that did not match, and :meth:`reset_storage` forgets it with the
+        storage. Asking the server again cost two round trips on every per-document call —
+        ``stored_vectors`` and the deletes run once per document an ingest touches, so against
+        a remote server that was three requests of preamble before any work. The record is
+        still read when this handle has not been prepared, and the collection is still checked
+        every time, so a collection another process dropped reads as empty, as it did before.
+        """
+        fingerprint = self._fingerprint or await self._recorded_fingerprint()
+        if fingerprint is None or not await self._collection_exists(fingerprint):
+            return None
+        return fingerprint
 
     async def _ensure_collection(self, fingerprint: EmbedFingerprint) -> None:
         """Create the collection or check the one there, bring it to its shape, index its payload.

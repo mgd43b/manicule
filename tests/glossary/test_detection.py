@@ -1552,3 +1552,31 @@ def test_two_expansions_are_the_same_only_when_they_say_the_same_thing() -> None
     assert normalize_expansion("Network Operations Workspace") != normalize_expansion(
         "Workspace, Network Operations"
     )
+
+
+def test_a_line_with_no_parenthesis_never_reaches_the_parenthetical_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scan costs about a millisecond per kilobyte on a line it cannot match.
+
+    It opens with an unanchored run of words before the `(` it needs, so `finditer` backtracks
+    over that run at every position of a line that has none. Skipping such lines is exact, and
+    it is most of what glossary detection costs on ordinary prose.
+    """
+    scanned: list[str] = []
+    real = ingest_glossary._PARENTHETICAL_RE  # pyright: ignore[reportPrivateUsage] - spied on
+
+    class Spy:
+        def finditer(self, line: str) -> object:
+            scanned.append(line)
+            return real.finditer(line)
+
+    monkeypatch.setattr(ingest_glossary, "_PARENTHETICAL_RE", Spy())
+
+    plain = "The retry policy backs off exponentially and gives up after five attempts."
+    expansion = "Mean Time To Recovery (MTTR) is tracked per service."
+    entries = detect_in_chunk(chunk(f"{plain}\n{expansion}"))
+
+    assert plain not in scanned
+    assert expansion in scanned
+    assert [entry.acronym for entry in entries] == ["MTTR"]

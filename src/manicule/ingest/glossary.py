@@ -1107,6 +1107,13 @@ def _from_line(line: str, previous: str) -> list[_Candidate]:
     if term_first is not None:
         found.append(term_first)
 
+    # The pattern needs a literal `(`, but it opens with an unanchored run of up to
+    # MAX_EXPANSION_WORDS words, so on a line without one `finditer` retries that run at every
+    # position and backtracks over it each time before failing: about a millisecond per
+    # kilobyte of ordinary prose, nearly all of this function's cost. The test is exact — a line
+    # with no `(` cannot match — and it skips the scan for most lines of most chunks.
+    if "(" not in line:
+        return found
     for parenthetical in _PARENTHETICAL_RE.finditer(line):
         terms = [part.strip() for part in parenthetical["terms"].split(",") if part.strip()]
         if terms:

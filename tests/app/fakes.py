@@ -821,6 +821,9 @@ class FakeTelemetry:
         )
         return identifier
 
+    async def settle(self) -> None:
+        """Nothing to wait for: rows are recorded synchronously."""
+
     async def query_logs(
         self, *, limit: int = 50, offset: int = 0
     ) -> tuple[Sequence[Mapping[str, object]], int]:

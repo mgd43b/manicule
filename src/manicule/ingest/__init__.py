@@ -20,32 +20,88 @@ watches a directory, so that the optional dependency it needs is paid for only b
 
 from __future__ import annotations
 
-from manicule.ingest.capacity import (
-    CapacityDiagnostic,
-    CapacityRefusedError,
-    CapacityResource,
-)
-from manicule.ingest.embedding import batch_size, embed_chunks
-from manicule.ingest.middleware import MiddlewareRunner, declarations, text_digest
-from manicule.ingest.pipeline import (
-    BlobSink,
-    Change,
-    DocumentOutcome,
-    IngestPipeline,
-    NoRetention,
-    RunReport,
-)
-from manicule.ingest.ports import IngestStore
-from manicule.ingest.recovery import InstanceLock, requeue_interrupted
-from manicule.ingest.refusals import check_before_run, require_coherent, require_measured
-from manicule.ingest.sweeps import SweepGate, SweepResult, sweep_vectors
-from manicule.ingest.workers import (
-    AttemptResult,
-    InProcessRunner,
-    ParseRunner,
-    WorkerConfig,
-    WorkerPool,
-    worker_config,
+from typing import TYPE_CHECKING
+
+from manicule._lazy import lazy_exports
+
+if TYPE_CHECKING:
+    from manicule.ingest.capacity import (
+        CapacityDiagnostic,
+        CapacityRefusedError,
+        CapacityResource,
+    )
+    from manicule.ingest.embedding import batch_size, embed_chunks
+    from manicule.ingest.middleware import MiddlewareRunner, declarations, text_digest
+    from manicule.ingest.pipeline import (
+        BlobSink,
+        Change,
+        DocumentOutcome,
+        IngestPipeline,
+        NoRetention,
+        RunReport,
+    )
+    from manicule.ingest.ports import IngestStore
+    from manicule.ingest.recovery import InstanceLock, requeue_interrupted
+    from manicule.ingest.refusals import check_before_run, require_coherent, require_measured
+    from manicule.ingest.sweeps import SweepGate, SweepResult, sweep_vectors
+    from manicule.ingest.workers import (
+        AttemptResult,
+        InProcessRunner,
+        ParseRunner,
+        WorkerConfig,
+        WorkerPool,
+        worker_config,
+    )
+
+__getattr__, __dir__ = lazy_exports(
+    globals(),
+    {
+        "manicule.ingest.capacity": (
+            "CapacityDiagnostic",
+            "CapacityRefusedError",
+            "CapacityResource",
+        ),
+        "manicule.ingest.embedding": (
+            "batch_size",
+            "embed_chunks",
+        ),
+        "manicule.ingest.middleware": (
+            "MiddlewareRunner",
+            "declarations",
+            "text_digest",
+        ),
+        "manicule.ingest.pipeline": (
+            "BlobSink",
+            "Change",
+            "DocumentOutcome",
+            "IngestPipeline",
+            "NoRetention",
+            "RunReport",
+        ),
+        "manicule.ingest.ports": ("IngestStore",),
+        "manicule.ingest.recovery": (
+            "InstanceLock",
+            "requeue_interrupted",
+        ),
+        "manicule.ingest.refusals": (
+            "check_before_run",
+            "require_coherent",
+            "require_measured",
+        ),
+        "manicule.ingest.sweeps": (
+            "SweepGate",
+            "SweepResult",
+            "sweep_vectors",
+        ),
+        "manicule.ingest.workers": (
+            "AttemptResult",
+            "InProcessRunner",
+            "ParseRunner",
+            "WorkerConfig",
+            "WorkerPool",
+            "worker_config",
+        ),
+    },
 )
 
 __all__ = [

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import gzip
 import json
 import os
 import sqlite3
@@ -24,6 +25,7 @@ from manicule.core.errors import StorageBusyError
 from manicule.core.ids import content_hash
 from manicule.core.sources import DiscoveredDoc, DocRef, Watermark
 from manicule.ingest.capacity import CapacityRefusedError, CapacityResource
+from manicule.storage import blobs as blobs_module
 from manicule.storage.blobs import (
     BlobStore,
     OmittedBlob,
@@ -55,6 +57,34 @@ async def test_bytes_survive_a_round_trip_so_reparsing_never_refetches(
     stored = await blobs.put(payload, "application/pdf")
     assert isinstance(stored, StoredBlob)
     assert await blobs.get(stored.hash) == payload
+
+
+async def test_a_blob_is_compressed_once_and_never_while_holding_the_writer(
+    engine: AsyncEngine, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Level-9 gzip of a large page is tens of milliseconds, and it used to run twice.
+
+    The second run was inside `writer_slot` and `BEGIN IMMEDIATE`, so every other writer in the
+    process — publication, journal transitions, `record_seen` — queued behind compression. The
+    stored bytes do not change: same input, same level, `mtime=0`.
+    """
+    admission = writer_admission(engine)
+    calls: list[bool] = []
+    real = gzip.compress
+
+    def spying(data: bytes, *args: Any, **kwargs: Any) -> bytes:
+        calls.append(admission.locked())
+        return real(data, *args, **kwargs)
+
+    monkeypatch.setattr(blobs_module.gzip, "compress", spying)
+    payload = b"<html><body>" + b"retry policy " * 4096 + b"</body></html>"
+
+    stored = await BlobStore(engine, data_dir).put(payload, "text/html")
+
+    assert isinstance(stored, StoredBlob)
+    assert stored.compression == "gzip"
+    assert calls == [False], "compressed more than once, or while holding the writer slot"
+    assert await BlobStore(engine, data_dir).get(stored.hash) == payload
 
 
 async def test_identical_bytes_are_stored_once(engine: AsyncEngine, data_dir: Path) -> None:

@@ -35,6 +35,7 @@ from manicule.core.content import LEGACY_PUBLICATION, BlockKind, Chunk
 from manicule.core.embedding import (
     VECTOR_CHECKSUM_VERSION,
     VectorIntegrity,
+    VectorState,
     canonical_stored_vector,
     vector_checksum,
 )
@@ -913,6 +914,51 @@ async def test_a_reset_drops_this_workspace_s_collection_and_forgets_its_model(
     assert not await client.collection_exists(collection)
     assert await store.fingerprint() is None
     assert await store.count() == 0
+
+
+async def test_a_prepared_store_does_not_reread_its_record_on_every_document(
+    store: QdrantVectorStore, client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``stored_vectors`` and the deletes run once per document an ingest touches.
+
+    Each used to ask the server for the recorded fingerprint first — a meta collection check and
+    a retrieve — before the request that did the work. A prepared handle already holds the
+    fingerprint the record was checked against, so it asks only whether its collection exists.
+    """
+    await prepared(store)
+    await store.upsert([chunk("one")], [spread(4, 0)])
+    meta_reads: list[str] = []
+    real_retrieve = client.retrieve
+
+    async def counting(collection_name: str, *args: Any, **kwargs: Any) -> Any:
+        meta_reads.append(collection_name)
+        return await real_retrieve(collection_name, *args, **kwargs)
+
+    monkeypatch.setattr(client, "retrieve", counting)
+
+    verdicts = await store.stored_vectors([chunk("one")])
+    await store.delete_chunks(["missing-row"])
+    assert await store.count() == 1
+    await store.delete_document("no-such-document")
+
+    assert verdicts[chunk("one").id].state is not VectorState.ABSENT
+    assert meta_reads == [], "the recorded fingerprint was read again by a prepared handle"
+
+
+async def test_a_prepared_store_reads_a_dropped_collection_as_empty(
+    store: QdrantVectorStore, client: AsyncQdrantClient
+) -> None:
+    """Another process can drop the collection under a prepared handle; that reads as empty."""
+    await prepared(store)
+    await store.upsert([chunk("one")], [spread(4, 0)])
+    await client.delete_collection(
+        collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+    )
+
+    assert await store.count() == 0
+    assert (await store.stored_vectors([chunk("one")]))[chunk("one").id].state is (
+        VectorState.ABSENT
+    )
 
 
 async def test_a_reset_lets_the_next_ingest_arrive_from_a_different_model(

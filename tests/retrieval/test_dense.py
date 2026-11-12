@@ -19,6 +19,8 @@ from tests.retrieval.fakes import SCOPE, ListVectorStore, a_query, profiles
 from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from manicule.core.content import Chunk
@@ -271,6 +273,39 @@ def test_a_floor_above_the_cap_is_refused() -> None:
     """It would clamp the derived factor below its own floor and report the cap firing always."""
     with pytest.raises(ValueError, match="above overfetch_max"):
         DenseConfig(overfetch_min=30, overfetch_max=20)
+
+
+async def test_rows_below_the_floor_are_never_read_from_sqlite(
+    store: SqliteDocStore, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A weak query escalates to the widest fetch, so it is the one that must not pay for it.
+
+    The floor reads only a score that hydration never changes, so applying it first returns the
+    same survivors. What it saves is the authoritative chunk read for every row about to be
+    thrown away — on a deployment, up to 960 rows a round for a query the corpus answers badly.
+    """
+    excluded, live = await _corpus(store, engine)
+    vectors = ListVectorStore([*excluded, *live], scores=[0.9] * len(excluded) + [0.9, 0.05, 0.05])
+    stage = DenseStage(
+        embedder=HashEmbedder(),
+        vectors=vectors,
+        docstore=store,
+        profiles=profiles(candidates=3, final_top_k=3, min_score=0.5),
+    )
+    requested: list[str] = []
+    original = store.get_chunks
+
+    async def recording(chunk_ids: Sequence[str]) -> Sequence[Chunk]:
+        requested.extend(chunk_ids)
+        return await original(chunk_ids)
+
+    monkeypatch.setattr(store, "get_chunks", recording)
+
+    produced = await stage.run(a_query(), [])
+
+    assert [candidate.chunk.id for candidate in produced] == [live[0].id]
+    assert live[1].id not in requested
+    assert live[2].id not in requested
 
 
 async def test_a_store_with_no_live_count_changes_round_trips_and_not_results(

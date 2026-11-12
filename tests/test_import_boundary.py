@@ -11,6 +11,9 @@ already imported a good deal, and a check run in-process would be measuring the 
 
 from __future__ import annotations
 
+import ast
+import importlib
+import inspect
 import json
 import subprocess
 import sys
@@ -202,12 +205,19 @@ def _modules_added_by_importing(*packages: str) -> set[str]:
     interpreter arrives with things already loaded — coverage hooks, ``sitecustomize``,
     whatever the environment injects — and none of it is manicule's doing. Measuring the
     total would make this test a report on the runner rather than on the code.
+
+    **Every name in each package's ``__all__`` is resolved too.** Packages re-export lazily
+    (:mod:`manicule._lazy`), so importing one loads almost nothing until a name is used; a
+    boundary measured on the bare import would pass while checking nothing. What a plugin
+    author can reach through the package is what the boundary is about.
     """
     script = (
-        "import json, sys\n"
+        "import importlib, json, sys\n"
         "before = set(sys.modules)\n"
         f"for name in {list(packages)!r}:\n"
-        "    __import__(name)\n"
+        "    module = importlib.import_module(name)\n"
+        "    for exported in getattr(module, '__all__', ()):\n"
+        "        getattr(module, exported)\n"
         "print(json.dumps(sorted(set(sys.modules) - before)))\n"
     )
     completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -575,3 +585,51 @@ def test_the_installed_distribution_declares_no_implementation_dependency() -> N
         "tokenizers",
     }
     assert not names & forbidden, f"manicule requires {sorted(names & forbidden)}"
+
+
+LAZY_PACKAGES = ("manicule.core", "manicule.app", "manicule.ingest")
+"""Packages whose ``__init__`` re-exports through :func:`manicule._lazy.lazy_exports`."""
+
+
+def test_reading_the_version_does_not_import_the_core_vocabulary() -> None:
+    """``manicule --version`` and every plugin's compatibility check read one string.
+
+    Python runs a package before its submodule, so while ``manicule.core`` re-exported its whole
+    vocabulary eagerly, reading ``manicule.core.version`` imported acquisition, anchors,
+    content, embedding and protocols with it — about a hundred milliseconds for one string.
+    """
+    loaded = _modules_added_by_importing("manicule.core.version")
+    heavy = sorted(
+        name
+        for name in loaded
+        if name.startswith("manicule.")
+        and name not in {"manicule.core", "manicule._lazy"}
+        and name != "manicule.core.version"
+    )
+    assert heavy == [], f"reading the version imported {heavy}"
+
+
+def test_a_lazy_package_declares_each_name_once_and_every_one_resolves() -> None:
+    """The type-checking imports, the lazy table and ``__all__`` name the same things.
+
+    A lazy package lists its names twice — once as imports the checker reads, once as the table
+    that serves them at runtime — and two lists drift. This holds them to each other and to
+    ``__all__``, and resolves every name, so a name the table points at the wrong module fails
+    here rather than at a plugin author's first import.
+    """
+    for package in LAZY_PACKAGES:
+        module = importlib.import_module(package)
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+        checked = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "TYPE_CHECKING"
+            for statement in node.body
+            if isinstance(statement, ast.ImportFrom)
+            for alias in statement.names
+        }
+        exported = set(module.__all__)
+        assert checked == exported, f"{package}: {sorted(checked ^ exported)}"
+        for name in exported:
+            assert getattr(module, name) is not None, f"{package}.{name} did not resolve"

@@ -48,6 +48,8 @@ from tests.ingest import fakes
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 
+    from manicule.core.embedding import Vector
+
 STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
     "Run `uv sync --reinstall-package manicule` and try again."
@@ -1262,6 +1264,109 @@ async def test_query_telemetry_round_trips_through_the_real_store(runtime: Runti
     assert rows[0]["query"] == "retry policy"
     assert rows[0]["chunks"] == 2, "the chunk ids were stored but not counted back"
     assert rows[0]["confidence"] == 0.5
+
+
+async def test_recording_a_query_does_not_wait_for_the_database_writer(runtime: Runtime) -> None:
+    """A search must not sit behind a sync to write the row that describes it.
+
+    The insert used to run on the response path, outside the writer queue, so with another
+    writer holding SQLite it waited up to ``busy_timeout`` — five seconds added to a search
+    whose answer was already computed. Here another connection holds SQLite's write lock for
+    the whole call, the way a sync's transaction does.
+    """
+    telemetry = await runtime.telemetry()
+    engine = runtime.require_engine()
+    async with engine.connect() as holder:
+        await holder.exec_driver_sql("BEGIN IMMEDIATE")
+        await asyncio.wait_for(
+            telemetry.record_query(
+                "retry policy", profile="balanced", chunk_ids=["a"], confidence=None, elapsed_ms=3
+            ),
+            timeout=1.0,
+        )
+        await holder.rollback()
+    rows, total = await telemetry.query_logs(limit=10)
+    assert total == 1, "the queued row never landed once the writer let go"
+    assert rows[0]["query"] == "retry policy"
+
+
+async def test_a_page_of_query_logs_is_not_held_behind_a_stuck_write(runtime: Runtime) -> None:
+    """Reading telemetry waits briefly for this process's queued rows, and no longer.
+
+    A write queued behind another writer can wait as long as that writer holds SQLite. The
+    admin page asked for meanwhile answers with what is stored rather than waiting with it.
+    """
+    telemetry = await runtime.telemetry()
+    engine = runtime.require_engine()
+    async with engine.connect() as holder:
+        await holder.exec_driver_sql("BEGIN IMMEDIATE")
+        await telemetry.record_query(
+            "stuck", profile="balanced", chunk_ids=[], confidence=None, elapsed_ms=1
+        )
+        _, total = await asyncio.wait_for(telemetry.query_logs(limit=10), timeout=3.0)
+        assert total == 0, "the page waited for a write that could not land"
+        await holder.rollback()
+    await telemetry.settle()
+    assert (await telemetry.query_logs(limit=10))[1] == 1
+
+
+async def test_a_failed_query_log_write_does_not_log_the_query(
+    runtime: Runtime, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The insert's own error message carries its bound parameters, the query text among them."""
+    telemetry = await runtime.telemetry()
+    engine = runtime.require_engine()
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("DROP TABLE query_logs")
+    with caplog.at_level("WARNING"):
+        await telemetry.record_query(
+            "a confidential question",
+            profile="balanced",
+            chunk_ids=[],
+            confidence=None,
+            elapsed_ms=1,
+        )
+        await telemetry.settle()
+    assert "could not record query telemetry" in caplog.text
+    assert "confidential" not in caplog.text
+
+
+async def test_a_queued_query_row_lands_before_the_runtime_closes(
+    manicule_environment: Path,
+) -> None:
+    """Closing the runtime settles queued writes before disposing the engine they use."""
+    async with Runtime.open(data_dir=manicule_environment / "data") as first:
+        await (await first.telemetry()).record_query(
+            "retry policy", profile="balanced", chunk_ids=[], confidence=None, elapsed_ms=1
+        )
+    async with Runtime.open(data_dir=manicule_environment / "data") as reopened:
+        assert (await (await reopened.telemetry()).query_logs())[1] == 1
+
+
+async def test_warming_builds_retrieval_and_embeds_without_searching(
+    runtime: Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What ``serve`` runs before its first request, so that request does not pay for it.
+
+    The model is loaded and one query embedding is computed, through the prefix a search uses;
+    nothing is searched, so no ``query_logs`` row is written and no ranking is cached for the
+    first real search to hit.
+    """
+    embedder = await runtime.embedder()
+    embedded: list[str] = []
+    real = embedder.embed
+
+    async def recording(texts: Sequence[str]) -> list[Vector]:
+        embedded.extend(texts)
+        return await real(texts)
+
+    monkeypatch.setattr(embedder, "embed", recording)
+
+    await runtime.warm()
+
+    assert embedded == [embedder.fingerprint.prefix_scheme.query("warm-up")]
+    assert "retriever" in runtime._slots, "warming did not build retrieval"  # pyright: ignore[reportPrivateUsage]
+    assert (await (await runtime.telemetry()).query_logs())[1] == 0
 
 
 async def test_the_audit_trail_round_trips_and_filters(runtime: Runtime) -> None:

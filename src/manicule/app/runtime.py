@@ -15,6 +15,7 @@ implementation of it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -135,6 +136,16 @@ if TYPE_CHECKING:
     from manicule.storage.vectors import LanceVectorStore, PublishedLanceVectorStore
 
 _LOG = logging.getLogger(__name__)
+
+_QUERY_LOG_BACKLOG: Final = 256
+"""How many ``query_logs`` writes may be in flight before the next search waits for its own.
+
+Generous enough that a writer holding SQLite for a few seconds costs searches nothing, and
+bounded so that a writer that never lets go turns into slow searches rather than into memory
+growing one task per query."""
+
+_QUERY_LOG_READ_WAIT_S: Final = 1.0
+"""How long a read of ``query_logs`` waits for this process's queued writes to land."""
 
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
@@ -375,6 +386,10 @@ class Runtime:
         try:
             if self._stragglers is not None:
                 await self._stragglers.wait()
+            # Queued query-log writes go through the engine, so they land before it is disposed.
+            telemetry = self._slots.get("telemetry")
+            if telemetry is not None and isinstance(telemetry.value, _Telemetry):
+                await telemetry.value.settle()
             close_error: Exception | None = None
             try:
                 # First, while the engine they read their publication pointers through is open.
@@ -608,6 +623,20 @@ class Runtime:
         """The configured embedder, exposed for index-maintenance orchestration."""
         return await self._container.aget(keys.EMBEDDER)
 
+    async def warm(self) -> None:
+        """Pay for what the first search would otherwise pay for, before anyone is waiting.
+
+        Building retrieval loads the model — weights on an in-process backend, the served-model
+        probe on Ollama — and the first forward pass compiles what the backend compiles. Both
+        are seconds, and both used to land inside the first query's ``elapsed_ms``. One query
+        embedding runs here, through the same prefix a search uses; nothing is searched,
+        nothing is logged to ``query_logs`` and no ranking is cached, so the first real search
+        reads the corpus exactly as it would have.
+        """
+        await self.retriever()
+        embedder = await self.embedder()
+        await embedder.embed([embedder.fingerprint.prefix_scheme.query("warm-up")])
+
     async def prepared_vectors(self) -> VectorStore:
         """The vector store, committed to the configured embedder's space.
 
@@ -819,14 +848,14 @@ class Runtime:
 
         A writer is already holding the lock from :meth:`__aenter__` and simply proceeds.
         """
-        from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic is not cheap
-
         ensure = getattr(store, "ensure_workspace", None)
         if self._writer:
             if not self._migrated:
                 # Before the first read, always. A query against an un-migrated database fails
                 # in whatever way SQLite happens to fail, at whichever statement happens to run
                 # first.
+                from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic
+
                 await upgrade(engine)
                 self._migrated = True
             if ensure is not None:
@@ -855,6 +884,10 @@ class Runtime:
             return
         if not self._migrated:
             if await self._storage_needs_initializing(engine):
+                # Imported only here, where it migrates: a reader that finds the schema current
+                # never pays for Alembic.
+                from manicule.storage.migrator import upgrade  # noqa: PLC0415 - Alembic
+
                 with InstanceLock(self._settings.data_dir):
                     await upgrade(engine)
             self._migrated = True
@@ -900,11 +933,13 @@ class Runtime:
         a reader for no gain, which is the failure mode this whole classification exists to
         avoid.
         """
-        from manicule.storage.migrator import current_revision, head_revision  # noqa: PLC0415
+        # Not `manicule.storage.migrator`: that imports Alembic and reads every migration script
+        # to name the head, which a reader that finds the schema current never needed.
+        from manicule.storage.revision import HEAD_REVISION, current_revision  # noqa: PLC0415
 
         async with engine.connect() as connection:
             at = await connection.run_sync(current_revision)
-        return at != head_revision()
+        return at != HEAD_REVISION
 
     async def _build_vectors(self) -> VectorStore:
         """Wrap the embedded store in the handle that follows SQLite's publication pointer.
@@ -3724,6 +3759,7 @@ class _Telemetry:
 
     def __init__(self, runtime: Runtime) -> None:
         self._runtime = runtime
+        self._pending: set[asyncio.Task[None]] = set()
 
     async def record_query(
         self,
@@ -3734,24 +3770,78 @@ class _Telemetry:
         confidence: float | None,
         elapsed_ms: int,
     ) -> str:
-        from manicule.storage import models  # noqa: PLC0415
-        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        """Queue one ``query_logs`` row and return its id without waiting for the write.
 
+        The row is written by a background task, behind the engine's one writer queue, because
+        the alternative put a SQLite write on every search's response path: with a sync or a
+        maintenance writer holding the database, the insert sat in SQLite's busy handler for up
+        to ``busy_timeout`` while the caller waited for an answer that was already computed.
+        The id is chosen here, but the row it names exists only once :meth:`settle` has run:
+        a caller about to store the id somewhere that references ``query_logs`` — a message's
+        ``query_log_id`` is a foreign key — settles first. :meth:`query_logs` settles, bounded,
+        and the runtime's close settles fully. Past :data:`_QUERY_LOG_BACKLOG` writes in
+        flight, the next one is awaited instead — backpressure rather than an unbounded pile of
+        tasks behind a stalled writer.
+        """
         identifier = secrets.token_hex(8)
-        sessions = session_factory(self._runtime.require_engine())
-        async with sessions.begin() as session:
-            session.add(
-                models.QueryLog(
-                    id=identifier,
-                    workspace_id=self._runtime.workspace,
-                    query=query,
-                    profile=profile,
-                    retrieved_chunk_ids=list(chunk_ids),
-                    confidence_score=confidence,
-                    response_time_ms=elapsed_ms,
-                )
-            )
+        write = self._write_query(
+            identifier,
+            query=query,
+            profile=profile,
+            chunk_ids=list(chunk_ids),
+            confidence=confidence,
+            elapsed_ms=elapsed_ms,
+        )
+        if len(self._pending) >= _QUERY_LOG_BACKLOG:
+            await write
+            return identifier
+        task = asyncio.create_task(write, name="manicule-query-log")
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
         return identifier
+
+    async def _write_query(
+        self,
+        identifier: str,
+        *,
+        query: str,
+        profile: str,
+        chunk_ids: list[str],
+        confidence: float | None,
+        elapsed_ms: int,
+    ) -> None:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory, writer_slot  # noqa: PLC0415
+
+        try:
+            engine = self._runtime.require_engine()
+            async with writer_slot(engine, "query_log"), session_factory(engine).begin() as s:
+                s.add(
+                    models.QueryLog(
+                        id=identifier,
+                        workspace_id=self._runtime.workspace,
+                        query=query,
+                        profile=profile,
+                        retrieved_chunk_ids=chunk_ids,
+                        confidence_score=confidence,
+                        response_time_ms=elapsed_ms,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - telemetry never fails the read it describes
+            # Nobody awaits this task, so an exception left to escape would surface only as
+            # asyncio's "never retrieved" noise. The type alone, never the message: an insert
+            # failure from SQLAlchemy renders its bound parameters, and one of them is the query
+            # text — user content, which `security.storage.redact_logs_content` keeps out of logs.
+            _LOG.warning("could not record query telemetry: %s", type(exc).__name__)
+
+    async def settle(self) -> None:
+        """Wait for every queued ``query_logs`` write, including any queued while waiting.
+
+        Waiting here never cancels a write: a caller that bounds this with ``asyncio.timeout``
+        stops waiting, and the write still lands.
+        """
+        while self._pending:
+            await asyncio.wait(set(self._pending))
 
     async def query_logs(
         self, *, limit: int = 50, offset: int = 0
@@ -3761,6 +3851,11 @@ class _Telemetry:
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
 
+        # Read-your-writes within the process, bounded: a page asked for after a search includes
+        # it, unless the write is stuck behind another writer, when the page is not held for it.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_QUERY_LOG_READ_WAIT_S):
+                await self.settle()
         sessions = session_factory(self._runtime.require_engine())
         scope = models.QueryLog.workspace_id == self._runtime.workspace
         async with sessions() as session:

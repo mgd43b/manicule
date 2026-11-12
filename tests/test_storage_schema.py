@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import select, text
@@ -23,6 +23,7 @@ from manicule.storage.types import UtcDateTime, utcnow
 from tests.storage_helpers import make_document
 
 if TYPE_CHECKING:
+    from sqlalchemy import Connection, Row
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 EXPECTED_TABLES = frozenset(models.Base.metadata.tables)
@@ -47,6 +48,45 @@ async def test_the_migration_creates_every_table_the_models_declare(engine: Asyn
 async def test_a_migrated_database_is_at_head(engine: AsyncEngine) -> None:
     """A database behind head is one the code will query with columns that do not exist."""
     assert await current(engine) == head_revision()
+
+
+async def test_every_foreign_key_leads_an_index_on_its_child_table(engine: AsyncEngine) -> None:
+    """Deleting a parent row must not scan a child table to enforce the constraint.
+
+    SQLite checks a foreign key on a parent ``DELETE`` by searching the child table for the key,
+    and only an index whose leftmost column is one of the child columns spares it a full scan.
+    ``foreign_keys=ON`` makes that search run on every deletion, so a missing index turns each
+    deleted document, blob or tag into a scan of a table that grows with the corpus. Asked of the
+    migrated database, not the models, because that is what SQLite plans against.
+    """
+
+    def unindexed(sync: Connection) -> list[str]:
+        def rows(statement: str) -> list[Row[Any]]:
+            return list(sync.exec_driver_sql(statement).fetchall())
+
+        found: list[str] = []
+        for (table,) in rows(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE 'CREATE VIRTUAL%'"
+        ):
+            keys: dict[int, set[str]] = {}
+            for key in rows(f"PRAGMA foreign_key_list('{table}')"):
+                keys.setdefault(key.id, set()).add(key[3])  # the child column, named `from`
+            leading = {
+                rows(f"PRAGMA index_info('{index.name}')")[0].name
+                for index in rows(f"PRAGMA index_list('{table}')")
+            }
+            primary = [column for column in rows(f"PRAGMA table_info('{table}')") if column.pk]
+            leading.update(column.name for column in primary if column.pk == 1)
+            found.extend(
+                f"{table}({', '.join(sorted(columns))})"
+                for columns in keys.values()
+                if not columns & leading
+            )
+        return found
+
+    async with engine.connect() as connection:
+        assert await connection.run_sync(unindexed) == []
 
 
 async def test_snapshot_reuse_queries_use_bounded_composite_indexes(engine: AsyncEngine) -> None:
@@ -93,7 +133,13 @@ async def test_foreign_keys_are_enforced_on_every_pooled_connection(engine: Asyn
 
 async def test_every_declared_pragma_is_actually_applied(engine: AsyncEngine) -> None:
     """A pragma that silently failed to apply looks exactly like one that worked."""
-    expected = {"journal_mode": "wal", "foreign_keys": 1, "busy_timeout": 5000}
+    expected = {
+        "journal_mode": "wal",
+        "foreign_keys": 1,
+        "busy_timeout": 5000,
+        "mmap_size": 268435456,
+        "temp_store": 2,
+    }
     async with engine.connect() as connection:
         for name, want in expected.items():
             got = (await connection.execute(text(f"PRAGMA {name}"))).scalar()

@@ -20,6 +20,9 @@ class boundary: the platform gets the forward pass, and cannot reach the output.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import heapq
+import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +46,68 @@ from manicule.embedding.pooling import pool_token_states, require_token_states
 
 if TYPE_CHECKING:
     from manicule.embedding.runtimes.tokenization import FastTokenizer
+
+
+class _Lanes:
+    """Who goes next on a worker that runs one thing at a time.
+
+    A thread pool of one is first in, first out, so a search that arrived during an ingest
+    waited behind every forward pass the ingest had already submitted — up to a full batch of
+    chunks at the chunk budget, which on an accelerator is seconds. Here only one call is ever
+    handed to the executor at a time, and the waiting ones are ordered: an urgent call goes
+    ahead of every bulk one that has not started yet, and calls of one kind keep their order.
+    It still waits for the pass already running, and nothing about any pass's inputs changes —
+    a query is its own batch either way, so which vectors come out is unaffected.
+    """
+
+    URGENT = 0
+    BULK = 1
+
+    def __init__(self) -> None:
+        self._waiting: list[tuple[int, int, asyncio.Future[None]]] = []
+        self._order = itertools.count()
+        self._busy = False
+
+    async def run[T](self, executor: ThreadPoolExecutor, work: Callable[[], T], lane: int) -> T:
+        if self._busy:
+            turn: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            heapq.heappush(self._waiting, (lane, next(self._order), turn))
+            try:
+                await turn
+            except asyncio.CancelledError:
+                # Handed the worker in the same moment it was canceled: pass it on, or it
+                # stays held by a caller that will never use it.
+                if turn.done() and not turn.cancelled():
+                    self._release()
+                raise
+        else:
+            self._busy = True
+        loop = asyncio.get_running_loop()
+        submitted = executor.submit(work)
+        try:
+            return await asyncio.wrap_future(submitted, loop=loop)
+        finally:
+            if submitted.done():
+                self._release()
+            else:
+                # Canceled while the thread is still running it. The worker is not free until the
+                # thread is, and handing the turn on now would queue the next call inside the
+                # executor's own first-in-first-out queue, where no lane order applies.
+                submitted.add_done_callback(lambda _: self._release_from_thread(loop))
+
+    def _release_from_thread(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Release from the executor's thread, onto the loop that owns the waiters."""
+        # A loop that has closed has no waiters left to hand the worker to.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(self._release)
+
+    def _release(self) -> None:
+        while self._waiting:
+            _, _, turn = heapq.heappop(self._waiting)
+            if not turn.done():
+                turn.set_result(None)
+                return
+        self._busy = False
 
 
 class PooledEmbedder(Lifecycle, ABC):
@@ -87,6 +152,7 @@ class PooledEmbedder(Lifecycle, ABC):
         self._worker = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"manicule-embed-{backend}"
         )
+        self._lanes = _Lanes()
         self._closed = False
 
     # --- what a backend supplies ---------------------------------------------------------
@@ -271,12 +337,21 @@ class PooledEmbedder(Lifecycle, ABC):
         batch of token states however long the input list is.
         """
         vectors: list[Vector] = []
+        # A single text is what a search embeds, so it takes the urgent lane and runs at the next
+        # pass boundary rather than behind an ingest's queued batches. A one-chunk document gets
+        # the same treatment, which costs nothing: it is no larger than a query.
+        lane = _Lanes.URGENT if len(texts) == 1 else _Lanes.BULK
         for start in range(0, len(texts), self._batch_size):
             batch = texts[start : start + self._batch_size]
-            ids, mask = self._tokenize(batch)
-            states = await self._run(ids, mask)
+            # Tokenizing and pooling are CPU work with no thread affinity, unlike the forward
+            # pass, so they run on a pool thread instead of the event loop: an ingest's batches
+            # no longer stall the requests the same process is serving. The same functions on
+            # the same inputs, so the same vectors.
+            ids, mask = await asyncio.to_thread(self._tokenize, batch)
+            states = await self._run(ids, mask, lane=lane)
             vectors.extend(
-                pool_token_states(
+                await asyncio.to_thread(
+                    pool_token_states,
                     TokenStates(
                         states=states, attention_mask=mask, dimension=self.fingerprint.dimension
                     ),
@@ -288,18 +363,21 @@ class PooledEmbedder(Lifecycle, ABC):
         self._embedded += len(texts)
         return vectors
 
-    async def _on_worker[T](self, work: Callable[[], T]) -> T:
+    async def _on_worker[T](self, work: Callable[[], T], *, lane: int = _Lanes.BULK) -> T:
         """Run ``work`` on this embedder's one thread, off the event loop.
 
         The runtimes are synchronous and compute-bound, and an ingest run embeds while an HTTP
         request is in flight; a thread is the difference between a slow index and a frozen one.
-        That it is always the *same* thread is not a detail — see the constructor.
+        That it is always the *same* thread is not a detail — see the constructor. Which call
+        runs next is :class:`_Lanes`' decision.
         """
-        return await asyncio.get_running_loop().run_in_executor(self._worker, work)
+        return await self._lanes.run(self._worker, work, lane)
 
-    async def _run(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+    async def _run(
+        self, input_ids: np.ndarray, attention_mask: np.ndarray, *, lane: int = _Lanes.BULK
+    ) -> np.ndarray:
         """A forward pass, on the worker thread."""
-        return await self._on_worker(lambda: self._forward(input_ids, attention_mask))
+        return await self._on_worker(lambda: self._forward(input_ids, attention_mask), lane=lane)
 
     def _tokenize(self, texts: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
         """Token ids and attention mask, refusing anything the model would truncate.

@@ -276,6 +276,7 @@ class AuthSession(Base):
     __table_args__ = (
         Index("ix_auth_sessions_workspace_id", "workspace_id"),
         Index("ix_auth_sessions_user_id", "user_id"),
+        Index("ix_auth_sessions_key_id", "key_id"),
     )
 
 
@@ -709,6 +710,8 @@ class AcquisitionRecord(Base):
         UniqueConstraint("run_id", "sequence"),
         Index("ix_acquisition_records_run_state_sequence", "run_id", "state", "sequence"),
         Index("ix_acquisition_records_run_blob_state", "run_id", "blob_ref", "state"),
+        # Leftmost, so deleting a blob checks its RESTRICT without scanning the journal.
+        Index("ix_acquisition_records_blob_ref", "blob_ref"),
         Index("ix_acquisition_records_marker_name", "marker_name", unique=True),
         Index(
             "ix_acquisition_records_run_source_version",
@@ -874,6 +877,8 @@ class ReconciliationCandidate(Base):
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(["document_id"], ["documents.id"], ondelete="CASCADE"),
+        # Leftmost, so deleting a document finds its candidates without a table scan.
+        Index("ix_reconciliation_candidates_document_id", "document_id"),
         WITHOUT_ROWID,
     )
 
@@ -1061,6 +1066,8 @@ class SourceDependency(Base):
 
     __table_args__ = (
         Index("ix_source_dependencies_target", "workspace_id", "source", "target_source_id"),
+        # Leftmost, so deleting a document finds its dependency rows without a table scan.
+        Index("ix_source_dependencies_parent_document_id", "parent_document_id"),
         WITHOUT_ROWID,
     )
 
@@ -1204,7 +1211,11 @@ class CollectionDocument(Base):
         ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
     )
 
-    __table_args__ = (WITHOUT_ROWID,)
+    __table_args__ = (
+        # Leftmost, so deleting a document finds its memberships without a table scan.
+        Index("ix_collection_documents_document_id", "document_id"),
+        WITHOUT_ROWID,
+    )
 
 
 class GlossaryEntry(Base):
@@ -1299,7 +1310,7 @@ class DocumentTag(Base):
     )
     tag_id: Mapped[str] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True)
 
-    __table_args__ = (WITHOUT_ROWID,)
+    __table_args__ = (Index("ix_document_tags_tag_id", "tag_id"), WITHOUT_ROWID)
 
 
 # --- conversations -----------------------------------------------------------------------
@@ -1350,6 +1361,8 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow
     )
+
+    __table_args__ = (Index("ix_conversations_workspace_id", "workspace_id"),)
 
 
 class Message(Base):
@@ -1425,6 +1438,7 @@ class Message(Base):
             name="feedback_reason_is_known",
         ),
         Index("ix_messages_conversation_id_created_at", "conversation_id", "created_at"),
+        Index("ix_messages_query_log_id", "query_log_id"),
         Index(
             "ix_messages_feedback",
             "feedback",
@@ -1862,6 +1876,7 @@ class DerivedGeneration(Base):
             name="uq_derived_generation_plan",
         ),
         Index("ix_derived_generations_workspace_state", "workspace_id", "state"),
+        Index("ix_derived_generations_snapshot_run_id", "snapshot_run_id"),
         Index(
             "uq_derived_generations_workspace_fence",
             "workspace_id",
@@ -1920,6 +1935,7 @@ class DerivedGenerationSnapshot(Base):
 
     __table_args__ = (
         UniqueConstraint("generation_id", "run_id", name="uq_generation_snapshot_run"),
+        Index("ix_derived_generation_snapshots_run_id", "run_id"),
         CheckConstraint(
             "ordinal >= 0 AND expected_item_count >= 0 "
             "AND contributed_item_count >= 0 "
@@ -1953,6 +1969,12 @@ class DerivedGenerationItem(Base):
             "generation_id",
             "document_id",
             unique=True,
+        ),
+        # Covers the capacity sum, which would otherwise walk every staged payload per batch.
+        Index(
+            "ix_derived_generation_items_generation_temporary_bytes",
+            "generation_id",
+            "temporary_bytes",
         ),
         CheckConstraint(
             "sequence >= 0 AND temporary_bytes >= 0",

@@ -772,7 +772,21 @@ class Telemetry(Protocol):
         confidence: float | None,
         elapsed_ms: int,
     ) -> str:
-        """Record one retrieval and return the row's id."""
+        """Record one retrieval and return the row's id.
+
+        An implementation may queue the write rather than wait for it — the built-in one does,
+        so that a search never waits on the database writer to describe itself. Until
+        :meth:`settle` returns, the id may name a row that does not exist yet.
+        """
+        ...
+
+    async def settle(self) -> None:
+        """Wait until every query recorded so far is stored.
+
+        What a caller does before storing a returned id where a foreign key will check it. An
+        implementation that writes synchronously has nothing to wait for and returns at once.
+        Bound it with ``asyncio.timeout`` where waiting is optional.
+        """
         ...
 
     async def query_logs(

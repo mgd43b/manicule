@@ -284,6 +284,18 @@ async def _serve(
             host=address.host,
             port=address.port,
         )
+        # Beside the transport rather than ahead of it, so the address is listening at once and a
+        # request that arrives first simply builds what this is building, under the same lock.
+        #
+        # Not over stdio. A stdio server is started by its client, often one per conversation,
+        # and many of those only list or read; loading gigabytes of weights for each one would
+        # spend on every session what only a searching session needs. A network server is
+        # long-lived and shared, so paying once at start is the cheaper place.
+        warming = (
+            asyncio.create_task(_warm(runtime), name="manicule-warm")
+            if transport != "stdio"
+            else None
+        )
         # The control socket and the scheduler are what make this process *the writer* rather
         # than a process that happens to serve a protocol. They are started after the lock is
         # held and after the address is announced, and closed on every path out — including the
@@ -323,8 +335,25 @@ async def _serve(
             _report(failed("start", service.workspace, error_info(exc)), json_output)
             return EX_CONFIG
         finally:
+            if warming is not None:
+                warming.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await warming
             pid.unlink(missing_ok=True)
     return 0
+
+
+async def _warm(runtime: Runtime) -> None:
+    """Load retrieval and the model while the server waits for its first request.
+
+    A failure is said and not raised. It is the same failure the first search would meet, and
+    that search will report it properly; a server that refused to start because its model is
+    still downloading would turn a slow first answer into no answers at all.
+    """
+    try:
+        await runtime.warm()
+    except Exception as exc:  # noqa: BLE001 - reported, and the first search reports it again
+        announce(f"retrieval could not be warmed ahead of the first search: {exc}")
 
 
 async def _serve_a_protocol(

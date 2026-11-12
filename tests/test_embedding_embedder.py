@@ -8,6 +8,10 @@ machine that has never downloaded anything.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +23,7 @@ from manicule.core.errors import ContextOverflowError, TokenStateError
 from manicule.core.fingerprints import ChunkFingerprint
 from manicule.core.lifecycle import HealthState
 from manicule.core.protocols import Embedder, TokenStateEmbedder
+from manicule.embedding.base import _Lanes  # pyright: ignore[reportPrivateUsage] - scheduler unit
 from manicule.embedding.cards import ModelCard, read_card
 from manicule.ingest.embedding import embed_chunks as embed_chunk_batch
 from manicule.testing import (
@@ -365,3 +370,118 @@ async def test_metrics_expose_the_cache(embedder: StubEmbedder) -> None:
     assert published["embedding_cache_hits"] == 1
     assert published["embedding_cache_misses"] == 1
     assert published["embedding_texts_embedded"] == 1
+
+
+async def test_a_query_runs_ahead_of_queued_ingest_passes() -> None:
+    """A search during an ingest waits for the pass that is running, and for nothing after it.
+
+    The worker is a pool of one, which on its own is first in, first out: a query submitted
+    behind three queued ingest batches used to wait for all three. Bulk calls keep their order
+    among themselves; only what has not started yet is overtaken.
+    """
+    lanes = _Lanes()
+    worker = ThreadPoolExecutor(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    ran: list[str] = []
+
+    def blocking() -> None:
+        started.set()
+        release.wait(5)
+        ran.append("running")
+
+    def job(name: str) -> Callable[[], None]:
+        return lambda: ran.append(name)
+
+    try:
+        first = asyncio.create_task(lanes.run(worker, blocking, _Lanes.BULK))
+        await asyncio.to_thread(started.wait, 5)
+        queued = [
+            asyncio.create_task(lanes.run(worker, job("bulk-1"), _Lanes.BULK)),
+            asyncio.create_task(lanes.run(worker, job("bulk-2"), _Lanes.BULK)),
+        ]
+        await asyncio.sleep(0)
+        query = asyncio.create_task(lanes.run(worker, job("query"), _Lanes.URGENT))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, *queued, query)
+    finally:
+        worker.shutdown(wait=True)
+
+    assert ran == ["running", "query", "bulk-1", "bulk-2"]
+
+
+async def test_a_canceled_waiter_does_not_keep_the_worker() -> None:
+    """A caller canceled while queued gives up its turn rather than holding it forever."""
+    lanes = _Lanes()
+    worker = ThreadPoolExecutor(max_workers=1)
+    release = threading.Event()
+    try:
+        running = asyncio.create_task(lanes.run(worker, lambda: release.wait(5), _Lanes.BULK))
+        await asyncio.sleep(0)
+        abandoned = asyncio.create_task(lanes.run(worker, lambda: "never", _Lanes.URGENT))
+        await asyncio.sleep(0)
+        abandoned.cancel()
+        release.set()
+        await running
+        assert await asyncio.wait_for(lanes.run(worker, lambda: "next", _Lanes.BULK), 5) == "next"
+    finally:
+        worker.shutdown(wait=True)
+    assert abandoned.cancelled()
+
+
+async def test_a_single_text_takes_the_urgent_lane_and_a_batch_the_bulk_one(
+    embedder: StubEmbedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What decides the lane: a search embeds one text, an ingest embeds a document's chunks."""
+    await embedder.setup()
+    lanes: list[int] = []
+    real = embedder._lanes.run  # pyright: ignore[reportPrivateUsage] - the seam under test
+
+    async def recording(
+        executor: ThreadPoolExecutor, work: Callable[[], object], lane: int
+    ) -> object:
+        lanes.append(lane)
+        return await real(executor, work, lane)
+
+    monkeypatch.setattr(embedder._lanes, "run", recording)  # pyright: ignore[reportPrivateUsage]
+    try:
+        await embedder.embed(["what is the retry policy"])
+        await embedder.embed(["gamma delta epsilon", "zeta eta theta"])
+        assert lanes == [_Lanes.URGENT, _Lanes.BULK]
+    finally:
+        await embedder.teardown()
+
+
+async def test_a_canceled_pass_keeps_the_worker_until_its_thread_is_done() -> None:
+    """Canceling a caller cannot stop the thread running its pass, so the worker is not free.
+
+    Handing the turn on at once queued the next call inside the executor's own first-in,
+    first-out queue, where a query arriving next would wait behind a queued ingest batch again.
+    """
+    lanes = _Lanes()
+    worker = ThreadPoolExecutor(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    ran: list[str] = []
+
+    def blocking() -> None:
+        started.set()
+        release.wait(5)
+        ran.append("canceled pass")
+
+    try:
+        running = asyncio.create_task(lanes.run(worker, blocking, _Lanes.BULK))
+        await asyncio.to_thread(started.wait, 5)
+        running.cancel()
+        await asyncio.sleep(0)
+        bulk = asyncio.create_task(lanes.run(worker, lambda: ran.append("bulk"), _Lanes.BULK))
+        await asyncio.sleep(0)
+        query = asyncio.create_task(lanes.run(worker, lambda: ran.append("query"), _Lanes.URGENT))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(bulk, query), 5)
+    finally:
+        worker.shutdown(wait=True)
+    assert running.cancelled()
+    assert ran == ["canceled pass", "query", "bulk"]

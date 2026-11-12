@@ -30,7 +30,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import json
 import re
+import subprocess
+import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -317,6 +320,28 @@ def test_the_console_script_is_guarded(pyproject: dict[str, Any]) -> None:
         f"manicule/entry.py imports {sorted(imported)} at module scope. Anything beyond the "
         "standard library defeats the guard: the import fails before it can be reported."
     )
+
+
+def test_the_version_is_answered_without_importing_the_command_line() -> None:
+    """``manicule --version`` prints the installed version and imports nothing else of ours.
+
+    It is what scripts and package managers run, and importing the whole command line to print
+    one line of distribution metadata cost about half a second.
+    """
+    script = (
+        "import json, sys\n"
+        "sys.argv = ['manicule', '--version']\n"
+        "from manicule.entry import main\n"
+        "main()\n"
+        "sys.stderr.write(json.dumps(sorted(m for m in sys.modules if m.startswith('manicule'))))\n"
+    )
+    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-I", "-c", script], capture_output=True, text=True, check=True
+    )
+    assert completed.stdout == f"{CORE_VERSION}\n"
+    loaded = set(json.loads(completed.stderr))
+    assert "manicule.cli" not in loaded, "the command line was imported to print a version"
+    assert "manicule.core.acquisition" not in loaded
 
 
 def test_every_package_depends_on_a_manicule_that_exists() -> None:

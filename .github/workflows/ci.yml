@@ -949,14 +949,18 @@ jobs:
 
       # A bare install, which is what `pip install manicule` gives. The console script must
       # print an install hint and exit 1 — not raise. `manicule.entry` exists for this and
-      # nothing else.
+      # nothing else. `--help` is the probe because it needs the command line; `--version` is
+      # answered before the command line is imported, so a bare install prints its version, and
+      # that is asserted too.
       - name: a bare install explains itself instead of raising
         run: |
           set -euo pipefail
           uv venv --python 3.14 /tmp/bare
           uv pip install --python /tmp/bare/bin/python dist/*.whl
+          version=$(/tmp/bare/bin/manicule --version)
+          test -n "${version}" || { echo "--version printed nothing on a bare install" >&2; exit 1; }
           set +e
-          output=$(/tmp/bare/bin/manicule --version 2>&1)
+          output=$(/tmp/bare/bin/manicule --help 2>&1)
           status=$?
           set -e
           echo "${output}"
@@ -1000,6 +1004,7 @@ jobs:
             --find-links dist-ollama \
             "$(echo dist/*.whl)[all]" "$(echo dist-mlx/*.whl)"
           /tmp/pair/bin/manicule --version
+          /tmp/pair/bin/manicule --help > /dev/null
           /tmp/pair/bin/python - <<'PY'
           from importlib.metadata import entry_points
           names = sorted(e.name for e in entry_points(group="manicule.plugins"))

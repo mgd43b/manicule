@@ -231,6 +231,25 @@ async def select(
     )
 
 
+async def _cursor_after(
+    store: IngestStore, page: Sequence[Document], previous: SelectionCursor | None
+) -> SelectionCursor | None:
+    """The position to resume after ``page`` from, read before any of it is touched.
+
+    A keyset rather than a count, so a page costs the same at the end of a large selection as at
+    the start: ``OFFSET`` makes SQLite step over every row in front of the page, which turns a
+    sweep over a corpus into a quadratic one. Read before the page is processed because a
+    repair can replace a row and a position can only be read from a row that exists. The last
+    document that still has one is the cursor; a page whose every row vanished since it was read
+    keeps ``previous``, and the next query no longer returns them.
+    """
+    for document in reversed(page):
+        position = await store.selection_cursor(document.id)
+        if position is not None:
+            return position
+    return previous
+
+
 async def re_embed(
     documents: Sequence[Document],
     *,
@@ -824,11 +843,7 @@ async def re_parse_stale(
         # and a position can only be read from a row that exists. The last document that still
         # has one is the cursor; a page whose every row vanished since it was read keeps the old
         # cursor, and the next query no longer returns them.
-        for document in reversed(page):
-            position = await store.selection_cursor(document.id)
-            if position is not None:
-                cursor = position
-                break
+        cursor = await _cursor_after(store, page, cursor)
         for document in page:
             sweep.selected += 1
             # Read again, because the selection is a snapshot and a container earlier in this
@@ -950,10 +965,12 @@ async def plan_re_embed(*, store: IngestStore, batch: int = DEFAULT_SWEEP_BATCH)
         documents that have no bytes to re-parse.
     """
     sweep = ReembedSweep(dry_run=True)
+    cursor: SelectionCursor | None = None
     while True:
-        page = await select(store, statuses=RE_EMBEDDABLE, limit=batch, offset=sweep.selected)
+        page = await select(store, statuses=RE_EMBEDDABLE, limit=batch, after=cursor)
         if not page:
             return sweep
+        cursor = await _cursor_after(store, page, cursor)
         for document in page:
             sweep.selected += 1
             if document.original_ref is None:
@@ -1001,9 +1018,9 @@ async def re_embed_all(
     wholly in the current space. That extra work is not in the plan, which prices stored rows.
 
     **A document is the unit and the selection does not shrink**, since a re-embedded document
-    is still indexed — so the cursor is the count seen. Stopping is safe at a document boundary.
-    Resuming is running it again from the start, because nothing recorded tells a document this
-    reached from one it did not: that is the premise it exists for.
+    is still indexed — so the cursor is the last position seen. Stopping is safe at a document
+    boundary. Resuming is running it again from the start, because nothing recorded tells a
+    document this reached from one it did not: that is the premise it exists for.
 
     Args:
         store: Where the selection is queried.
@@ -1016,13 +1033,15 @@ async def re_embed_all(
         The counts, and one line per document that could not be re-embedded.
     """
     sweep = ReembedSweep()
+    cursor: SelectionCursor | None = None
     while True:
-        page = await select(store, statuses=RE_EMBEDDABLE, limit=batch, offset=sweep.selected)
+        page = await select(store, statuses=RE_EMBEDDABLE, limit=batch, after=cursor)
         if not page:
             # Chunks the model was given, failures included: a document that failed at the
             # store had already been embedded, and the price is what was spent.
             sweep.chunks = sweep.embedding.embedded
             return sweep
+        cursor = await _cursor_after(store, page, cursor)
         for document in page:
             sweep.selected += 1
             own, inside = await _re_parse_judged(
@@ -1354,14 +1373,12 @@ async def plan_stale_glossary(
     """
     _require_detection(fingerprint)
     sweep = GlossarySweep(dry_run=True)
+    cursor: SelectionCursor | None = None
     while True:
-        # The offset is the count, exactly: a plan writes nothing, so every document it has seen
-        # is still in the selection and still in front of the next page.
-        page = await select(
-            store, glossary_fingerprint=fingerprint, limit=batch, offset=sweep.selected
-        )
+        page = await select(store, glossary_fingerprint=fingerprint, limit=batch, after=cursor)
         if not page:
             return sweep
+        cursor = await _cursor_after(store, page, cursor)
         sweep.selected += len(page)
 
 
@@ -1513,14 +1530,12 @@ async def plan_stale_relations(
     """
     _require_extraction(fingerprint)
     sweep = RelationSweep(dry_run=True)
+    cursor: SelectionCursor | None = None
     while True:
-        # The offset is the count, exactly: a plan repairs nothing, so every document it has
-        # seen is still in the selection and still in front of the next page.
-        page = await select(
-            store, relation_fingerprint=fingerprint, limit=batch, offset=sweep.selected
-        )
+        page = await select(store, relation_fingerprint=fingerprint, limit=batch, after=cursor)
         if not page:
             return sweep
+        cursor = await _cursor_after(store, page, cursor)
         sweep.selected += len(page)
 
 

@@ -55,6 +55,15 @@ PRAGMAS: tuple[tuple[str, str], ...] = (
     ("busy_timeout", "5000"),
     ("synchronous", "NORMAL"),
     ("wal_autocheckpoint", "1000"),
+    # The two below are read throughput and nothing else: no query returns a different row
+    # because of them. The pool holds up to fifteen connections, each with its own 2 MB page
+    # cache, so hot B-tree and FTS pages were read through the VFS again by every one of them.
+    # A memory map is shared through the operating system's page cache instead, so it helps all
+    # of them without multiplying memory by the pool size the way a larger `cache_size` would.
+    # A memory map is unsafe on network storage, but so is WAL, which this database already
+    # needs. `temp_store` keeps sorts and `DISTINCT` out of temporary files.
+    ("mmap_size", "268435456"),
+    ("temp_store", "MEMORY"),
 )
 """Applied to **every** connection, in a ``connect`` listener.
 
