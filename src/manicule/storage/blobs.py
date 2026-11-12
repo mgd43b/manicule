@@ -239,6 +239,15 @@ def should_compress(media_type: str | None) -> bool:
     return lowered.startswith(_COMPRESSIBLE_PREFIXES) or lowered.endswith(_COMPRESSIBLE_SUFFIXES)
 
 
+def _digest_and_representation(data: bytes, compression: str) -> tuple[str, bytes]:
+    """The content address of ``data`` and the bytes that represent it on disk.
+
+    One function so one thread hop pays for both; each is linear in the size of the document.
+    """
+    proposed = gzip.compress(data, mtime=0) if compression == "gzip" else data
+    return content_hash(data), proposed
+
+
 def _admitted_writer[**P, R](
     operation: Callable[Concatenate[BlobStore, P], Coroutine[Any, Any, R]],
 ) -> Callable[Concatenate[BlobStore, P], Coroutine[Any, Any, R]]:
@@ -526,9 +535,9 @@ class BlobStore:
 
     @classmethod
     def _published_blob(
-        cls, destination: Path, data: bytes, digest: str, compression: str
+        cls, destination: Path, data: bytes, proposed: bytes, digest: str
     ) -> tuple[StoredBlob, bool]:
-        proposed = gzip.compress(data, mtime=0) if compression == "gzip" else data
+        """Publish ``proposed``, the representation of ``data`` the caller already computed."""
         published, created = cls._publish_durable(destination, proposed)
         if published == data:
             actual_compression = "none"
@@ -939,15 +948,25 @@ class BlobStore:
         staging_key: str | None = None,
         acquired: AcquiredSource | None = None,
     ) -> StoredBlob:
-        digest = content_hash(data)
+        # Hashed and compressed once, here, off the event loop and before any lock. Both used
+        # to run twice — once on the loop and again inside `writer_slot` and `BEGIN IMMEDIATE`,
+        # where level-9 gzip of a large page held every other writer in the process behind it.
+        # The bytes are the same either way: same input, same level, `mtime=0`.
+        compression = "gzip" if should_compress(media_type) else "none"
+        digest, proposed = await asyncio.to_thread(_digest_and_representation, data, compression)
         if staging_key is None:
             async with self._durable_locks([f"blob:{digest}"]):
-                return await self._store_blob_locked(data, media_type)
+                return await self._store_blob_locked(
+                    data, media_type, digest=digest, compression=compression, proposed=proposed
+                )
         keys = [f"blob:{digest}", f"marker:{self._stage_name(staging_key)}"]
         async with self._durable_locks(keys):
             return await self._store_blob_locked(
                 data,
                 media_type,
+                digest=digest,
+                compression=compression,
+                proposed=proposed,
                 staging_key=staging_key,
                 acquired=acquired,
             )
@@ -957,15 +976,15 @@ class BlobStore:
         data: bytes,
         media_type: str | None,
         *,
+        digest: str,
+        compression: str,
+        proposed: bytes,
         staging_key: str | None = None,
         acquired: AcquiredSource | None = None,
     ) -> StoredBlob:
         if (staging_key is None) != (acquired is None):
             msg = "an acquisition stage requires both its key and source envelope"
             raise ValueError(msg)
-        digest = content_hash(data)
-        compression = "gzip" if should_compress(media_type) else "none"
-        proposed = gzip.compress(data, mtime=0) if compression == "gzip" else data
         owned_representation = StoredBlob(
             hash=digest,
             size_bytes=len(data),
@@ -1020,7 +1039,7 @@ class BlobStore:
                         minimum=self._min_disk_headroom_bytes,
                     )
                 stored, publication_created = await self._durable_thread_call(
-                    lambda: self._published_blob(destination, data, digest, compression)
+                    lambda: self._published_blob(destination, data, proposed, digest)
                 )
                 publication_completed = True
                 actual_growth = max(0, stored.stored_bytes - described_bytes)
