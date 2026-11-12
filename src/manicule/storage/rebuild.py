@@ -1456,6 +1456,25 @@ class SqliteRebuildStore(WorkspaceScoped):
             ):
                 raise RebuildLeaseConflictError("checkpoint vectors were not replayed")
             target = RebuildTarget.model_validate(generation.target)
+            # One read for the whole batch, and digests only. A replayed checkpoint is checked
+            # against what was staged, and loading each staged row whole to do it read every
+            # replacement's payload — the largest column in the table — one round trip at a time.
+            staged = {
+                int(sequence): str(digest)
+                for sequence, digest in (
+                    await session.execute(
+                        select(
+                            models.DerivedGenerationItem.sequence,
+                            models.DerivedGenerationItem.payload_digest,
+                        ).where(
+                            models.DerivedGenerationItem.generation_id == generation_id,
+                            models.DerivedGenerationItem.sequence.between(
+                                replacements[0][0], replacements[-1][0]
+                            ),
+                        )
+                    )
+                ).all()
+            }
             for sequence, replacement in replacements:
                 try:
                     replacement.validate_identity()
@@ -1467,11 +1486,9 @@ class SqliteRebuildStore(WorkspaceScoped):
                 encoded = _canonical(payload)
                 temporary_bytes = self._temporary_cost(replacement, target, len(encoded))
                 digest = hashlib.sha256(encoded).hexdigest()
-                existing = await session.get(
-                    models.DerivedGenerationItem, (generation_id, sequence)
-                )
+                existing = staged.get(sequence)
                 if existing is not None:
-                    if existing.payload_digest != digest:
+                    if existing != digest:
                         raise RebuildPublicationValidationError
                     continue
                 session.add(
