@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.27](https://github.com/mgd43b/manicule/compare/v0.2.26...v0.2.27) (2026-11-12)
+
+
+### Performance Improvements
+
+* faster search, ingest and CLI startup without changing what is indexed ([#558](https://github.com/mgd43b/manicule/issues/558)) ([f61d55c](https://github.com/mgd43b/manicule/commit/f61d55c12ee53bf0cb2763259646890463f85c86))
+
 ## [0.2.26](https://github.com/mgd43b/manicule/compare/v0.2.25...v0.2.26) (2026-11-11)
 
 
