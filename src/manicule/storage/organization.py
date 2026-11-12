@@ -323,6 +323,34 @@ class CollectionsMixin(WorkspaceScoped):
             access = await access_for(session, self._workspace_id, rows)
             return [to_document(document, access=access[document.id]) for document in rows]
 
+    async def collection_document_ids(self, collection_id: str, *, limit: int) -> set[str]:
+        """The ids :meth:`collection_documents` would list, and nothing else about them.
+
+        What scoping a query to a collection needs. Listing the members built a whole
+        :class:`Document` for each — its metadata, its reader gates, a pydantic model — on every
+        scoped search, only for :func:`resolve_filter` to keep the id. The predicate is the same
+        one, so the set is the same set.
+        """
+        async with self._sessions() as session:
+            row = await self._collection(session, collection_id)
+            if row is None:
+                return set()
+            return set(
+                (
+                    await session.execute(
+                        select(models.Document.id)
+                        .where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                            self._membership_clause(row),
+                        )
+                        .limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
     async def collections_for(self, document_id: str) -> Sequence[Collection]:
         """Every collection holding this document, by hand or by rule.
 
@@ -674,6 +702,28 @@ class TagsMixin(WorkspaceScoped):
             rows = (await session.execute(statement)).scalars().all()
             return [to_document(row) for row in rows]
 
+    async def document_ids_with_tags(self, tag_ids: Sequence[str], *, limit: int) -> set[str]:
+        """The ids :meth:`documents_with_tags` would list, for scoping a query by tag."""
+        wanted = list(dict.fromkeys(tag_ids))
+        if not wanted:
+            return set()
+        async with self._sessions() as session:
+            return set(
+                (
+                    await session.execute(
+                        select(models.Document.id)
+                        .where(
+                            models.Document.workspace_id == self._workspace_id,
+                            models.Document.deleted_at.is_(None),
+                            models.Document.id.in_(_tagged_ids(wanted, match_all=False)),
+                        )
+                        .limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
     # --- internals --------------------------------------------------------------------------
 
     async def _tag(self, session: AsyncSession, tag_id: str) -> models.Tag | None:
@@ -768,19 +818,15 @@ async def resolve_filter(
     if filter.collection_ids:
         from_collections: set[str] = set()
         for collection_id in sorted(filter.collection_ids):
-            members = await collections.collection_documents(
-                collection_id, limit=MAX_RESOLVED_DOCUMENTS + 1
-            )
+            members = await _member_ids(collections, collection_id)
             _refuse_if_truncated(len(members), f"collection {collection_id!r}")
-            from_collections.update(document.id for document in members)
+            from_collections.update(members)
         _refuse_if_truncated(len(from_collections), "the named collections together")
         scopes.append(from_collections)
     if filter.tag_ids:
-        tagged = await tags.documents_with_tags(
-            sorted(filter.tag_ids), limit=MAX_RESOLVED_DOCUMENTS + 1
-        )
+        tagged = await _tagged_document_ids(tags, sorted(filter.tag_ids))
         _refuse_if_truncated(len(tagged), "the named tags")
-        scopes.append({document.id for document in tagged})
+        scopes.append(tagged)
     if filter.document_ids:
         scopes.append(set(filter.document_ids))
 
@@ -799,6 +845,26 @@ async def resolve_filter(
             "tag_ids": frozenset(),
         }
     )
+
+
+async def _member_ids(collections: CollectionStore, collection_id: str) -> set[str]:
+    """A collection's member ids, asking for ids alone when the store can answer that."""
+    if isinstance(collections, CollectionsMixin):
+        return await collections.collection_document_ids(
+            collection_id, limit=MAX_RESOLVED_DOCUMENTS + 1
+        )
+    members = await collections.collection_documents(
+        collection_id, limit=MAX_RESOLVED_DOCUMENTS + 1
+    )
+    return {document.id for document in members}
+
+
+async def _tagged_document_ids(tags: TagStore, tag_ids: Sequence[str]) -> set[str]:
+    """Ids of the documents carrying any of ``tag_ids``, as ids alone when the store can."""
+    if isinstance(tags, TagsMixin):
+        return await tags.document_ids_with_tags(tag_ids, limit=MAX_RESOLVED_DOCUMENTS + 1)
+    tagged = await tags.documents_with_tags(tag_ids, limit=MAX_RESOLVED_DOCUMENTS + 1)
+    return {document.id for document in tagged}
 
 
 MAX_RESOLVED_DOCUMENTS = 10_000

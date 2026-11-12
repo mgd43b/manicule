@@ -686,6 +686,48 @@ async def test_a_collection_too_large_to_carry_is_refused_rather_than_truncated(
         await resolve_filter(scope, collections=store, tags=store)
 
 
+async def test_resolving_a_scope_reads_member_ids_and_builds_no_documents(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every collection-scoped search resolves membership first, so it has to be cheap.
+
+    Listing members built a whole ``Document`` — metadata, reader gates, a pydantic model — for
+    each one, only for the resolution to keep its id. The ids come from the same predicate, so
+    a hand-made collection, a rule-driven one, a tag and the trash all resolve as they did.
+    """
+    manual = await _seed(store, 2)
+    ruled = await _seed(store, 2, source="confluence")
+    hand = await store.create_collection("hand")
+    await store.add_to_collection(hand.id, [manual[0].id, manual[1].id])
+    await store.soft_delete_document(manual[1].id)
+    wiki = await store.create_collection(
+        "wiki", rule=CollectionRule(sources=frozenset({"confluence"}))
+    )
+    tag = await store.ensure_tag("reviewed")
+    await store.tag_document(manual[0].id, [tag.id])
+    await store.tag_document(ruled[0].id, [tag.id])
+
+    async def refused(*_: object, **__: object) -> None:
+        raise AssertionError("resolution listed whole documents")
+
+    monkeypatch.setattr(store, "collection_documents", refused)
+    monkeypatch.setattr(store, "documents_with_tags", refused)
+
+    both = Filter(
+        workspace_ids=frozenset({DEFAULT_WORKSPACE}),
+        collection_ids=frozenset({hand.id, wiki.id}),
+    )
+    tagged = Filter(workspace_ids=frozenset({DEFAULT_WORKSPACE}), tag_ids=frozenset({tag.id}))
+
+    resolved = await resolve_filter(both, collections=store, tags=store)
+    by_tag = await resolve_filter(tagged, collections=store, tags=store)
+
+    assert resolved is not None
+    assert resolved.document_ids == frozenset({manual[0].id, ruled[0].id, ruled[1].id})
+    assert by_tag is not None
+    assert by_tag.document_ids == frozenset({manual[0].id, ruled[0].id})
+
+
 async def test_a_filter_naming_neither_is_returned_untouched(store: SqliteDocStore) -> None:
     """Resolution is a no-op for the filters that need none, so it can be applied everywhere."""
     scope = Filter(workspace_ids=frozenset({DEFAULT_WORKSPACE}), sources=frozenset({"fs"}))
