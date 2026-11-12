@@ -25,6 +25,7 @@ exists to keep it fed.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
@@ -96,7 +97,10 @@ async def embed_chunks(
     Raises:
         ContextOverflowError: Any chunk exceeds what the model will read.
     """
-    measured = _measured(embedder, chunks, chunk_fingerprint)
+    # On a pool thread: one tokenization per chunk, which on a large document is long enough to
+    # starve the lease renewals and requests sharing the event loop. Embedders already count
+    # tokens off the loop, for the chunker's preparation threads.
+    measured = await asyncio.to_thread(_measured, embedder, chunks, chunk_fingerprint)
     if not chunks:
         return []
     return await embed_checked_chunks(
@@ -523,7 +527,7 @@ async def embed_or_reuse(
     # model would refuse is refused whether or not another workspace holds a vector for it, so a
     # borrowed vector can never be the reason a document indexed that otherwise would not have.
     # Tokenizer time, so it is not timed as a store lookup.
-    measured = _measured(embedder, pending, chunk_fingerprint)
+    measured = await asyncio.to_thread(_measured, embedder, pending, chunk_fingerprint)
     borrowed = await _borrow(lender, pending, timings=timings) if reuse else {}
 
     model_positions = [
