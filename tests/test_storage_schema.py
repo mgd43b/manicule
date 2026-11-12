@@ -133,7 +133,14 @@ async def test_foreign_keys_are_enforced_on_every_pooled_connection(engine: Asyn
 
 async def test_every_declared_pragma_is_actually_applied(engine: AsyncEngine) -> None:
     """A pragma that silently failed to apply looks exactly like one that worked."""
-    expected = {"journal_mode": "wal", "foreign_keys": 1, "busy_timeout": 5000}
+    expected = {
+        "journal_mode": "wal",
+        "foreign_keys": 1,
+        "busy_timeout": 5000,
+        "mmap_size": 268435456,
+        "cache_size": -8192,
+        "temp_store": 2,
+    }
     async with engine.connect() as connection:
         for name, want in expected.items():
             got = (await connection.execute(text(f"PRAGMA {name}"))).scalar()

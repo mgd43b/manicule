@@ -115,8 +115,19 @@ def _configure(dbapi_conn, _):
     cur.execute("PRAGMA busy_timeout = 5000")
     cur.execute("PRAGMA synchronous = NORMAL")
     cur.execute("PRAGMA wal_autocheckpoint = 1000")
+    cur.execute("PRAGMA mmap_size = 268435456")
+    cur.execute("PRAGMA cache_size = -8192")
+    cur.execute("PRAGMA temp_store = MEMORY")
     cur.close()
 ```
+
+The last three are read throughput and change no result. The pool holds up to fifteen
+connections and each has its own page cache, so the default 2 MB per connection meant every
+connection read hot index and FTS pages through the VFS again. A 256 MB memory map is shared
+through the operating system's page cache, so it carries most of the weight; the per-connection
+cache grows only to 8 MB, and sorts and `DISTINCT` stay in memory rather than spilling to temp
+files. A memory map is unsafe on network storage, and so is WAL, which this database already
+requires.
 
 **`foreign_keys` is per-connection and defaults to OFF.** This is the single most common way
 a SQLite schema full of `REFERENCES` clauses turns out to enforce nothing: the pragma is set
