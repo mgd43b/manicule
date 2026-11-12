@@ -1264,6 +1264,42 @@ async def test_query_telemetry_round_trips_through_the_real_store(runtime: Runti
     assert rows[0]["confidence"] == 0.5
 
 
+async def test_recording_a_query_does_not_wait_for_the_database_writer(runtime: Runtime) -> None:
+    """A search must not sit behind a sync to write the row that describes it.
+
+    The insert used to run on the response path, outside the writer queue, so with another
+    writer holding SQLite it waited up to ``busy_timeout`` — five seconds added to a search
+    whose answer was already computed. Here another connection holds SQLite's write lock for
+    the whole call, the way a sync's transaction does.
+    """
+    telemetry = await runtime.telemetry()
+    engine = runtime.require_engine()
+    async with engine.connect() as holder:
+        await holder.exec_driver_sql("BEGIN IMMEDIATE")
+        await asyncio.wait_for(
+            telemetry.record_query(
+                "retry policy", profile="balanced", chunk_ids=["a"], confidence=None, elapsed_ms=3
+            ),
+            timeout=1.0,
+        )
+        await holder.rollback()
+    rows, total = await telemetry.query_logs(limit=10)
+    assert total == 1, "the queued row never landed once the writer let go"
+    assert rows[0]["query"] == "retry policy"
+
+
+async def test_a_queued_query_row_lands_before_the_runtime_closes(
+    manicule_environment: Path,
+) -> None:
+    """Closing the runtime settles queued writes before disposing the engine they use."""
+    async with Runtime.open(data_dir=manicule_environment / "data") as first:
+        await (await first.telemetry()).record_query(
+            "retry policy", profile="balanced", chunk_ids=[], confidence=None, elapsed_ms=1
+        )
+    async with Runtime.open(data_dir=manicule_environment / "data") as reopened:
+        assert (await (await reopened.telemetry()).query_logs())[1] == 1
+
+
 async def test_the_audit_trail_round_trips_and_filters(runtime: Runtime) -> None:
     """Including the ``event_type`` filter, which is a second statement nothing else runs."""
     telemetry = await runtime.telemetry()

@@ -136,6 +136,13 @@ if TYPE_CHECKING:
 
 _LOG = logging.getLogger(__name__)
 
+_QUERY_LOG_BACKLOG: Final = 256
+"""How many ``query_logs`` writes may be in flight before the next search waits for its own.
+
+Generous enough that a writer holding SQLite for a few seconds costs searches nothing, and
+bounded so that a writer that never lets go turns into slow searches rather than into memory
+growing one task per query."""
+
 ARCHIVE_MANIFEST = "manicule-export.json"
 """The file that makes an exported directory an archive rather than a pile of blobs."""
 
@@ -375,6 +382,10 @@ class Runtime:
         try:
             if self._stragglers is not None:
                 await self._stragglers.wait()
+            # Queued query-log writes go through the engine, so they land before it is disposed.
+            telemetry = self._slots.get("telemetry")
+            if telemetry is not None and isinstance(telemetry.value, _Telemetry):
+                await telemetry.value.settle()
             close_error: Exception | None = None
             try:
                 # First, while the engine they read their publication pointers through is open.
@@ -3724,6 +3735,7 @@ class _Telemetry:
 
     def __init__(self, runtime: Runtime) -> None:
         self._runtime = runtime
+        self._pending: set[asyncio.Task[None]] = set()
 
     async def record_query(
         self,
@@ -3734,24 +3746,71 @@ class _Telemetry:
         confidence: float | None,
         elapsed_ms: int,
     ) -> str:
-        from manicule.storage import models  # noqa: PLC0415
-        from manicule.storage.engine import session_factory  # noqa: PLC0415
+        """Queue one ``query_logs`` row and return its id without waiting for the write.
 
+        The row is written by a background task, behind the engine's one writer queue, because
+        the alternative put a SQLite write on every search's response path: with a sync or a
+        maintenance writer holding the database, the insert sat in SQLite's busy handler for up
+        to ``busy_timeout`` while the caller waited for an answer that was already computed.
+        The id is chosen here, so it is valid the moment this returns; the row it names is
+        visible once :meth:`settle` has run, which :meth:`query_logs` and the runtime's close
+        both do. Past :data:`_QUERY_LOG_BACKLOG` writes in flight, the next one is awaited
+        instead — backpressure rather than an unbounded pile of tasks behind a stalled writer.
+        """
         identifier = secrets.token_hex(8)
-        sessions = session_factory(self._runtime.require_engine())
-        async with sessions.begin() as session:
-            session.add(
-                models.QueryLog(
-                    id=identifier,
-                    workspace_id=self._runtime.workspace,
-                    query=query,
-                    profile=profile,
-                    retrieved_chunk_ids=list(chunk_ids),
-                    confidence_score=confidence,
-                    response_time_ms=elapsed_ms,
-                )
-            )
+        write = self._write_query(
+            identifier,
+            query=query,
+            profile=profile,
+            chunk_ids=list(chunk_ids),
+            confidence=confidence,
+            elapsed_ms=elapsed_ms,
+        )
+        if len(self._pending) >= _QUERY_LOG_BACKLOG:
+            await write
+            return identifier
+        task = asyncio.create_task(write, name="manicule-query-log")
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
         return identifier
+
+    async def _write_query(
+        self,
+        identifier: str,
+        *,
+        query: str,
+        profile: str,
+        chunk_ids: list[str],
+        confidence: float | None,
+        elapsed_ms: int,
+    ) -> None:
+        from manicule.storage import models  # noqa: PLC0415
+        from manicule.storage.engine import session_factory, writer_slot  # noqa: PLC0415
+
+        try:
+            engine = self._runtime.require_engine()
+            async with writer_slot(engine, "query_log"), session_factory(engine).begin() as s:
+                s.add(
+                    models.QueryLog(
+                        id=identifier,
+                        workspace_id=self._runtime.workspace,
+                        query=query,
+                        profile=profile,
+                        retrieved_chunk_ids=chunk_ids,
+                        confidence_score=confidence,
+                        response_time_ms=elapsed_ms,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 - telemetry never fails the read it describes
+            # Nobody awaits this task, so an exception left to escape would surface only as
+            # asyncio's "never retrieved" noise. The query text stays out of the message: it is
+            # user content, and `security.storage.redact_logs_content` governs log lines.
+            _LOG.warning("could not record query telemetry: %s: %s", type(exc).__name__, exc)
+
+    async def settle(self) -> None:
+        """Wait for every queued ``query_logs`` write, including any queued while waiting."""
+        while self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)
 
     async def query_logs(
         self, *, limit: int = 50, offset: int = 0
@@ -3761,6 +3820,8 @@ class _Telemetry:
         from manicule.storage import models  # noqa: PLC0415
         from manicule.storage.engine import session_factory  # noqa: PLC0415
 
+        # Read-your-writes within the process: a page asked for after a search includes it.
+        await self.settle()
         sessions = session_factory(self._runtime.require_engine())
         scope = models.QueryLog.workspace_id == self._runtime.workspace
         async with sessions() as session:

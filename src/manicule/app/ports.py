@@ -772,7 +772,12 @@ class Telemetry(Protocol):
         confidence: float | None,
         elapsed_ms: int,
     ) -> str:
-        """Record one retrieval and return the row's id."""
+        """Record one retrieval and return the row's id.
+
+        An implementation may queue the write rather than wait for it — the built-in one does,
+        so that a search never waits on the database writer to describe itself. The row must be
+        visible to this object's own :meth:`query_logs` by the time that returns.
+        """
         ...
 
     async def query_logs(
