@@ -619,6 +619,20 @@ class Runtime:
         """The configured embedder, exposed for index-maintenance orchestration."""
         return await self._container.aget(keys.EMBEDDER)
 
+    async def warm(self) -> None:
+        """Pay for what the first search would otherwise pay for, before anyone is waiting.
+
+        Building retrieval loads the model — weights on an in-process backend, the served-model
+        probe on Ollama — and the first forward pass compiles what the backend compiles. Both
+        are seconds, and both used to land inside the first query's ``elapsed_ms``. One query
+        embedding runs here, through the same prefix a search uses; nothing is searched,
+        nothing is logged to ``query_logs`` and no ranking is cached, so the first real search
+        reads the corpus exactly as it would have.
+        """
+        await self.retriever()
+        embedder = await self.embedder()
+        await embedder.embed([embedder.fingerprint.prefix_scheme.query("warm-up")])
+
     async def prepared_vectors(self) -> VectorStore:
         """The vector store, committed to the configured embedder's space.
 

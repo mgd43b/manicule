@@ -48,6 +48,8 @@ from tests.ingest import fakes
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 
+    from manicule.core.embedding import Vector
+
 STALE_INSTALL = (
     "an entry point declared in pyproject.toml is missing from the installed distribution. "
     "Run `uv sync --reinstall-package manicule` and try again."
@@ -1298,6 +1300,32 @@ async def test_a_queued_query_row_lands_before_the_runtime_closes(
         )
     async with Runtime.open(data_dir=manicule_environment / "data") as reopened:
         assert (await (await reopened.telemetry()).query_logs())[1] == 1
+
+
+async def test_warming_builds_retrieval_and_embeds_without_searching(
+    runtime: Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What ``serve`` runs before its first request, so that request does not pay for it.
+
+    The model is loaded and one query embedding is computed, through the prefix a search uses;
+    nothing is searched, so no ``query_logs`` row is written and no ranking is cached for the
+    first real search to hit.
+    """
+    embedder = await runtime.embedder()
+    embedded: list[str] = []
+    real = embedder.embed
+
+    async def recording(texts: Sequence[str]) -> list[Vector]:
+        embedded.extend(texts)
+        return await real(texts)
+
+    monkeypatch.setattr(embedder, "embed", recording)
+
+    await runtime.warm()
+
+    assert embedded == [embedder.fingerprint.prefix_scheme.query("warm-up")]
+    assert "retriever" in runtime._slots, "warming did not build retrieval"  # pyright: ignore[reportPrivateUsage]
+    assert (await (await runtime.telemetry()).query_logs())[1] == 0
 
 
 async def test_the_audit_trail_round_trips_and_filters(runtime: Runtime) -> None:
