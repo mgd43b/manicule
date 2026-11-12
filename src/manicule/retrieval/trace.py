@@ -116,13 +116,15 @@ class DenseReport(BaseModel):
     dropped_by_join: int = Field(
         default=0,
         ge=0,
-        description="Rows removed because the document was foreign, deleted, unindexed or "
-        "gone. A large number here means the index is dirty.",
+        description="Rows that cleared the similarity floor and were then removed because the "
+        "document was foreign, deleted, unindexed or gone. A large number here means the index "
+        "is dirty. The floor runs first, so a row below it is counted only on the line below.",
     )
     dropped_by_min_score: int = Field(
         default=0,
         ge=0,
-        description="Rows removed by the similarity floor. A large number here means the "
+        description="Rows removed by the similarity floor, before any join. A large number here "
+        "means the "
         "query is hard — a different diagnosis from the line above, which is why they are "
         "counted apart.",
     )

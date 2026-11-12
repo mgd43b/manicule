@@ -831,11 +831,18 @@ So the floor is a junk filter and **not** the relevance decision. The relevance 
 confidence (§8.4), which is continuous: backend drift nudges a reported number by a thousandth
 and never changes which passages come back.
 
-**Interaction with over-fetch:** the floor is applied *after* the hydrating join, so a discarded
-low-similarity candidate does not count as a survivor, and the retry in §4.4 can be triggered by
-the floor rather than by exclusions. That is correct — the leg's job is to produce `k` candidates
-worth fusing — and the trace distinguishes `dropped_by_join` from `dropped_by_min_score`, because
-one of those means the index is dirty and the other means the query is hard.
+**Interaction with over-fetch:** a discarded low-similarity candidate does not count as a
+survivor, so the retry in §4.4 can be triggered by the floor rather than by exclusions. That is
+correct — the leg's job is to produce `k` candidates worth fusing — and the trace distinguishes
+`dropped_by_join` from `dropped_by_min_score`, because one of those means the index is dirty and
+the other means the query is hard.
+
+The floor runs *before* the hydrating join. Both are order-preserving filters and the floor reads
+only the score, which hydration never changes, so the survivors are the same either way; the
+difference is cost. A weak query is the one that escalates to the widest fetch, and floor-first
+means it reads from SQLite only the rows it could keep. The one visible consequence is in the
+trace: a row below the floor is counted in `dropped_by_min_score` and never reaches the join, so
+`dropped_by_join` counts only rows that cleared the floor.
 
 ---
 

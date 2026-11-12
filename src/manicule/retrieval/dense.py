@@ -200,10 +200,14 @@ class DenseStage:
         while True:
             rows = await self._vectors.search(vector, over_fetch, split.pushdown)
             fetched = len(rows)
-            live = await self._hydrate(rows, split.join)
-            by_join = fetched - len(live)
-            kept = [c for c in live if max(c.score, 0.0) >= profile.min_score]
-            by_floor = len(live) - len(kept)
+            # The floor reads only the score, which hydration never changes, and it commutes
+            # with the join: both are filters that keep order. Applying it first means a weak
+            # query — the one that escalates to the widest fetch — reads from SQLite only the
+            # rows it could keep, instead of every row it is about to throw away.
+            above = [row for row in rows if max(row.score, 0.0) >= profile.min_score]
+            by_floor = fetched - len(above)
+            kept = await self._hydrate(above, split.join)
+            by_join = len(above) - len(kept)
 
             if len(kept) >= k:
                 outcome = Shortfall.SATISFIED
