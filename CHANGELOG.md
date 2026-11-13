@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.28](https://github.com/mgd43b/manicule/compare/v0.2.27...v0.2.28) (2026-11-13)
+
+
+### Features
+
+* **authoring:** a new collection is its first write; remove and move authored documents ([#560](https://github.com/mgd43b/manicule/issues/560)) ([334b17c](https://github.com/mgd43b/manicule/commit/334b17c0741473362b8d64fdaaffcffb526ea981))
+
 ## [0.2.27](https://github.com/mgd43b/manicule/compare/v0.2.26...v0.2.27) (2026-11-12)
 
 
