@@ -124,6 +124,10 @@ returning less. Give the collection a `uri_prefixes` rule naming its directory b
 however it arrived. `manicule doctor`'s `authoring` check reports a configured collection that
 has no such rule, because nothing else about that state is visible.
 
+Under `authoring.collections_from_directories` (§4.12) the rule is written when the collection is:
+the first `document_create` into a new directory creates the collection *with* its prefix, in one
+store write, so the state `doctor` reports here never arises for a collection that mode made.
+
 The manual write stays regardless, and is not made conditional on a rule existing. A collection
 here may legitimately have no rule, and a `document_create` that assigned membership one way
 when a rule was present and another way when it was not would be a second notion of what a
@@ -198,7 +202,10 @@ being wrong means writing outside the corpus.
 Behavior lives in `ApplicationService` and nowhere else. The MCP tool, the CLI command
 (`manicule document create <collection> <slug>`, body from `--file` or standard input) and the HTTP
 route (`POST /api/v1/documents`) produce byte-identical envelopes;
-`tests/app/test_document_create.py` compares all three.
+`tests/app/test_document_create.py` compares all three. §4.13's `document_remove` and
+`document_move` are on the same three surfaces: `manicule document remove <collection> <slug>` and
+`manicule document move <slug> <from> <to>`, and `POST /api/v1/documents/remove` and
+`POST /api/v1/documents/move`.
 
 **The browser surface has no authoring form, deliberately.** `POST /ui/documents` is asserted
 *absent* by `tests/web/test_boundaries.py`: that surface renders envelopes and does not author, and
@@ -222,15 +229,15 @@ configuration flag:
 | Transport | Surface |
 |---|---|
 | stdio | everything, including `document_create` |
-| socket | the read-only set **plus `document_create`**, and nothing else that mutates |
+| socket | the read-only set **plus `document_create`, `document_remove` and `document_move`**, and nothing else that mutates |
 
 The property that mattered is that the absence of every *other* write tool stays **mechanical
 rather than reasoned**, and it does. `_Registrar.tool` registers a tool only when its
 `readOnlyHint` is true or its name is in `manicule.mcp.server.NETWORK_AUTHORING` — a frozenset
-holding one name — so there is no handler behind any other write tool on a socket. An absence,
-not a refusal. `tests/api/test_routes.py` asserts that row as a set operation: the published set
-*is* the read-only set plus that constant, so a second write tool cannot drift in behind the
-first.
+holding authoring's three names — so there is no handler behind any other write tool on a socket.
+An absence, not a refusal. `tests/api/test_routes.py` asserts that row as a set operation: the
+published set *is* the read-only set plus that constant, so another write tool cannot drift in
+behind authoring's.
 
 **That set does not depend on authentication, and the attempt to make it depend on
 authentication is worth recording.** When `--no-authentication` was added
@@ -281,7 +288,9 @@ Two constraints ride along and both are enforced:
   on every address, and the flag does not apply to that either
   ([`surfaces.md` §6](surfaces.md#sensitive-sources-take-the-way-out-away)).
 - **Scope is a configured writable collection**, not any collection the workspace holds. Creating a
-  collection is therefore not also the act of granting write access to it.
+  collection is therefore not also the act of granting write access to it — unless the operator
+  turns on `authoring.collections_from_directories`, which makes exactly that trade, in the bounded
+  form §4.12 describes.
 
 `tests/api/test_routes.py::ABSENT_TOOLS` does not name `document_create`, and says why: `index_path`
 walks any directory the process can read and `config_set` rewrites the running configuration,
@@ -289,7 +298,7 @@ whereas this writes one document, to one workspace, in one configured collection
 connector root, at a path the caller never supplies. Bounded authority, not unbounded. That list's
 value is that every entry explains itself, so the absence explains itself too.
 
-**Why the extra care, given it is only one tool:** this corpus is read as *instructions*, not just
+**Why the extra care, given how small the surface is:** this corpus is read as *instructions*, not just
 data. `feedback_` memories are treated as standing instructions by every assistant that recalls
 them. So write access here is the ability to inject behavior into future sessions across every
 project — a materially higher-stakes write than indexing a directory, and the reason the default
@@ -307,6 +316,7 @@ Both are empty by default, and empty means authoring is off: the tool is publish
 and refuses every call naming these settings. Both are required together, because either alone
 describes an operation that cannot run — a source with no collection has nowhere to put a document
 that is not an unscoped pile, and collections with no source have no root to be written beneath.
+`collections_from_directories = true` (§4.12) stands in for the list.
 
 Each name is a collection **and** a single path segment beneath the root, so the collection
 wants a rule saying the same thing. Once per collection:
@@ -326,6 +336,90 @@ A third finding comes from the source rather than from the collection: `failing`
 whose directory the filesystem source's own `exclude` keeps out of the walk. Nothing written there
 would ever be indexed, so `document_create` into it refuses rather than writing a file the walk
 then steps over — see [`connectors/filesystem.md`](connectors/filesystem.md) §2.2 and §3.
+
+### 4.12 Collections from directories
+
+The list above is the default, and for a corpus that grows a project at a time it is three steps
+per project: a configuration edit, a `collection create` with its `--uri-prefix`, and a restart.
+`collections_from_directories` replaces the list with the directory tree it already describes:
+
+```toml
+[authoring]
+source = "memories"
+collections_from_directories = true   # every top-level directory beneath the root
+```
+
+Every top-level directory beneath the source's root is then a collection authoring may write
+into, and adding one is the first write into it. `document_create(collection="journal", ...)`
+into a name that is neither a directory nor a collection yet creates the collection with a rule
+selecting `<root>/journal/` — one store write, so the two never exist apart — then writes and
+indexes the document, which creates the directory. The result says `collection_created: true`.
+
+It is a separate setting rather than `collections = "*"` because it is a separate policy: a field
+that is sometimes a list and sometimes a wildcard is one every reader has to ask which it holds,
+and the wildcard invites patterns nobody implemented. Setting both is refused at startup.
+
+**What it trades, and what it still refuses.** This is the mode in which creating a collection
+*is* granting write access to it, and that is why it is off by default. The bound that remains:
+
+- **One path segment beneath one root**, held to §4.8's rule like any slug.
+- **No hidden name, and no name the walk always skips.** The filesystem source does not walk
+  dot-directories, so `.git` — a top-level directory of any corpus that git versions — would take
+  writes that are never indexed; the same holds for `venv`, `node_modules`, `__pycache__` and the
+  rest of the connector's ignored directories, which `doctor` leaves out too.
+- **No name the workspace would spell differently.** Collection names are stored NFKC-normalized
+  with whitespace collapsed; a directory name is not, so a name that normalizes to something else
+  would be two names for one collection.
+- **No case variant of an existing directory.** On a case-insensitive filesystem `Notes` and
+  `notes` are one directory, so they cannot be two collections. Refused everywhere, because a
+  corpus written on one filesystem is cloned onto the other.
+- **Nothing that occupies the name without being a directory** — a file, or a symbolic link.
+- **No directory the source excludes**, as in list mode.
+- **No collection made for something else.** An existing collection is accepted only if its
+  directory exists beneath the root or its rule already selects that directory. A collection that
+  is neither — a Confluence space, a hand-curated list — is refused with the
+  `collection rule set` command that would make it the directory, rather than written into
+  because its name matched. A rule counts as selecting the directory only when nothing else in it
+  narrows the prefix — no other source, media type, tag or date window — because a rule ANDs its
+  selectors.
+
+Every refusal happens before anything is created. A write that fails after the collection was
+made — the disk refuses the file — takes the collection back, and the directory if it made it;
+a write whose *indexing* fails keeps both, with the file, for §4.5's reason.
+
+`doctor`'s `authoring` check reads the directories in this mode (facts `mode: "directories"`,
+`collections` the directory names). A directory with no collection yet — one that arrived by
+git — is `degraded`, not `failing`, because the next write into it creates the collection; until
+then its synced documents are in no collection. A directory whose name cannot be a collection is
+`degraded` too.
+
+### 4.13 Removing and moving a document
+
+`document_create` has an inverse and a composition, addressed the same way and held to the same
+bounds:
+
+- **`document_remove(collection, slug)`** deletes the file beneath the root and moves the index
+  entry to the trash — the same soft delete reconciliation would make when it noticed the file had
+  gone, done now. `document_delete` is not this: it takes any document's id and removes only the
+  index entry, which for an authored file the next sync puts back.
+- **`document_move(slug, from_collection, to_collection)`** copies the file byte for byte into the
+  destination through `document_create`'s own path (exclusive create, so a taken slug there is
+  refused), indexes it, and only then removes the original. A refusal at the destination leaves
+  the original untouched. The slug is unchanged, so `[[slug]]` links still resolve; the
+  `document_id` changes, because identity follows the path (§4.2). Under
+  `collections_from_directories` a new destination is created.
+
+Before either reads or deletes a file it makes every check `document_create` makes before it
+writes one: under `collections_from_directories` the name must be a real directory (not a link, a
+file or a case variant), and in either mode the path must be one the source walks. Removal retires
+the index entry under the file's path and, for a file whose sidecar manifest declares an identity,
+under that identity too. A move re-indexes its destination once the original is retired, so the
+wikilink middleware — which keeps a live document's slug rather than letting a newcomer take it —
+resolves the slug to the destination.
+
+Both are on the network surface beside `document_create`, and `document_delete` is not: it would
+let a socket caller remove any document in the workspace, a mailbox's included. The recovery path
+for a removed file is the one the corpus already has — its git history — not manicule.
 
 ---
 
@@ -642,6 +736,9 @@ file it came from is input from whoever could write it.
 - `tests/app/test_document_create.py` — surface parity across the three envelope adapters, identity
   stability under a retitle, the overwrite refusal naming the existing document, partial failure
   leaving the file and reporting `ok: false`, and containment for every shape of unsafe slug.
+- `tests/app/test_directory_collections.py` — §4.12 and §4.13: a collection created by its first
+  write, every refusal leaving neither a file nor a collection behind, the doctor findings, and
+  remove and move over the service, MCP and HTTP.
 - `tests/api/test_routes.py` — the network surface asserted as a set operation, and `ABSENT_TOOLS`
   explaining why authoring is not in it.
 - `tests/mcp/test_transports.py` — a socket serving configured authoring without authentication

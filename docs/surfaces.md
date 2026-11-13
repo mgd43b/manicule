@@ -272,7 +272,9 @@ server and the built command tree.
 | `index_changes` | — | `index --watch` | run counters |
 | `index_status` | ✓ | `index` | counts, fingerprints, and whether vector search is still exhaustive |
 | `stats` | ✓ | `index --stats` | counts, grouped three ways |
-| `document_create` | ✓ | `document create <collection> <slug>` | the file written, and whether the index has it |
+| `document_create` | ✓ | `document create <collection> <slug>` | the file written, whether the index has it, and whether its collection was created |
+| `document_remove` | ✓ | `document remove <collection> <slug>` | which of the file and the index entry were removed |
+| `document_move` | ✓ | `document move <slug> <from> <to>` | the destination write, and the original's removal |
 | `document_list` | ✓ | `document list` | a page of documents |
 | `document_get` | ✓ | `document get` | one document, optionally its chunks |
 | `document_resolve` | ✓ | `document resolve` | one document by page id, URI or document id, with its retained bytes |
@@ -988,6 +990,15 @@ that works, because `document_create` writes membership one document at a time. 
 reached the same directory by a sync joins nothing, and the only symptom is a collection-scoped
 search quietly returning less. The remedy names the `collection rule set` command that ends it.
 
+Under `authoring.collections_from_directories` the same check reads the source root's top-level
+directories instead of a list (`facts.mode` is `directories`; `list` otherwise) and nothing in it
+is `failing`: a directory with no collection yet is `degraded`, because the next
+`document_create` into it creates one and until then its synced documents join nothing; so is a
+directory whose collection does not select it, and a directory whose name cannot be a
+collection (one the workspace would spell differently, or one differing from another only by
+case). Hidden, excluded and non-directory entries are not collections and are not reported.
+`facts.excluded` is always empty in that mode.
+
 `connectors` is `ok` with no sources configured, and `ok` when every configured source is named
 after its own type. Otherwise it counts the documents filed under a connector *type* name while
 an instance of that type is configured under a different one — the identity change in
@@ -1371,10 +1382,14 @@ purged (a purged row stays in the index with its title until it is deleted this 
 scoped to the workspace in use, does not require the connector to still be configured, and prints
 how many rows it removed. Without `--yes` it deletes nothing and says so.
 
-**The exception is `document_create`, by name, in one frozenset.**
-`manicule.mcp.server.NETWORK_AUTHORING` holds it and nothing else, and the surface a socket
-carries is asserted as a set operation — the read-only set *plus* that constant — so a second
-write tool cannot drift in behind it. The transport still decides the surface: run manicule
+**The exception is authoring, by name, in one frozenset.**
+`manicule.mcp.server.NETWORK_AUTHORING` holds `document_create`, `document_remove` and
+`document_move` and nothing else, and the surface a socket carries is asserted as a set
+operation — the read-only set *plus* that constant — so another write tool cannot drift in behind
+them. The three are one authority: each is addressed by an authoring collection and a slug, so
+removing and moving reach only what creating could have written. `document_delete` is not among
+them, because it takes any document's id and on a socket would be the ability to empty the
+index of a mailbox as easily as of a memory corpus. The transport still decides the surface: run manicule
 locally and you get the local one, run it on a network and you get the network one, with no new
 mode and no flag.
 
@@ -1419,7 +1434,7 @@ of the two or fails a test.
 **The classification is the one already at the registrations** — the four hints of §4.1, decided
 from behavior and checked against it by `tests/mcp/test_annotations.py`. There is no second
 table of "tools a socket may carry": `NETWORK_AUTHORING` is not that table, because it names an
-exception rather than a membership rule, it holds one tool, and the equality asserting the whole
+exception rather than a membership rule, it holds authoring's three tools, and the equality asserting the whole
 surface is written out in `tests/api/test_routes.py` where both halves can be read together. There
 is still no setting that grants an exception — a structural guarantee traded for a configuration
 one is a guarantee that fails silently. The server also *says* so: the read-only surface's
@@ -1590,7 +1605,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | Group | Routes |
 |---|---|
 | health | `GET /healthz`, `GET /readyz`, `GET /api/v1/health`, `GET /api/v1/stats`, `GET /api/v1/workspaces` |
-| documents | `GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `DELETE /api/v1/documents/{id}`, `GET /api/v1/documents/trash`, `POST /api/v1/documents/{id}/restore`, `POST /api/v1/documents/{id}/reindex`, `GET /api/v1/search` |
+| documents | `GET /api/v1/documents`, `POST /api/v1/documents`, `POST /api/v1/documents/remove`, `POST /api/v1/documents/move`, `GET /api/v1/documents/{id}`, `DELETE /api/v1/documents/{id}`, `GET /api/v1/documents/trash`, `POST /api/v1/documents/{id}/restore`, `POST /api/v1/documents/{id}/reindex`, `GET /api/v1/search` |
 | chat | `POST /api/v1/chat`, `POST /api/v1/chat/stream`, `POST /api/v1/chat/research`, `POST /api/v1/chat/feedback` |
 | conversations | `GET`/`POST /api/v1/conversations`, `GET /api/v1/conversations/{id}/messages`, `PATCH`/`DELETE /api/v1/conversations/{id}`, `POST`/`DELETE /api/v1/conversations/{id}/share`, `GET /shared/{token}` |
 | collections | `GET`/`POST /api/v1/collections`, `PATCH`/`DELETE /api/v1/collections/{id}`, `POST /api/v1/collections/{id}/name`, `GET`/`PUT`/`DELETE /api/v1/collections/{id}/rule`, `GET /api/v1/collections/{id}/counts`, `GET /api/v1/collections/{id}/documents`, `POST`/`DELETE /api/v1/collections/{id}/documents/{docId}` |
@@ -1600,7 +1615,7 @@ above — except the twelfth, which is the MCP endpoint of §6.1 and speaks its 
 | auth | `GET /auth/providers`, `GET /auth/session`, `GET /auth/login/{provider}`, `GET /auth/callback/{provider}`, `POST /auth/logout`, `POST /auth/key`, `POST /auth/password`, `GET`/`POST /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{nameOrId}`, `POST /api/v1/auth/password`, `GET`/`POST /api/v1/auth/users`, `PATCH /api/v1/auth/users/{user}`, `PUT /api/v1/auth/users/{user}/password`, `POST /api/v1/auth/users/{user}/sign-out` |
 | workbench | `GET /api/v1/workbench?document_id=…` |
 | websocket chat | `WS /api/v1/chat/ws` |
-| mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create`. Authentication decides who may call that write, not whether it is carried |
+| mcp | `POST /mcp/` — the read-only tool surface of §6.1, plus `document_create`, `document_remove` and `document_move`. Authentication decides who may call those writes, not whether they are carried |
 
 Plus the embeddable widget: `GET /widget/widget.js` and a static page at `GET /widget`, and the
 browser surface at `/ui` — fifteen areas of server-rendered HTML over the same service, mounted on

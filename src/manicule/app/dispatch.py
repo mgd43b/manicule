@@ -19,6 +19,7 @@ from manicule.app.results import (
     UNSUCCESSFUL_RECONCILIATIONS,
     ConnectorReconciled,
     DocumentCreated,
+    DocumentMoved,
     Envelope,
     ErrorInfo,
     IngestReport,
@@ -185,7 +186,11 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
         payload = await call()
     except (ManiculeError, ValueError, OSError) as exc:
         return failed(op, workspace, error_info(exc))
-    reported = _self_reported_failure(op, payload) or _unsuccessful_reconciliation(payload)
+    reported = (
+        _unfinished_move(payload)
+        or _self_reported_failure(op, payload)
+        or _unsuccessful_reconciliation(payload)
+    )
     if reported is None:
         return succeeded(op, workspace, payload)
     # Retained for the payloads that carry work already done — counters an ingest committed,
@@ -194,10 +199,25 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
     # would offer a partial result there is no partial result of.
     retained = (
         payload
-        if isinstance(payload, IngestReport | DocumentCreated | ConnectorReconciled)
+        if isinstance(payload, IngestReport | DocumentCreated | DocumentMoved | ConnectorReconciled)
         else None
     )
     return failed(op, workspace, reported, payload=retained)
+
+
+def _unfinished_move(payload: Payload) -> ErrorInfo | None:
+    """A move that wrote its destination and could not remove the original, or ``None``.
+
+    Reported as a failure with the payload retained, for ``document_create``'s reason: the
+    destination path is on it, and the corpus now holds the document twice.
+    """
+    if not isinstance(payload, DocumentMoved) or payload.removed is not None:
+        return None
+    return ErrorInfo(
+        type="DocumentNotRemovedError",
+        message=payload.detail or f"{payload.moved.path} was written; the original was not removed",
+        hint="The document is in both collections. Remove the original with document_remove.",
+    )
 
 
 def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
@@ -213,7 +233,10 @@ def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
     "is what happened a failure" — and because keeping them together made a single function with
     one branch per operation, which is the shape that acquires a sixth branch nobody reads.
     """
-    if isinstance(payload, DocumentCreated) and not payload.indexed:
+    # A move's destination is an authored write, and reports the same way when it is not
+    # indexed: the file is there, the original is removed, and the path is on the payload.
+    created = payload.moved if isinstance(payload, DocumentMoved) else payload
+    if isinstance(created, DocumentCreated) and not created.indexed:
         # The file was written and the index did not take it. Reported as a failure **with the
         # payload retained**, because the path on it is the only way back to content the caller
         # has already handed over — and removing the file to make the envelope tidy would
@@ -222,8 +245,8 @@ def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
         return ErrorInfo(
             type="DocumentNotIndexedError",
             message=(
-                f"{payload.path} was written and could not be indexed"
-                + (f": {payload.detail}" if payload.detail else "")
+                f"{created.path} was written and could not be indexed"
+                + (f": {created.detail}" if created.detail else "")
             ),
             hint=(
                 "The file is on disk and is the record; it was not removed. Fix what the "

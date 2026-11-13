@@ -75,6 +75,8 @@ TICKETED: tuple[str, ...] = (
 MUTATIONS: tuple[str, ...] = (
     "index_path",
     "document_create",
+    "document_remove",
+    "document_move",
     "document_delete",
     "document_reindex",
     "connector_sync",

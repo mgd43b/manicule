@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### A new memory collection is its first write
+
+Adding a collection to an authored corpus used to take three things that had to agree: a
+directory beneath the authoring root, a collection with a `--uri-prefix` rule naming it, and the
+name in `authoring.collections`. A new, opt-in setting replaces the list:
+
+```toml
+[authoring]
+source = "memories"
+collections_from_directories = true
+```
+
+Every top-level directory beneath the source's root is then a collection authoring may write
+into. `document_create` into a name that is neither a directory nor a collection yet creates the
+collection with a rule selecting its directory, in one store write, then writes and indexes the
+document; the result reports `collection_created: true`. It is a separate setting rather than
+`collections = "*"`, and setting it beside a non-empty `collections` is refused at startup.
+
+It is off by default because in this mode creating a collection *is* granting write access to it.
+What it still refuses, before anything is created: a hidden name (so `.git` takes no writes), a
+name the workspace would store spelled differently, a case variant of an existing directory, a
+name taken by a file or a symbolic link, a directory the source excludes, and an existing
+collection that is not already that directory (its directory does not exist and its rule does not
+select it). A write the disk refuses takes back the collection it made.
+
+`manicule doctor`'s `authoring` check reads the directories in this mode and reports
+`facts.mode` (`directories` or `list`, in either mode). A directory with no collection yet is
+`degraded` rather than `failing`, since the next write into it creates one. The explicit list
+stays the default and behaves as before.
+
+### Remove and move an authored document
+
+Two new operations, on MCP, HTTP and the command line, addressed the way `document_create` is (an
+authoring collection and a slug) and held to the same bounds:
+
+- **`document_remove`** (`manicule document remove <collection> <slug>`,
+  `POST /api/v1/documents/remove`) deletes the file beneath the authoring root and moves its index
+  entry to the trash. `document_delete` removes only the index entry, which the next sync of an
+  authored file put back.
+- **`document_move`** (`manicule document move <slug> <from> <to>`,
+  `POST /api/v1/documents/move`) copies the file byte for byte into the destination, indexes it,
+  then removes the original. A refusal at the destination leaves the original alone. The slug is
+  kept, so `[[slug]]` links still resolve; the `document_id` changes, because it follows the path.
+
+Both join `document_create` on the network MCP surface (`NETWORK_AUTHORING`).
+`document_delete` stays off it: it takes any document's id.
+
 ### The Outlook source reads a Microsoft 365 mailbox and calendar
 
 A `type = "outlook"` source syncs one Microsoft 365 mailbox and its calendar, read-only, through

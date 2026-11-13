@@ -118,12 +118,12 @@ def _cli(monkeypatch: pytest.MonkeyPatch, service: ApplicationService, argv: Seq
 # --- the surfaces offer what they say they offer ---------------------------------------------
 
 
-def test_the_server_offers_exactly_forty_seven_tools(service: ApplicationService) -> None:
-    """Forty-seven, named, and matching the declared surface."""
+def test_the_server_offers_exactly_forty_nine_tools(service: ApplicationService) -> None:
+    """Forty-nine, named, and matching the declared surface."""
     server = build_server(service)
     offered = sorted(tool.name for tool in asyncio.run(server.list_tools()))
     assert offered == sorted(TOOL_NAMES)
-    assert len(offered) == 47
+    assert len(offered) == 49
 
 
 def test_no_tool_moves_documents_out_of_the_corpus_wholesale() -> None:

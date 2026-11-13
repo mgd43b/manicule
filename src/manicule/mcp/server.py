@@ -136,16 +136,17 @@ heading path — copying long passages forward spends context on text you have a
 
 READ_ONLY_NOTICE = """\
 
-## This server is read-only, apart from `document_create`
+## This server is read-only, apart from authoring
 
-It is being served over a socket, so it offers the tools that read, plus that one.
+It is being served over a socket, so it offers the tools that read, plus the three that author:
+`document_create`, `document_remove` and `document_move`.
 Indexing a directory, deleting, syncing a source, writing configuration and enabling a plugin
 are **not** absent by accident and are not behind a permission you can be granted: they are not
 registered on this server at all.
 
-`document_create` is here because it is bounded where those are not: one document, in one of
-this installation's configured authoring collections, beneath one configured directory, at a
-path you do not choose. Everything its description says applies unchanged here.
+They are here because they are bounded where those are not: one document, in this
+installation's authoring collections, beneath one configured directory, at a path you do not
+choose. Everything their descriptions say applies unchanged here.
 
 The rest are reachable where a person is present — `manicule <command>` at a terminal, or an
 MCP client that launches `manicule serve` over stdio. If a task needs one, say which command it
@@ -215,6 +216,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "search",
     "index_path",
     "document_create",
+    "document_remove",
+    "document_move",
     "document_list",
     "document_get",
     "document_resolve",
@@ -269,10 +272,17 @@ the tools a socket may carry: that set is *derived* from each registration's ``r
 """
 
 
-NETWORK_AUTHORING: frozenset[str] = frozenset({"document_create"})
+NETWORK_AUTHORING: frozenset[str] = frozenset(
+    {
+        "document_create",
+        "document_remove",
+        "document_move",
+    }
+)
 """The tools a socket carries **in addition to** every tool that reports itself read-only.
 
-One name, and the set operation is the point: the network surface is
+Three names — authoring's write, its inverse, and the two composed — and the set operation is
+the point: the network surface is
 ``{tool for tool in TOOL_NAMES if reads} | NETWORK_AUTHORING`` and nothing else, so a mutating
 tool added tomorrow is absent unless somebody puts it here on purpose.
 ``tests/api/test_routes.py`` asserts exactly that equality, which is what stops a second write
@@ -285,6 +295,12 @@ running from, ``plugin_add`` enables code with this process's full authority. Au
 **one document, to one workspace, in one configured collection, beneath one connector's root,
 at a path the caller never supplies** — bounded authority rather than unbounded, and bounded by
 configuration an operator set rather than by an argument a caller sends.
+
+**Removing and moving are held to the same bound, which is why they are here and
+``document_delete`` is not.** ``document_remove`` and ``document_move`` are addressed by an
+authoring collection and a slug, exactly as ``document_create`` is, so they reach only what
+authoring could have written. ``document_delete`` takes any document's id — a mailbox's, a
+Confluence space's — and on a socket it would be the ability to empty the index.
 
 **And why a socket may carry it at all.** The gate is one layer up:
 :func:`~manicule.app.bind.resolve_bind` refuses a non-loopback bind unless an operator named a
@@ -962,9 +978,9 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
 
     # --- documents ------------------------------------------------------------------------
 
-    # Not read-only, and **on the network surface anyway** — the one tool that is. See
-    # `NETWORK_AUTHORING`, which is where that decision is written down and where the test
-    # asserting it as a set operation reads it from.
+    # Not read-only, and **on the network surface anyway**, as are `document_remove` and
+    # `document_move` below. See `NETWORK_AUTHORING`, which is where that decision is written
+    # down and where the test asserting it as a set operation reads it from.
     #
     # `removes`, because `overwrite` replaces a document whose previous content the call does
     # not carry — `collection_update`'s reason exactly. `repeatable`, because the same slug and
@@ -1017,8 +1033,10 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
 
         Args:
             collection: Which collection to author into, named as `collection_list` reports it.
-                Only collections this installation configures for authoring are accepted; any
-                other is refused rather than created.
+                Only collections this installation authors into are accepted. Where it treats
+                every directory of its corpus as a collection, a new name creates that
+                collection (the result says `collection_created`); otherwise a name it does not
+                configure is refused rather than created.
             slug: Identity and filename stem. One path component: no slashes, no `..`.
             body: The complete markdown document, front matter included.
             overwrite: Replace the document already holding this slug. Refused without it, and
@@ -1036,6 +1054,55 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             )
 
         return await dispatch("document_create", authored)
+
+    # `removes` and not `repeatable`: the second call finds nothing and refuses. Not
+    # `reaches_out`, for `document_create`'s reason.
+    @register.tool(hints(reads=False, removes=True, repeatable=False, reaches_out=False))
+    async def document_remove(collection: str, slug: str) -> dict[str, Any]:
+        """Remove a document `document_create` could have written: its file and its index entry.
+
+        Use this to retract a fact that is wrong or no longer true. Prefer revising it with
+        `document_create(overwrite=true)` when there is a corrected version to record instead.
+        The file is deleted from the corpus on disk and the index entry goes to the trash, so a
+        later sync does not bring it back. `document_delete` is different: it takes any
+        document's id and removes only the index entry.
+
+        Args:
+            collection: The authoring collection the document is in.
+            slug: The document's slug — its filename stem.
+        """
+
+        async def removed() -> Payload:
+            await require_network_member(service)
+            return await service.document_remove(collection=collection, slug=slug)
+
+        return await dispatch("document_remove", removed)
+
+    # `removes`, because the original is removed. Not `repeatable`: a second call finds no
+    # original and refuses.
+    @register.tool(hints(reads=False, removes=True, repeatable=False, reaches_out=False))
+    async def document_move(slug: str, from_collection: str, to_collection: str) -> dict[str, Any]:
+        """Move a document `document_create` wrote into another authoring collection.
+
+        The file is copied byte for byte into `to_collection`, indexed there, and only then
+        removed from `from_collection`, so a refusal at the destination (the slug is already
+        taken there) leaves the original where it was. The slug stays the same, so `[[slug]]`
+        links still resolve; the `document_id` changes, because it follows the file's path.
+        Where every directory of the corpus is a collection, a new `to_collection` is created.
+
+        Args:
+            slug: The document's slug — its filename stem.
+            from_collection: The authoring collection it is in now.
+            to_collection: The authoring collection to move it into.
+        """
+
+        async def moved() -> Payload:
+            await require_network_member(service)
+            return await service.document_move(
+                slug=slug, from_collection=from_collection, to_collection=to_collection
+            )
+
+        return await dispatch("document_move", moved)
 
     @register.tool(READS)
     async def document_list(
@@ -1471,6 +1538,8 @@ def build_surface(  # noqa: PLR0915 - flat registrations are the auditable autho
             search,
             index_path,
             document_create,
+            document_remove,
+            document_move,
             document_list,
             document_get,
             document_resolve,

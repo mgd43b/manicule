@@ -11,12 +11,13 @@ non-loopback bind needs a host somebody wrote down, an explicit opt-in the calle
 authentication switched on — or a second opt-in saying the operator accepts serving without it.
 Any one missing is a refusal.
 
-**And it carries the read-only tools, plus exactly one write.** Binding a socket removes the
+**And it carries the read-only tools, plus authoring's writes.** Binding a socket removes the
 property stdio had, so something has to replace it: :func:`~manicule.mcp.server.build_server` is
 asked for the read-only surface, which registers a tool only when its ``readOnlyHint`` is true or
-its name is in :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That set holds ``document_create``
-and nothing else, whatever the authentication mode — the credential decides *who may call* it
-(:func:`~manicule.mcp.server.require_network_member`), never whether the socket carries it. Every
+its name is in :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That set holds
+``document_create``, ``document_remove`` and ``document_move`` and nothing else, whatever the
+authentication mode — the credential decides *who may call* them
+(:func:`~manicule.mcp.server.require_network_member`), never whether the socket carries them. Every
 other write tool stays on stdio, on the command line, and on the control socket of #139 — every
 one of them a place where a person is present or a process is the writer. See
 :data:`NETWORK_SURFACE_IS_READ_ONLY`, and
@@ -63,10 +64,11 @@ guarding it — and a setting that could grant an exception would trade that for
 guarantee, which is a weaker one that fails silently.
 
 **What "read-only surface" means is decided at the registrations**, not here, and it now admits
-one named write: :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That was its own decision with
-its own threat model, written down where the registrar reads it — which is exactly the shape
-this constant's last paragraph asked for. This still says "there is no per-caller escape from
-the surface the transport implies", and that remains true of every other write tool.
+authoring's named writes: :data:`~manicule.mcp.server.NETWORK_AUTHORING`. That was its own
+decision with its own threat model, written down where the registrar reads it — which is
+exactly the shape this constant's last paragraph asked for. This still says "there is no
+per-caller escape from the surface the transport implies", and that remains true of every other
+write tool.
 
 It exists so the rule can be *read* at the one place a reader would look for it, and so
 ``tests/mcp/test_transports.py`` can name it.

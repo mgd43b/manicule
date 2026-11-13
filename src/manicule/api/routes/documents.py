@@ -31,7 +31,7 @@ from fastapi import APIRouter, Query, Response
 
 from manicule.api.context import Service
 from manicule.api.envelopes import respond
-from manicule.api.models import DocumentBody
+from manicule.api.models import DocumentBody, DocumentMoveBody, DocumentRemoveBody
 from manicule.api.security import MemberPrincipal, ViewerPrincipal, require
 from manicule.config.settings import Role
 
@@ -171,6 +171,49 @@ async def create_document(
             slug=body.slug,
             body=body.body,
             overwrite=body.overwrite,
+        ),
+    )
+
+
+@router.post(
+    "/documents/remove",
+    name="document_remove",
+    summary="Remove an authored document: its file and its index entry.",
+)
+async def remove_document(
+    service: Service, caller: MemberPrincipal, body: DocumentRemoveBody
+) -> Response:
+    """The inverse of ``POST /documents``, held to its bounds: a collection and a slug, no path.
+
+    A ``POST`` rather than a ``DELETE`` on a path, because the address is two names in a body,
+    as the create's is, and ``DELETE /documents/{document_id}`` already means the index-only
+    delete of any document by id.
+    """
+    del caller
+    return await respond(
+        "document_remove",
+        service,
+        lambda: service.document_remove(collection=body.collection, slug=body.slug),
+    )
+
+
+@router.post(
+    "/documents/move",
+    name="document_move",
+    summary="Move an authored document into another authoring collection.",
+)
+async def move_document(
+    service: Service, caller: MemberPrincipal, body: DocumentMoveBody
+) -> Response:
+    """Written into the destination first, then removed from the origin. The id changes."""
+    del caller
+    return await respond(
+        "document_move",
+        service,
+        lambda: service.document_move(
+            slug=body.slug,
+            from_collection=body.from_collection,
+            to_collection=body.to_collection,
         ),
     )
 

@@ -230,7 +230,7 @@ class Envelope(BaseModel):
     def one_outcome_shape(self) -> Self:
         """Hold the data/error invariant at every constructor, not only in the helpers.
 
-        **Two operations may fail and still carry data**, and they are enumerated rather than
+        **A few operations may fail and still carry data**, and they are enumerated rather than
         permitted in general. A failure with a payload beside it is a shape a consumer has to be
         told about — it reads ``ok`` first and then finds ``data`` populated — so it is worth
         exactly as much scrutiny as the success shape, and an operation that started retaining
@@ -248,6 +248,9 @@ class Envelope(BaseModel):
             return self
         if self.op == "document_create":
             self._retained_authoring()
+            return self
+        if self.op == "document_move":
+            self._retained_move()
             return self
         if self.op in {"connector_reconcile", "connector_reconcile_resolve"}:
             self._retained_reconciliation()
@@ -321,6 +324,30 @@ class Envelope(BaseModel):
             )
             raise ValueError(msg)
 
+    def _retained_move(self) -> None:
+        """A move that wrote its destination and did not finish keeps where the document is.
+
+        Two ways not to finish, each with the destination path on the error: the destination
+        was not indexed, or the original could not be removed.
+
+        Raises:
+            ValueError: The data is not a ``DocumentMoved`` that reports itself unfinished, or
+                the error does not name the destination path.
+        """
+        moved = DocumentMoved.model_validate(self.data)
+        if moved.moved.indexed and moved.removed is not None:
+            msg = (
+                "a failed document_move envelope may retain data only for a move whose "
+                "destination is not indexed or whose original was not removed"
+            )
+            raise ValueError(msg)
+        if moved.moved.path not in (self.error.message if self.error else ""):
+            msg = (
+                "a failed document_move envelope retains the destination path; the error beside "
+                "it must name the same path"
+            )
+            raise ValueError(msg)
+
     def as_json(self) -> dict[str, Any]:
         """The envelope as plain JSON-safe data.
 
@@ -342,13 +369,13 @@ def failed(
     workspace: str,
     error: ErrorInfo,
     *,
-    payload: IngestReport | DocumentCreated | ConnectorReconciled | None = None,
+    payload: IngestReport | DocumentCreated | DocumentMoved | ConnectorReconciled | None = None,
 ) -> Envelope:
     """Wrap a failure, retaining a partial result when the operation produced one.
 
-    Three payload types reach here, and each is an operation that did part of what was asked and
+    Four payload types reach here, and each is an operation that did part of what was asked and
     must say which part. An ingest run that has to be retried names its watermark; an authored
-    document that could not be indexed names the file it left on disk; a reconciliation the
+    or moved document that could not be indexed names the file it left on disk; a reconciliation the
     ceiling refused names how many documents it would have deleted. In every case the
     alternative — an error with no data — would leave a caller unable to find the work that
     was in fact done.
@@ -1152,6 +1179,14 @@ class DocumentCreated(Payload):
     overwritten: bool
     """Whether an existing document was replaced rather than a new one created."""
 
+    collection_created: bool = False
+    """Whether this write created its collection, under ``collections_from_directories``.
+
+    True for the first document in a directory that was not a collection yet: the collection
+    and its rule were made by this call. Always false for a configured list of collections,
+    which this operation never creates.
+    """
+
     chunks: int = Field(default=0, ge=0)
     detail: str = ""
     """Why this result is not the complete one, in the words of whatever declined.
@@ -1161,6 +1196,45 @@ class DocumentCreated(Payload):
     """
 
     elapsed_ms: int = Field(default=0, ge=0)
+
+
+class DocumentRemoved(Payload):
+    """One authored document removed: its file, and its index entry.
+
+    Two booleans because the two halves can each already be gone — a file deleted by hand and
+    not yet reconciled, or an entry a failed ingest never wrote — and the caller is told which
+    of them this call actually removed.
+    """
+
+    document_id: str
+    path: str
+    """The file's absolute path beneath the authoring source's root."""
+
+    slug: str
+    collection: str
+    source: str
+    file_removed: bool
+    """Whether this call deleted the file. False when it was already gone."""
+
+    index_removed: bool
+    """Whether this call moved a live index entry to the trash. False when there was none."""
+
+
+class DocumentMoved(Payload):
+    """An authored document written into another collection, and the original removed.
+
+    ``moved`` is the destination write, with the new ``document_id`` — identity follows the
+    path, so it differs from ``removed.document_id``. When the destination could not be indexed
+    the file is still written, the original still removed, and the envelope reports
+    ``ok: false`` with this payload attached, as ``document_create`` does.
+    """
+
+    moved: DocumentCreated
+    removed: DocumentRemoved | None
+    """The original's removal, or ``None`` when the destination was written and the original
+    could not be removed — reported as ``ok: false`` with this payload, and ``detail`` says why."""
+
+    detail: str = ""
 
 
 class DocumentReindexed(Payload):

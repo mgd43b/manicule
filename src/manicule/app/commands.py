@@ -372,6 +372,14 @@ BINDERS: Mapping[str, Binder] = {
         body=args.text("body"),
         overwrite=args.flag("overwrite"),
     ),
+    "document_remove": lambda service, args, report: service.document_remove(
+        collection=args.text("collection"), slug=args.text("slug")
+    ),
+    "document_move": lambda service, args, report: service.document_move(
+        slug=args.text("slug"),
+        from_collection=args.text("from_collection"),
+        to_collection=args.text("to_collection"),
+    ),
     "document_delete": lambda service, args, report: service.document_delete(
         args.text("document_id"), hard=args.flag("hard")
     ),

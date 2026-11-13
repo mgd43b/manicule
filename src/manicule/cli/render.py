@@ -495,6 +495,25 @@ def render_document_created(out: Console, payload: r.DocumentCreated) -> None:
         out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
 
 
+def render_document_removed(out: Console, payload: r.DocumentRemoved) -> None:
+    """Which halves this call removed; either may already have been gone."""
+    halves = [
+        *(["the file"] if payload.file_removed else []),
+        *(["the index entry, into the trash"] if payload.index_removed else []),
+    ]
+    out.print(f"removed {' and '.join(halves)} for [bold]{escape(payload.path)}[/bold]")
+    out.print(f"[dim]{payload.document_id} · {escape(payload.collection)}[/dim]")
+
+
+def render_document_moved(out: Console, payload: r.DocumentMoved) -> None:
+    """The destination first, as a create; then the original, as a removal."""
+    render_document_created(out, payload.moved)
+    if payload.removed is not None:
+        render_document_removed(out, payload.removed)
+    if payload.detail:
+        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
+
+
 def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:
     where = "the trash" if payload.mode == "soft" else "the index, permanently"
     out.print(f"removed [bold]{payload.document_id}[/bold] into {where}")
@@ -1888,6 +1907,8 @@ RENDERERS: Mapping[type[Payload], Callable[[Console, Payload], None]] = {
     r.DocumentDetail: lambda out, p: render_document(out, _as(r.DocumentDetail, p)),
     r.DocumentResolved: lambda out, p: render_document_resolved(out, _as(r.DocumentResolved, p)),
     r.DocumentCreated: lambda out, p: render_document_created(out, _as(r.DocumentCreated, p)),
+    r.DocumentRemoved: lambda out, p: render_document_removed(out, _as(r.DocumentRemoved, p)),
+    r.DocumentMoved: lambda out, p: render_document_moved(out, _as(r.DocumentMoved, p)),
     r.DocumentDeleted: lambda out, p: render_document_deleted(out, _as(r.DocumentDeleted, p)),
     r.SourceDocumentsDeleted: lambda out, p: render_source_documents_deleted(
         out, _as(r.SourceDocumentsDeleted, p)

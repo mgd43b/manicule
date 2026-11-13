@@ -532,6 +532,17 @@ manicule document create memory retry-policy -f fact.md   # or pipe the body on 
 Like every other write command, that one needs a running `manicule serve` — the server owns the
 data directory. Over MCP and HTTP it is a call like any other.
 
+**Or let every directory be a collection.** With `collections_from_directories = true` in place
+of the list, each top-level directory beneath the root is a collection, and writing into a new
+name creates the collection, its directory rule and the directory — adding a project is its first
+memory. It is off by default because it makes creating a collection the same act as granting
+write access to it; hidden, excluded and case-variant names, and existing collections made for
+something else, are still refused.
+
+`manicule document remove <collection> <slug>` deletes an authored document's file and its index
+entry, and `manicule document move <slug> <from> <to>` moves one between collections; both are
+MCP tools and HTTP routes beside `document_create`, with the same bounds.
+
 **It writes a markdown file into that source's root and then indexes that path**, returning only
 once the document is published and searchable — so an assistant that writes a memory and
 immediately searches for it finds it. The file stays the record. The corpus remains a directory
@@ -550,7 +561,7 @@ Four refusals are worth knowing before you call it:
 | | |
 |---|---|
 | **Unconfigured** | Both settings empty is the default, and means authoring is off. The tool is offered on every surface and refuses every call, naming the settings it needs. |
-| **An unlisted collection** | Refused even when the workspace has it — so creating a collection is not also the act of granting write access to it. |
+| **An unlisted collection** | Refused even when the workspace has it — so creating a collection is not also the act of granting write access to it. With `collections_from_directories`, a collection the workspace has that is not its directory is refused the same way. |
 | **A slug already taken** | Refused unless `overwrite` is passed, and the refusal names the document that holds it. A file nothing has indexed counts as holding it too. |
 | **A socket with no authentication** | Refuses to *start*, loopback included — so a corpus is never exposed by forgetting a setting. `manicule serve --no-authentication` waives it deliberately, for a network you own: the socket then serves authoring to anything that can route to it, and says so at startup naming the corpus. It waives no other refusal: team mode and a sensitive source (a Gmail mailbox) still refuse to serve without authentication. |
 

@@ -193,11 +193,11 @@ def require_authoring_authentication(
         f"`authoring.source` is {settings.authoring.source!r}, so document_create can write into "
         f"that corpus, and `security.auth.mode` is 'none', so anything that can reach the port "
         f"can call it — on loopback that is every process and every page on this machine. Set "
-        f"security.auth.mode to 'api_key' or 'oauth', or clear `authoring.source` and "
-        f"`authoring.collections` to serve this installation read-only. Pass "
+        f"security.auth.mode to 'api_key' or 'oauth', or clear `authoring.source` to serve "
+        f"this installation read-only. Pass "
         f"--no-authentication to serve it anyway on a network you own: the socket then carries "
-        f"document_create, and anything that can route to the port may call it. Authoring over "
-        f"stdio needs none of this: a pipe has no port."
+        f"document_create, document_remove and document_move, and anything that can route to "
+        f"the port may call them. Authoring over stdio needs none of this: a pipe has no port."
     )
     raise PolicyError(msg)
 

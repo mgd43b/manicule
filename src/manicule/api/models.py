@@ -107,6 +107,21 @@ class DocumentBody(Body):
     overwrite: bool = False
 
 
+class DocumentRemoveBody(Body):
+    """An authored document to remove, addressed as it was written: collection and slug."""
+
+    collection: str = Field(min_length=1, max_length=200)
+    slug: str = Field(min_length=1, max_length=200)
+
+
+class DocumentMoveBody(Body):
+    """An authored document to move from one authoring collection to another."""
+
+    slug: str = Field(min_length=1, max_length=200)
+    from_collection: str = Field(min_length=1, max_length=200)
+    to_collection: str = Field(min_length=1, max_length=200)
+
+
 class CollectionBody(Body):
     """A new collection."""
 
