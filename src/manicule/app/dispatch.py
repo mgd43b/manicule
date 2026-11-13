@@ -186,7 +186,11 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
         payload = await call()
     except (ManiculeError, ValueError, OSError) as exc:
         return failed(op, workspace, error_info(exc))
-    reported = _self_reported_failure(op, payload) or _unsuccessful_reconciliation(payload)
+    reported = (
+        _unfinished_move(payload)
+        or _self_reported_failure(op, payload)
+        or _unsuccessful_reconciliation(payload)
+    )
     if reported is None:
         return succeeded(op, workspace, payload)
     # Retained for the payloads that carry work already done — counters an ingest committed,
@@ -199,6 +203,21 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
         else None
     )
     return failed(op, workspace, reported, payload=retained)
+
+
+def _unfinished_move(payload: Payload) -> ErrorInfo | None:
+    """A move that wrote its destination and could not remove the original, or ``None``.
+
+    Reported as a failure with the payload retained, for ``document_create``'s reason: the
+    destination path is on it, and the corpus now holds the document twice.
+    """
+    if not isinstance(payload, DocumentMoved) or payload.removed is not None:
+        return None
+    return ErrorInfo(
+        type="DocumentNotRemovedError",
+        message=payload.detail or f"{payload.moved.path} was written; the original was not removed",
+        hint="The document is in both collections. Remove the original with document_remove.",
+    )
 
 
 def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:

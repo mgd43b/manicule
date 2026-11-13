@@ -230,7 +230,7 @@ class Envelope(BaseModel):
     def one_outcome_shape(self) -> Self:
         """Hold the data/error invariant at every constructor, not only in the helpers.
 
-        **Two operations may fail and still carry data**, and they are enumerated rather than
+        **A few operations may fail and still carry data**, and they are enumerated rather than
         permitted in general. A failure with a payload beside it is a shape a consumer has to be
         told about — it reads ``ok`` first and then finds ``data`` populated — so it is worth
         exactly as much scrutiny as the success shape, and an operation that started retaining
@@ -248,6 +248,9 @@ class Envelope(BaseModel):
             return self
         if self.op == "document_create":
             self._retained_authoring()
+            return self
+        if self.op == "document_move":
+            self._retained_move()
             return self
         if self.op in {"connector_reconcile", "connector_reconcile_resolve"}:
             self._retained_reconciliation()
@@ -318,6 +321,30 @@ class Envelope(BaseModel):
             msg = (
                 "a failed document_create envelope retains the path so a caller can find the "
                 "file that was kept; the error beside it must name the same path"
+            )
+            raise ValueError(msg)
+
+    def _retained_move(self) -> None:
+        """A move that wrote its destination and did not finish keeps where the document is.
+
+        Two ways not to finish, each with the destination path on the error: the destination
+        was not indexed, or the original could not be removed.
+
+        Raises:
+            ValueError: The data is not a ``DocumentMoved`` that reports itself unfinished, or
+                the error does not name the destination path.
+        """
+        moved = DocumentMoved.model_validate(self.data)
+        if moved.moved.indexed and moved.removed is not None:
+            msg = (
+                "a failed document_move envelope may retain data only for a move whose "
+                "destination is not indexed or whose original was not removed"
+            )
+            raise ValueError(msg)
+        if moved.moved.path not in (self.error.message if self.error else ""):
+            msg = (
+                "a failed document_move envelope retains the destination path; the error beside "
+                "it must name the same path"
             )
             raise ValueError(msg)
 
@@ -1203,7 +1230,11 @@ class DocumentMoved(Payload):
     """
 
     moved: DocumentCreated
-    removed: DocumentRemoved
+    removed: DocumentRemoved | None
+    """The original's removal, or ``None`` when the destination was written and the original
+    could not be removed — reported as ``ok: false`` with this payload, and ``detail`` says why."""
+
+    detail: str = ""
 
 
 class DocumentReindexed(Payload):

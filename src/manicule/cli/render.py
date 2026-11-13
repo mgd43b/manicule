@@ -508,7 +508,10 @@ def render_document_removed(out: Console, payload: r.DocumentRemoved) -> None:
 def render_document_moved(out: Console, payload: r.DocumentMoved) -> None:
     """The destination first, as a create; then the original, as a removal."""
     render_document_created(out, payload.moved)
-    render_document_removed(out, payload.removed)
+    if payload.removed is not None:
+        render_document_removed(out, payload.removed)
+    if payload.detail:
+        out.print(f"[yellow]{escape(payload.detail)}[/yellow]")
 
 
 def render_document_deleted(out: Console, payload: r.DocumentDeleted) -> None:

@@ -3515,7 +3515,9 @@ class ApplicationService:
         try:
             await asyncio.to_thread(_write_authored, target, content, replace=overwrite)
         except FileExistsError as exc:
-            await self._take_back(created, target.parent, directory_existed=directory_existed)
+            # Nothing is taken back here: the file that won the race is a document in this
+            # directory, so the collection this call made for it is the one it belongs in.
+            #
             # The exclusive create lost a race this process could not see: another process wrote
             # the slug between the conflict check and here. Reported as the same refusal the
             # check would have given, because it is the same fact arriving a moment later.
@@ -3788,7 +3790,9 @@ class ApplicationService:
                 _authored_path, connector, collection=from_collection, slug=slug
             )
             try:
-                content = await asyncio.to_thread(origin.read_text, encoding="utf-8")
+                # `newline=""` so line endings arrive as they are on disk; `_write_authored`
+                # translates none on the way out, so a CRLF file stays one.
+                content = await asyncio.to_thread(origin.read_text, encoding="utf-8", newline="")
             except FileNotFoundError as exc:
                 msg = (
                     f"no authored document {slug!r} in collection {from_collection!r}: {origin} "
@@ -3804,7 +3808,19 @@ class ApplicationService:
                 overwrite=False,
                 started=started,
             )
-            removed = await self._unauthor(authoring, collection=from_collection, slug=slug)
+            try:
+                removed = await self._unauthor(authoring, collection=from_collection, slug=slug)
+            except (ManiculeError, OSError, SQLAlchemyError) as exc:
+                # The destination is written and is the record now, so the caller is told where
+                # it is — and that the original is still there — rather than handed an error
+                # with no payload and a corpus holding the fact twice.
+                return r.DocumentMoved(
+                    moved=moved,
+                    removed=None,
+                    detail=f"{moved.path} was written and {origin} could not be removed "
+                    f"({type(exc).__name__}: {exc}). Both hold the document now; remove the "
+                    f"original with document_remove({from_collection!r}, {slug!r}).",
+                )
         return r.DocumentMoved(moved=moved, removed=removed)
 
     async def document_delete(self, document_id: str, *, hard: bool = False) -> r.DocumentDeleted:
@@ -5183,18 +5199,7 @@ class ApplicationService:
                 remedy="manicule config show",
             )
         if uncovered:
-            named = ", ".join(repr(name) for name in uncovered)
-            return r.Check(
-                name="authoring",
-                state="degraded",
-                detail=f"{named} holds its documents by hand rather than by rule, so a "
-                f"document that reaches its directory by sync rather than by "
-                f"`document_create` joins nothing and a collection-scoped search quietly "
-                f"returns less.",
-                facts=facts,
-                remedy=f"manicule collection rule set {shlex.quote(identifiers[uncovered[0]])} "
-                f"--uri-prefix {shlex.quote(str(connector.root / uncovered[0]))}",
-            )
+            return _uncovered_check(connector, uncovered, identifiers, facts)
         return r.Check(
             name="authoring",
             state="ok",
@@ -5283,18 +5288,7 @@ class ApplicationService:
                 f"--uri-prefix {shlex.quote(str(connector.root / missing[0]))}",
             )
         if uncovered:
-            named = ", ".join(repr(name) for name in uncovered)
-            return r.Check(
-                name="authoring",
-                state="degraded",
-                detail=f"{named} holds its documents by hand rather than by rule, so a "
-                f"document that reaches its directory by sync rather than by "
-                f"`document_create` joins nothing and a collection-scoped search quietly "
-                f"returns less.",
-                facts=facts,
-                remedy=f"manicule collection rule set {shlex.quote(identifiers[uncovered[0]])} "
-                f"--uri-prefix {shlex.quote(str(connector.root / uncovered[0]))}",
-            )
+            return _uncovered_check(connector, uncovered, identifiers, facts)
         if malformed:
             named = ", ".join(repr(name) for name in malformed)
             return r.Check(
@@ -11727,6 +11721,30 @@ def _directory_collection_state(connector: FilesystemConnector, name: str) -> bo
         )
         raise PolicyError(msg)
     return True
+
+
+def _uncovered_check(
+    connector: FilesystemConnector,
+    uncovered: Sequence[str],
+    identifiers: Mapping[str, str],
+    facts: dict[str, JsonValue],
+) -> r.Check:
+    """The ``degraded`` finding for collections whose rule does not select their directory.
+
+    Shared by both authoring modes, which report this state in the same words.
+    """
+    named = ", ".join(repr(name) for name in uncovered)
+    return r.Check(
+        name="authoring",
+        state="degraded",
+        detail=f"{named} holds its documents by hand rather than by rule, so a "
+        f"document that reaches its directory by sync rather than by "
+        f"`document_create` joins nothing and a collection-scoped search quietly "
+        f"returns less.",
+        facts=facts,
+        remedy=f"manicule collection rule set {shlex.quote(identifiers[uncovered[0]])} "
+        f"--uri-prefix {shlex.quote(str(connector.root / uncovered[0]))}",
+    )
 
 
 def _authoring_mode(authoring: AuthoringSettings) -> str:

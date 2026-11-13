@@ -477,6 +477,7 @@ async def test_move_writes_the_destination_and_removes_the_origin(root: Path) ->
     assert not (root / "inbox" / "fact.md").exists()
     assert moved.moved.collection_created is True
     assert moved.moved.document_id != original.document_id, "identity follows the path"
+    assert moved.removed is not None
     assert moved.removed.document_id == original.document_id
     assert backend.store.deleted == [(original.document_id, "soft")]
     kept = backend.organization_.collections[moved.moved.collection_id]
@@ -572,3 +573,60 @@ async def test_remove_and_move_are_routes_over_http(root: Path) -> None:
     assert moved.status_code == HTTPStatus.OK, moved.text
     assert removed.status_code == HTTPStatus.OK, removed.text
     assert written_under(root) == ["inbox", "kept", "kept/a.md"]
+
+
+async def test_move_keeps_crlf_line_endings(root: Path) -> None:
+    """Byte for byte, line endings included, so git sees a rename rather than a rewrite."""
+    (root / "inbox").mkdir()
+    (root / "inbox" / "fact.md").write_bytes(b"# Fact\r\n\r\nWritten on Windows.\r\n")
+    service, _ = await directory_service(root)
+
+    await service.document_move(slug="fact", from_collection="inbox", to_collection="kept")
+
+    assert (root / "kept" / "fact.md").read_bytes() == b"# Fact\r\n\r\nWritten on Windows.\r\n"
+
+
+async def test_a_move_that_cannot_remove_the_original_says_where_both_are(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ok: false`` with the destination on the payload, not an error with no data."""
+    service, _ = await directory_service(root)
+    await service.document_create(collection="inbox", slug="fact", body=BODY)
+
+    async def stuck(self: ApplicationService, *args: object, **kwargs: object) -> object:
+        del self, args, kwargs
+        raise PermissionError(13, "read-only file system")
+
+    monkeypatch.setattr(ApplicationService, "_unauthor", stuck)
+
+    result = await build_server(service).call_tool(
+        "document_move", {"slug": "fact", "from_collection": "inbox", "to_collection": "kept"}
+    )
+
+    envelope = dict(result.structured_content or {})
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "DocumentNotRemovedError"
+    assert envelope["data"]["moved"]["path"] == str(root / "kept" / "fact.md")
+    assert envelope["data"]["removed"] is None
+    assert (root / "inbox" / "fact.md").exists()
+    assert (root / "kept" / "fact.md").exists()
+
+
+async def test_losing_the_slug_race_keeps_the_collection_it_made(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file that won is a document in that directory, so its collection stays."""
+    service, backend = await directory_service(root)
+
+    def taken(target: Path, content: str, *, replace: bool) -> None:
+        del content, replace
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# The winner\n", encoding="utf-8")
+        raise FileExistsError(17, "exists", str(target))
+
+    monkeypatch.setattr("manicule.app.service._write_authored", taken)
+
+    with pytest.raises(PolicyError, match="created by something else"):
+        await service.document_create(collection="journal", slug="x", body=BODY)
+
+    assert collection_names(backend) == ["journal"]
