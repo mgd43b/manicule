@@ -32,7 +32,9 @@ import secrets
 import shlex
 import time
 import tomllib
+import unicodedata
 from base64 import b64encode
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -112,7 +114,7 @@ from manicule.core.errors import (
 from manicule.core.fingerprints import identity_differences
 from manicule.core.glossary import GlossaryEntry, QueryExpansion
 from manicule.core.ids import document_id as document_id_of
-from manicule.core.organization import directory_prefix
+from manicule.core.organization import CollectionRule, directory_prefix
 from manicule.core.readers import ReaderGroup, admits
 from manicule.core.rebuild import (
     RebuildLeaseConflictError,
@@ -176,7 +178,7 @@ if TYPE_CHECKING:
     from manicule.core.content import Chunk, Document
     from manicule.core.embedding import VectorChecksumBackfill, VectorChecksumCoverage
     from manicule.core.fingerprints import Fingerprint
-    from manicule.core.organization import Collection, CollectionRule, Tag, TrashEntry
+    from manicule.core.organization import Collection, Tag, TrashEntry
     from manicule.core.rebuild import RebuildCheckpoint, RebuildEstimate
     from manicule.core.retrieval import Confidence
     from manicule.embedding.artifacts import WeightsPlan
@@ -3337,7 +3339,9 @@ class ApplicationService:
             collection: The collection to author into, by name — the handle a person and an
                 assistant both have, where an id is a uuid nobody quotes. It must be one of
                 ``authoring.collections``, and it is also the directory beneath the root that
-                the file lands in.
+                the file lands in. Under ``authoring.collections_from_directories`` it is any
+                top-level directory beneath the root, and a name that is not one yet is
+                created — directory, collection and the rule joining them — by this write.
             slug: The document's identity and its filename stem. A single path segment.
             body: Complete markdown, front matter included.
             overwrite: Replace the document already holding this slug. Off by default: the
@@ -3349,17 +3353,23 @@ class ApplicationService:
 
         Returns:
             Where the file is, the identity it was indexed under, and whether the index has it.
-            A write that could not be indexed keeps the file and reports ``indexed: false``.
+            A write that could not be indexed keeps the file and reports ``indexed: false`` —
+            and keeps a collection this call created for it, since the file is in its directory.
 
         Raises:
             ConfigError: Authoring is not configured, or the configured source is not a usable
                 filesystem source.
             PolicyError: The collection is not one authoring may write into, or the slug is
-                already taken and ``overwrite`` was not asked for.
+                already taken and ``overwrite`` was not asked for. Under
+                ``collections_from_directories``, also: the name is taken beneath the root by
+                something that is not a directory, or in the workspace by a collection that is
+                not that directory.
             UnknownEntityError: The collection is configured for authoring and does not exist
                 in this workspace.
             ValueError: The slug is not a single safe path segment, or the body is empty or
-                opens a front-matter fence it never closes.
+                opens a front-matter fence it never closes. Under
+                ``collections_from_directories``, also a collection name that is hidden or that
+                the workspace would store spelled differently.
         """
         started = time.monotonic()
         authoring = self.settings.authoring
@@ -3367,11 +3377,14 @@ class ApplicationService:
             msg = (
                 "document authoring is not configured. Set `authoring.source` to a configured "
                 "filesystem connector instance and `authoring.collections` to the collections "
-                "it may write into; until both are set there is no root to write beneath and "
-                "no scope to write within, so the operation refuses rather than choosing one."
+                "it may write into, or `authoring.collections_from_directories` to let every "
+                "directory beneath its root be one; until both halves are set there is no root "
+                "to write beneath and no scope to write within, so the operation refuses rather "
+                "than choosing one."
             )
             raise ConfigError(msg)
-        if collection not in authoring.collections:
+        from_directories = authoring.collections_from_directories
+        if not from_directories and collection not in authoring.collections:
             permitted = ", ".join(repr(name) for name in authoring.collections)
             # Refused against the *configured* list rather than against the workspace's
             # collections, and the difference is the point: adding a collection to manicule must
@@ -3388,14 +3401,20 @@ class ApplicationService:
         # to the same rule. Operator-supplied rather than caller-supplied, which makes this
         # unlikely rather than impossible — and "unlikely" is not what a path check is for.
         _require_segment(collection, "collection name")
+        if from_directories:
+            _require_directory_collection_name(collection)
         content = _authored_markdown(
             body, slug=slug, local_evidence=frozenset(authoring.local_evidence)
         )
         await self._require_readable_source(authoring.source)
 
+        # Resolved here for a configured list, where a missing collection is a configuration
+        # fault to refuse before taking the lock. Under directory mode it is resolved inside the
+        # lock instead, because there the answer may be "create it", and two writers deciding
+        # that at once must not both act on it.
         store = await self._backend.organization()
-        found = await store.find_collection(collection)
-        if found is None:
+        found = None if from_directories else await store.find_collection(collection)
+        if found is None and not from_directories:
             msg = (
                 f"no collection {collection!r} in workspace {self.workspace!r}, though "
                 f"`authoring.collections` names it. Create it — `manicule collection create "
@@ -3423,7 +3442,7 @@ class ApplicationService:
         collection: str,
         slug: str,
         content: str,
-        found: Collection,
+        found: Collection | None,
         overwrite: bool,
         started: float,
     ) -> r.DocumentCreated:
@@ -3431,9 +3450,22 @@ class ApplicationService:
 
         Split out so the lock wraps exactly the check-write-index sequence and nothing else: the
         validation above it refuses bad arguments without waiting behind somebody else's embed.
+
+        ``found`` is ``None`` only under ``collections_from_directories``, where the collection
+        is resolved here — and created here when it does not exist, **after** every check that
+        could refuse and immediately before the write, so a refusal never leaves a collection
+        behind and a write that fails takes back the collection it would have gone into.
         """
         connector = await self._filesystem_source(authoring.source, require_profiles=False)
         _require_within_ceiling(content, connector, authoring.source)
+        directory_existed = True
+        if found is None:
+            directory_existed = await asyncio.to_thread(
+                _directory_collection_state, connector, collection
+            )
+            found = await self._directory_collection(
+                connector, collection, directory_existed=directory_existed
+            )
         # Through a thread because resolution is a syscall per segment, and **resolved** because
         # the identity below has to be the one ingestion will record: `index_path` resolves the
         # path it is given, so a target that differed by a symlinked segment would be written
@@ -3450,9 +3482,13 @@ class ApplicationService:
         if conflict is not None and not overwrite:
             raise PolicyError(conflict)
 
+        created: str | None = None
+        if found is None:
+            found, created = await self._create_directory_collection(connector, collection)
         try:
             await asyncio.to_thread(_write_authored, target, content, replace=overwrite)
         except FileExistsError as exc:
+            await self._take_back(created, target.parent, directory_existed=directory_existed)
             # The exclusive create lost a race this process could not see: another process wrote
             # the slug between the conflict check and here. Reported as the same refusal the
             # check would have given, because it is the same fact arriving a moment later.
@@ -3462,6 +3498,9 @@ class ApplicationService:
                 f"content that arrived after the check."
             )
             raise PolicyError(msg) from exc
+        except OSError:
+            await self._take_back(created, target.parent, directory_existed=directory_existed)
+            raise
 
         # **Everything after the write is inside this.** The file exists from here on, so the
         # contract is that a caller is told where it is whatever happens next — and `run_op`
@@ -3497,10 +3536,96 @@ class ApplicationService:
             indexed=indexed,
             member=member,
             overwritten=conflict is not None,
+            collection_created=created is not None,
             chunks=chunks,
             detail=detail,
             elapsed_ms=_millis(started),
         )
+
+    async def _directory_collection(
+        self, connector: FilesystemConnector, name: str, *, directory_existed: bool
+    ) -> Collection | None:
+        """The collection directory mode writes ``name`` into, or ``None`` when it is to be made.
+
+        **An existing collection is accepted only if it already is the directory**: its
+        directory exists beneath the root, or its rule selects that directory. Anything else is
+        a collection somebody made for another purpose — a Confluence space, a hand-curated
+        list — and directory mode creates collections; it does not take over one that is
+        something else. Accepting it on its name alone would make this "write into any
+        collection the workspace holds", which is the widening the configured list exists to
+        prevent.
+
+        Raises:
+            PolicyError: A collection of that name exists and is not that directory.
+        """
+        store = await self._backend.organization()
+        found = await store.find_collection(name)
+        if found is None:
+            return None
+        directory = connector.root / name
+        if directory_existed or _rule_selects(found, directory):
+            return found
+        msg = (
+            f"collection {name!r} already exists in workspace {self.workspace!r} and is not the "
+            f"directory {directory}: that directory does not exist and the collection's rule "
+            f"does not select it. `authoring.collections_from_directories` creates collections "
+            f"for directories; it does not take over a collection made for something else. "
+            f"Author into another name, or make this collection the directory with "
+            f"`manicule collection rule set {shlex.quote(found.id)} --uri-prefix "
+            f"{shlex.quote(str(directory))}`."
+        )
+        raise PolicyError(msg)
+
+    async def _create_directory_collection(
+        self, connector: FilesystemConnector, name: str
+    ) -> tuple[Collection, str | None]:
+        """Create the collection for a directory, and its rule with it, in one store write.
+
+        One write, so there is never a moment when the collection exists without the rule that
+        makes it the directory — the half-made state ``doctor`` would otherwise have to report.
+        Returns the collection and its id when this call made it, or ``None`` in second place
+        when another writer made it first; that one is then held to the same test as any
+        existing collection.
+        """
+        directory = connector.root / name
+        rule = CollectionRule(uri_prefixes=frozenset({directory_prefix(str(directory))}))
+        store = await self._backend.organization()
+        try:
+            await self.collection_create(name, rule=rule)
+        except NameInUseError:
+            # Another process created it between the lookup and here. Not this call's to make,
+            # so it is not this call's to take back if the write fails.
+            existing = await self._directory_collection(
+                connector, name, directory_existed=await asyncio.to_thread(directory.is_dir)
+            )
+            if existing is None:  # deleted again in between; nothing sensible left to do
+                raise
+            return existing, None
+        made = await store.find_collection(name)
+        if made is None:  # pragma: no cover - the store just reported creating it
+            msg = f"collection {name!r} was created and could not be read back"
+            raise UnknownEntityError(msg)
+        return made, made.id
+
+    async def _take_back(
+        self, created: str | None, directory: Path, *, directory_existed: bool
+    ) -> None:
+        """Undo what a directory-mode write made for a document that was never written.
+
+        The collection this call created, and the directory if the write made it and left it
+        empty. Best effort: the write's own failure is what the caller needs to see, so a
+        failure here is logged rather than raised over it.
+        """
+        if created is not None:
+            try:
+                await self.collection_delete(created)
+            except (ManiculeError, SQLAlchemyError) as exc:
+                _log.warning(
+                    "could not remove collection %s after a failed write: %s", created, exc
+                )
+        if not directory_existed:
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(directory.rmdir)
 
     async def _authored_conflict(self, target: Path, document_id: str) -> str | None:
         """Why writing to this path would replace something, or ``None`` when it would not.
@@ -4729,7 +4854,7 @@ class ApplicationService:
             remedy=f"chmod 0700 {where}",
         )
 
-    async def _authoring_check(  # noqa: PLR0911 - each return is a different finding
+    async def _authoring_check(  # noqa: PLR0911, PLR0912 - each return is a different finding
         self,
     ) -> r.Check:
         """Whether every collection authoring writes into also *selects* what lands in it.
@@ -4767,9 +4892,10 @@ class ApplicationService:
             return r.Check(
                 name="authoring",
                 state="ok",
-                detail="authoring is off; `authoring.source` and `authoring.collections` are "
-                "not both set",
+                detail="authoring is off; `authoring.source` and `authoring.collections` (or "
+                "`authoring.collections_from_directories`) are not both set",
                 facts={
+                    "mode": _authoring_mode(authoring),
                     "collections": [],
                     "malformed": [],
                     "missing": [],
@@ -4787,6 +4913,7 @@ class ApplicationService:
                 f"as a filesystem source: {exc}",
                 facts={
                     "source": authoring.source,
+                    "mode": _authoring_mode(authoring),
                     "collections": list(authoring.collections),
                     "malformed": [],
                     "missing": [],
@@ -4795,6 +4922,8 @@ class ApplicationService:
                 },
                 remedy="manicule config show",
             )
+        if authoring.collections_from_directories:
+            return await self._directory_authoring_check(connector)
         # `find_collection` rather than a dict over `list_collections`, so the name resolves
         # through the same normalization `document_create` resolves through. A check that
         # matched names its own way could report a collection missing that authoring finds.
@@ -4840,11 +4969,7 @@ class ApplicationService:
                 if connector.excludes(connector.root / name):
                     excluded.append(name)
                     continue
-                wanted = directory_prefix(str(connector.root / name))
-                rule = found.rule
-                if rule is None or not any(
-                    wanted.startswith(prefix) for prefix in rule.uri_prefixes
-                ):
+                if not _rule_selects(found, connector.root / name):
                     uncovered.append(name)
         except (ManiculeError, SQLAlchemyError, OSError) as exc:
             return r.Check(
@@ -4860,6 +4985,7 @@ class ApplicationService:
             )
         facts: dict[str, JsonValue] = {
             "source": authoring.source,
+            "mode": "list",
             "root": str(connector.root),
             "collections": list(authoring.collections),
             "malformed": list(malformed),
@@ -4920,6 +5046,117 @@ class ApplicationService:
             state="ok",
             detail=f"every collection under {connector.root} selects its own directory, so a "
             f"document joins it however it arrives",
+            facts=facts,
+        )
+
+    async def _directory_authoring_check(self, connector: FilesystemConnector) -> r.Check:
+        """:meth:`_authoring_check` under ``authoring.collections_from_directories``.
+
+        The collections are the root's top-level directories, so they are read from the disk
+        rather than from configuration — one level, skipping what the source would not walk
+        (hidden, excluded) and what is not a directory. The same facts are reported under the
+        same names, with ``excluded`` always empty because an excluded directory is simply not
+        one of the collections.
+
+        **Nothing here is ``failing``, and that is the difference the mode makes.** A directory
+        with no collection is the state the next ``document_create`` into it repairs, and a
+        directory whose collection does not select it still accepts writes. What is true of both
+        is that a document reaching that directory by sync joins nothing, which is the
+        ``degraded`` reading the list mode gives an uncovered collection. A directory whose
+        name cannot be a collection — hidden names aside, one the workspace would spell
+        differently, or one differing from another only by case — is ``degraded`` too: its
+        documents are indexed and in no collection, and authoring into it refuses.
+        """
+        authoring = self.settings.authoring
+        malformed: list[str] = []
+        missing: list[str] = []
+        uncovered: list[str] = []
+        identifiers: dict[str, str] = {}
+        names: list[str] = []
+        try:
+            names = await asyncio.to_thread(_collection_directories, connector)
+            folded = Counter(name.casefold() for name in names)
+            store = await self._backend.organization()
+            for name in names:
+                try:
+                    _require_directory_collection_name(name)
+                except ValueError:
+                    malformed.append(name)
+                    continue
+                if folded[name.casefold()] > 1:
+                    malformed.append(name)
+                    continue
+                found = await store.find_collection(name)
+                if found is None:
+                    missing.append(name)
+                    continue
+                identifiers[name] = found.id
+                if not _rule_selects(found, connector.root / name):
+                    uncovered.append(name)
+        except (ManiculeError, SQLAlchemyError, OSError) as exc:
+            return r.Check(
+                name="authoring",
+                state="unknown",
+                detail=f"authoring could not be checked: the directories beneath "
+                f"{connector.root} or the collections they are could not be read ({exc})",
+                facts={
+                    "source": authoring.source,
+                    "mode": "directories",
+                    "collections": list[JsonValue](names),
+                    "error_type": type(exc).__name__,
+                },
+            )
+        facts: dict[str, JsonValue] = {
+            "source": authoring.source,
+            "mode": "directories",
+            "root": str(connector.root),
+            "collections": list(names),
+            "malformed": list(malformed),
+            "missing": list(missing),
+            "excluded": [],
+            "uncovered": list(uncovered),
+        }
+        if missing:
+            named = ", ".join(repr(name) for name in missing)
+            return r.Check(
+                name="authoring",
+                state="degraded",
+                detail=f"{named} is a directory beneath {connector.root} with no collection yet. "
+                f"The next `document_create` into it creates one; until then a document that "
+                f"reaches it by sync joins nothing and a collection-scoped search cannot name it.",
+                facts=facts,
+                remedy=f"manicule collection create {shlex.quote(missing[0])} "
+                f"--uri-prefix {shlex.quote(str(connector.root / missing[0]))}",
+            )
+        if uncovered:
+            named = ", ".join(repr(name) for name in uncovered)
+            return r.Check(
+                name="authoring",
+                state="degraded",
+                detail=f"{named} holds its documents by hand rather than by rule, so a "
+                f"document that reaches its directory by sync rather than by "
+                f"`document_create` joins nothing and a collection-scoped search quietly "
+                f"returns less.",
+                facts=facts,
+                remedy=f"manicule collection rule set {shlex.quote(identifiers[uncovered[0]])} "
+                f"--uri-prefix {shlex.quote(str(connector.root / uncovered[0]))}",
+            )
+        if malformed:
+            named = ", ".join(repr(name) for name in malformed)
+            return r.Check(
+                name="authoring",
+                state="degraded",
+                detail=f"{named} is a directory beneath {connector.root} whose name cannot be a "
+                f"collection: the workspace would store it spelled differently, or another "
+                f"directory differs from it only by case. Its documents are indexed and in no "
+                f"collection, and authoring into it refuses. Rename the directory.",
+                facts=facts,
+            )
+        return r.Check(
+            name="authoring",
+            state="ok",
+            detail=f"every directory under {connector.root} is a collection that selects it, "
+            f"so a document joins its collection however it arrives",
             facts=facts,
         )
 
@@ -11252,6 +11489,126 @@ def _require_segment(value: str, what: str) -> None:
             f"so the file it names is not the file it reads as"
         )
         raise ValueError(msg)
+
+
+def _require_directory_collection_name(name: str) -> None:
+    """Refuse a name directory mode cannot make both a directory and the same collection.
+
+    Two rules on top of :func:`_require_segment`, each closing a way the directory and the
+    collection would stop being one thing.
+
+    **A hidden name is refused.** The filesystem source does not walk dot-directories, so a
+    document written under ``.git/`` or ``.trash/`` would be on disk and never indexed — and the
+    corpus this mode exists for is a git repository, whose ``.git`` is a top-level directory.
+
+    **A name the workspace would store spelled differently is refused.** Collection names are
+    stored NFKC-normalized with whitespace runs collapsed, and a directory name is not, so
+    a name in fullwidth letters would be collection ``memo`` over a directory spelled otherwise —
+    two names for what this mode promises is one.
+
+    Raises:
+        ValueError: Either rule is broken; the message says which.
+    """
+    if name.startswith("."):
+        msg = (
+            f"{name!r} is a hidden directory name, and the filesystem source does not walk "
+            f"hidden directories, so nothing written there would ever be indexed. Choose a "
+            f"collection name that does not start with '.'."
+        )
+        raise ValueError(msg)
+    if " ".join(unicodedata.normalize("NFKC", name).split()) != name:
+        msg = (
+            f"{name!r} is stored as a collection name in a different spelling (Unicode NFKC, "
+            f"single spaces), so its collection and its directory would not have the same name. "
+            f"Use the normalized spelling."
+        )
+        raise ValueError(msg)
+
+
+def _directory_collection_state(connector: FilesystemConnector, name: str) -> bool:
+    """Whether ``<root>/<name>`` is already a directory, refusing what cannot become one.
+
+    Blocking, and called through a thread. Refuses three things that occupy the name without
+    being a directory this mode can use:
+
+    * **a file**, which the write could not create a directory over;
+    * **a symbolic link**, which would make two names — or a name and somewhere else — one tree,
+      so that two collections select the same documents under different addresses;
+    * **a different case of the same name**, which on a case-insensitive filesystem (macOS by
+      default) *is* the same directory, so ``Notes`` and ``notes`` would be two collections over
+      one directory. Refused everywhere rather than only where it collides, because a corpus
+      written on one filesystem is cloned onto the other.
+
+    Raises:
+        PolicyError: The name is taken by something that is not its directory.
+    """
+    directory = connector.root / name
+    try:
+        entries = [entry.name for entry in connector.root.iterdir()]
+    except OSError as exc:
+        msg = f"cannot list {connector.root} to find collection directories: {exc}"
+        raise PolicyError(msg) from exc
+    variants = [entry for entry in entries if entry != name and entry.casefold() == name.casefold()]
+    if variants:
+        msg = (
+            f"{connector.root} already holds {variants[0]!r}, which differs from {name!r} only "
+            f"by case. On a case-insensitive filesystem the two are one directory, so they "
+            f"cannot be two collections. Author into {variants[0]!r}."
+        )
+        raise PolicyError(msg)
+    if name not in entries:
+        return False
+    if directory.is_symlink():
+        msg = (
+            f"{directory} is a symbolic link. A collection directory is a real directory beneath "
+            f"the root, so that each document has one address and one collection; author into "
+            f"another name, or replace the link with the directory it points at."
+        )
+        raise PolicyError(msg)
+    if not directory.is_dir():
+        msg = (
+            f"{directory} exists and is not a directory, so it cannot be collection {name!r}: a "
+            f"collection here is a directory beneath the root. Author into another name, or "
+            f"move that file."
+        )
+        raise PolicyError(msg)
+    return True
+
+
+def _authoring_mode(authoring: AuthoringSettings) -> str:
+    """``directories`` or ``list``: how the authorable collections are named, for ``doctor``."""
+    return "directories" if authoring.collections_from_directories else "list"
+
+
+def _collection_directories(connector: FilesystemConnector) -> list[str]:
+    """The root's top-level directories that directory-mode authoring treats as collections.
+
+    Blocking. One level, sorted, and only real directories the source would walk: hidden
+    entries, symbolic links, files and anything ``exclude`` covers are left out.
+
+    Raises:
+        OSError: The root cannot be listed.
+    """
+    return sorted(
+        entry.name
+        for entry in connector.root.iterdir()
+        if not entry.name.startswith(".")
+        and not entry.is_symlink()
+        and entry.is_dir()
+        and not connector.excludes(entry)
+    )
+
+
+def _rule_selects(collection: Collection, directory: Path) -> bool:
+    """Whether ``collection``'s rule selects every document beneath ``directory``.
+
+    **An ancestor counts.** A rule naming ``/corpus/`` does select what is under
+    ``/corpus/journals/``. Shared by ``doctor`` and by directory-mode authoring so that the two
+    never disagree about whether a collection is its directory.
+    """
+    wanted = directory_prefix(str(directory))
+    rule = collection.rule
+    return rule is not None and any(wanted.startswith(prefix) for prefix in rule.uri_prefixes)
 
 
 def _authored_markdown(body: str, *, slug: str, local_evidence: frozenset[str]) -> str:

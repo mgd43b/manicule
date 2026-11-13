@@ -1,0 +1,398 @@
+"""Authoring with ``authoring.collections_from_directories``: a collection is its first write.
+
+In this mode the authorable collections are the authoring source root's top-level directories,
+and ``document_create`` into a name that is not one yet creates the directory, the collection
+and the rule joining them. Most of what is asserted here is what that does **not** widen to:
+hidden directories, a name taken by a file or a link, a case variant, and a collection the
+workspace already holds for some other purpose. Every refusal asserts that nothing was written
+*and* that no collection was created, because a refusal that left a collection behind would be
+the half-made state this mode exists to remove.
+
+The filesystem is real and the ingest is faked, for the reason ``test_document_create`` gives.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
+from pydantic import JsonValue, ValidationError
+
+from manicule.app.service import ApplicationService
+from manicule.config.settings import (
+    AuthMode,
+    AuthoringSettings,
+    AuthSettings,
+    ConnectorSettings,
+    SecuritySettings,
+    Settings,
+)
+from manicule.core.errors import PolicyError
+from manicule.core.organization import CollectionRule, directory_prefix
+from manicule.mcp.server import build_server
+from tests.app.fakes import FakeBackend
+from tests.app.test_document_create import (
+    BODY,
+    SOURCE,
+    _authoring_check,  # pyright: ignore[reportPrivateUsage]
+    backend_for,
+    written_under,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+def directory_settings(root: Path, *, exclude: Sequence[str] = ()) -> Settings:
+    """One filesystem source, authored into by directory rather than by a list."""
+    options: dict[str, JsonValue] = {"root": str(root)}
+    if exclude:
+        options["exclude"] = list[JsonValue](exclude)
+    return Settings(
+        connectors={SOURCE: ConnectorSettings(type="filesystem", options=options)},
+        authoring=AuthoringSettings(source=SOURCE, collections_from_directories=True),
+        security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
+    )
+
+
+async def directory_service(
+    root: Path, *, existing: Sequence[str] = (), exclude: Sequence[str] = ()
+) -> tuple[ApplicationService, FakeBackend]:
+    backend = await backend_for(directory_settings(root, exclude=exclude), existing=existing)
+    return ApplicationService(backend), backend
+
+
+def collection_names(backend: FakeBackend) -> list[str]:
+    return sorted(item.name for item in backend.organization_.collections.values())
+
+
+@pytest.fixture
+def root(tmp_path: Path) -> Path:
+    made = tmp_path / "corpus"
+    made.mkdir()
+    return made
+
+
+# --- the setting -------------------------------------------------------------------------------
+
+
+def test_the_list_and_directory_mode_cannot_both_be_set() -> None:
+    """Two ways of naming one set; both at once is refused rather than one silently winning."""
+    with pytest.raises(ValidationError, match="collections_from_directories"):
+        AuthoringSettings(source=SOURCE, collections=("memory",), collections_from_directories=True)
+
+
+def test_directory_mode_alone_configures_authoring() -> None:
+    assert AuthoringSettings(source=SOURCE, collections_from_directories=True).configured
+    assert not AuthoringSettings(collections_from_directories=True).configured
+
+
+def test_directory_mode_is_off_by_default() -> None:
+    assert AuthoringSettings().collections_from_directories is False
+
+
+# --- the ordinary case -------------------------------------------------------------------------
+
+
+async def test_a_new_name_creates_the_directory_the_collection_and_its_rule(root: Path) -> None:
+    """The whole feature in one call: no config edit, no `collection create`, no `rule set`."""
+    service, backend = await directory_service(root)
+
+    created = await service.document_create(collection="journal", slug="first", body=BODY)
+
+    assert (root / "journal" / "first.md").read_text(encoding="utf-8") == BODY
+    assert created.collection_created is True
+    assert created.indexed is True
+    assert created.member is True
+    made = backend.organization_.collections[created.collection_id]
+    assert made.name == "journal"
+    assert made.rule == CollectionRule(
+        uri_prefixes=frozenset({directory_prefix(str(root / "journal"))})
+    )
+    assert backend.organization_.members[made.id] == [created.document_id]
+
+
+async def test_the_second_write_reuses_the_collection_the_first_made(root: Path) -> None:
+    service, backend = await directory_service(root)
+    first = await service.document_create(collection="journal", slug="first", body=BODY)
+
+    second = await service.document_create(collection="journal", slug="second", body=BODY)
+
+    assert second.collection_created is False
+    assert second.collection_id == first.collection_id
+    assert collection_names(backend) == ["journal"]
+
+
+async def test_a_directory_that_arrived_by_git_is_adopted(root: Path) -> None:
+    """A directory with documents and no collection yet gets its collection on the first write."""
+    (root / "notes").mkdir()
+    (root / "notes" / "old.md").write_text("# Old\n", encoding="utf-8")
+    service, backend = await directory_service(root)
+
+    created = await service.document_create(collection="notes", slug="new", body=BODY)
+
+    assert created.collection_created is True
+    assert collection_names(backend) == ["notes"]
+
+
+async def test_an_existing_collection_that_is_its_directory_is_written_into(root: Path) -> None:
+    """A collection made by hand the documented way — with its prefix — is the directory."""
+    service, backend = await directory_service(root, existing=())
+    await backend.organization_.create_collection(
+        "memory", rule=CollectionRule(uri_prefixes=frozenset({str(root / "memory")}))
+    )
+
+    created = await service.document_create(collection="memory", slug="fact", body=BODY)
+
+    assert created.collection_created is False
+    assert created.collection_id == "col-0"
+
+
+async def test_a_listed_collection_still_refuses_a_name_off_the_list(root: Path) -> None:
+    """The default is unchanged: list mode never creates a collection."""
+    settings = Settings(
+        connectors={SOURCE: ConnectorSettings(type="filesystem", options={"root": str(root)})},
+        authoring=AuthoringSettings(source=SOURCE, collections=("memory",)),
+        security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
+    )
+    backend = await backend_for(settings)
+
+    with pytest.raises(PolicyError, match=r"authoring\.collections"):
+        await ApplicationService(backend).document_create(collection="journal", slug="x", body=BODY)
+    assert collection_names(backend) == ["memory"]
+    assert written_under(root) == []
+
+
+# --- the bounds --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "match"),
+    [
+        ("..", "collection name"),
+        (".", "collection name"),
+        ("../escape", "separator"),
+        ("a/b", "separator"),
+        ("/absolute", "separator"),
+        ("back\\slash", "separator"),
+        ("", "collection name"),
+        (" padded", "normalization"),
+        (".git", "hidden"),
+        (".trash", "hidden"),
+        ("\uff4d\uff45\uff4d\uff4f", "different spelling"),
+        ("two  spaces", "different spelling"),
+    ],
+)
+async def test_a_name_that_cannot_be_a_directory_collection_is_refused(
+    root: Path, name: str, match: str
+) -> None:
+    service, backend = await directory_service(root)
+
+    with pytest.raises(ValueError, match=match):
+        await service.document_create(collection=name, slug="x", body=BODY)
+
+    assert written_under(root) == []
+    assert collection_names(backend) == []
+
+
+async def test_a_name_taken_by_a_file_is_refused(root: Path) -> None:
+    (root / "journal").write_text("not a directory\n", encoding="utf-8")
+    service, backend = await directory_service(root)
+
+    with pytest.raises(PolicyError, match="not a directory"):
+        await service.document_create(collection="journal", slug="x", body=BODY)
+
+    assert written_under(root) == ["journal"]
+    assert collection_names(backend) == []
+
+
+async def test_a_name_taken_by_a_symbolic_link_is_refused(root: Path, tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "journal").symlink_to(elsewhere, target_is_directory=True)
+    service, backend = await directory_service(root)
+
+    with pytest.raises(PolicyError, match="symbolic link"):
+        await service.document_create(collection="journal", slug="x", body=BODY)
+
+    assert list(elsewhere.iterdir()) == []
+    assert collection_names(backend) == []
+
+
+async def test_a_case_variant_of_an_existing_directory_is_refused(root: Path) -> None:
+    """``Notes`` and ``notes`` are one directory on a case-insensitive filesystem."""
+    (root / "Notes").mkdir()
+    service, backend = await directory_service(root)
+
+    with pytest.raises(PolicyError, match="only by case"):
+        await service.document_create(collection="notes", slug="x", body=BODY)
+
+    assert written_under(root) == ["Notes"]
+    assert collection_names(backend) == []
+
+
+async def test_a_collection_made_for_something_else_is_not_taken_over(root: Path) -> None:
+    """The directory-mode form of "creating a collection is not granting write access to it".
+
+    The workspace holds ``secrets`` — a Confluence space, a hand-curated list — with no directory
+    beneath the root and no rule selecting one. Accepting it by name would make this mode "write
+    into any collection the workspace holds".
+    """
+    service, backend = await directory_service(root, existing=("secrets",))
+
+    with pytest.raises(PolicyError, match="does not take over"):
+        await service.document_create(collection="secrets", slug="leak", body=BODY)
+
+    assert written_under(root) == []
+    assert backend.organization_.collections["col-0"].rule is None
+
+
+async def test_an_excluded_directory_is_refused_before_a_collection_is_made(root: Path) -> None:
+    service, backend = await directory_service(root, exclude=["private/**"])
+
+    with pytest.raises(PolicyError, match="exclude"):
+        await service.document_create(collection="private", slug="x", body=BODY)
+
+    assert written_under(root) == []
+    assert collection_names(backend) == []
+
+
+async def test_a_taken_slug_in_a_new_directory_makes_no_collection(root: Path) -> None:
+    """The conflict check refuses before the collection is created, not after."""
+    (root / "journal").mkdir()
+    (root / "journal" / "x.md").write_text("# Somebody else's\n", encoding="utf-8")
+    service, backend = await directory_service(root)
+
+    with pytest.raises(PolicyError, match="already exists"):
+        await service.document_create(collection="journal", slug="x", body=BODY)
+
+    assert collection_names(backend) == []
+
+
+async def test_a_write_that_fails_takes_back_what_it_made(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directory and collection are both undone when the file itself never landed."""
+    service, backend = await directory_service(root)
+
+    def refuses(target: Path, content: str, *, replace: bool) -> None:
+        del content, replace
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raise PermissionError(13, "read-only file system", str(target))
+
+    monkeypatch.setattr("manicule.app.service._write_authored", refuses)
+
+    with pytest.raises(PermissionError):
+        await service.document_create(collection="journal", slug="x", body=BODY)
+
+    assert written_under(root) == []
+    assert collection_names(backend) == []
+
+
+async def test_a_collection_created_by_another_writer_first_is_used(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cross-process race: the store refuses the duplicate and the write uses the winner."""
+    service, backend = await directory_service(root)
+    original = ApplicationService.collection_create
+    rule = CollectionRule(uri_prefixes=frozenset({directory_prefix(str(root / "journal"))}))
+
+    async def lost_the_race(self: ApplicationService, name: str, **kwargs: object) -> object:
+        await backend.organization_.create_collection(name, rule=rule)
+        return await original(self, name, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(ApplicationService, "collection_create", lost_the_race)
+
+    created = await service.document_create(collection="journal", slug="x", body=BODY)
+
+    assert created.collection_created is False
+    assert collection_names(backend) == ["journal"]
+    assert (root / "journal" / "x.md").exists()
+
+
+# --- over MCP ----------------------------------------------------------------------------------
+
+
+async def test_the_tool_creates_a_collection_and_says_so(root: Path) -> None:
+    service, backend = await directory_service(root)
+
+    result = await build_server(service).call_tool(
+        "document_create", {"collection": "journal", "slug": "x", "body": BODY}
+    )
+
+    envelope = dict(result.structured_content or {})
+    assert envelope["ok"] is True, envelope
+    assert envelope["data"]["collection_created"] is True
+    assert collection_names(backend) == ["journal"]
+
+
+# --- doctor ------------------------------------------------------------------------------------
+
+
+async def test_doctor_lists_the_directories_and_is_quiet_when_each_is_a_collection(
+    root: Path,
+) -> None:
+    service, _ = await directory_service(root)
+    await service.document_create(collection="journal", slug="x", body=BODY)
+    (root / ".git").mkdir()
+    (root / "README.md").write_text("# Corpus\n", encoding="utf-8")
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "ok"
+    assert check.facts["mode"] == "directories"
+    assert check.facts["collections"] == ["journal"], "hidden entries and files are not collections"
+
+
+async def test_doctor_reports_a_directory_with_no_collection_as_degraded(root: Path) -> None:
+    """Not ``failing``: the next write into it creates the collection."""
+    (root / "notes").mkdir()
+    service, _ = await directory_service(root)
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "degraded"
+    assert check.facts["missing"] == ["notes"]
+    assert check.remedy == f"manicule collection create notes --uri-prefix {root / 'notes'}"
+
+
+async def test_doctor_reports_a_directory_collection_without_its_rule(root: Path) -> None:
+    (root / "notes").mkdir()
+    service, _ = await directory_service(root, existing=("notes",))
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "degraded"
+    assert check.facts["uncovered"] == ["notes"]
+
+
+async def test_doctor_reports_directories_that_cannot_be_collections(root: Path) -> None:
+    """A directory whose name the workspace would spell differently, or a pair differing by case.
+
+    Their documents are indexed and in no collection, and authoring into them refuses.
+    """
+    fullwidth = "\uff4d\uff45\uff4d\uff4f"
+    (root / fullwidth).mkdir()
+    (root / "Notes").mkdir()
+    (root / "notes").mkdir(exist_ok=True)
+    # Three directories, or two where the filesystem folds case.
+    case_sensitive = len(list(root.iterdir())) == 3  # noqa: ASYNC240
+    service, _ = await directory_service(root, existing=("Notes", "notes"))
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "degraded"
+    expected = [fullwidth, "Notes", "notes"] if case_sensitive else [fullwidth]
+    assert sorted(check.facts["malformed"]) == sorted(expected)
+
+
+async def test_doctor_leaves_out_an_excluded_directory(root: Path) -> None:
+    (root / "private").mkdir()
+    service, _ = await directory_service(root, exclude=["private"])
+
+    check = _authoring_check(await service.doctor())
+
+    assert check.state == "ok"
+    assert check.facts["collections"] == []
+    assert check.facts["excluded"] == []

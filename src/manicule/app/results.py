@@ -1152,6 +1152,14 @@ class DocumentCreated(Payload):
     overwritten: bool
     """Whether an existing document was replaced rather than a new one created."""
 
+    collection_created: bool = False
+    """Whether this write created its collection, under ``collections_from_directories``.
+
+    True for the first document in a directory that was not a collection yet: the collection
+    and its rule were made by this call. Always false for a configured list of collections,
+    which this operation never creates.
+    """
+
     chunks: int = Field(default=0, ge=0)
     detail: str = ""
     """Why this result is not the complete one, in the words of whatever declined.

@@ -25,7 +25,15 @@ from typing import Any, Final, Literal, Self, cast, get_args, get_origin, overri
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     DotEnvSettingsSource,
@@ -1752,6 +1760,13 @@ class AuthoringSettings(Section):
     place text in front of future sessions. Bounded authority is the whole design: one
     workspace, one configured source, one of a named set of collections, at a path the caller
     never supplies.
+
+    **The set is named one of two ways, and an installation picks one.** ``collections`` lists
+    it; ``collections_from_directories`` says the set is the source root's top-level
+    directories, so a collection is added by writing into it. They are two settings rather than
+    a ``"*"`` inside the list because they are two policies, and a list that could also be a
+    wildcard would be a field every reader has to ask which of the two it holds. Both at once is
+    refused, so neither ever silently wins.
     """
 
     source: str = Field(
@@ -1770,7 +1785,20 @@ class AuthoringSettings(Section):
         "written. Each name is also the directory beneath the root that its documents land "
         "in, so it must be a single path segment — and the collection wants a "
         "``CollectionRule`` prefix saying so, or only the documents `document_create` wrote "
-        "are in it. `manicule doctor` reports a collection named here that has neither.",
+        "are in it. `manicule doctor` reports a collection named here that has neither. "
+        "Leave empty when ``collections_from_directories`` is on.",
+    )
+    collections_from_directories: bool = Field(
+        default=False,
+        description="Treat every top-level directory beneath the source's root as a "
+        "collection authoring may write into, instead of listing them in ``collections``. "
+        "``document_create`` into a name that is neither a directory nor a collection yet "
+        "creates both — the collection with a ``CollectionRule`` prefix selecting its "
+        "directory — and then writes the document, so adding a collection is the first write "
+        "into it. Off by default, because it makes creating a collection the same act as "
+        "granting write access to it. Still bounded: one path segment beneath one root, never a "
+        "hidden or excluded directory, and never an existing collection that is not already "
+        "that directory.",
     )
     local_evidence: tuple[str, ...] = Field(
         default=(),
@@ -1794,16 +1822,29 @@ class AuthoringSettings(Section):
             raise ValueError(msg)
         return value
 
+    @model_validator(mode="after")
+    def _one_way_to_name_the_collections(self) -> Self:
+        if self.collections and self.collections_from_directories:
+            msg = (
+                "authoring.collections and authoring.collections_from_directories are both set. "
+                "They are two ways of naming the collections authoring may write into — a list, "
+                "or every directory beneath the source's root — so set one and leave the other "
+                "empty, rather than have this guess which was meant."
+            )
+            raise ValueError(msg)
+        return self
+
     @property
     def configured(self) -> bool:
-        """Whether authoring has been switched on by naming both a source and a collection.
+        """Whether authoring has been switched on by naming a source and its collections.
 
-        Both, because either alone describes an operation that cannot run: a source with no
-        collection has nowhere to put a document that is not an unscoped pile, and collections
+        Both halves, because either alone describes an operation that cannot run: a source with
+        no collection has nowhere to put a document that is not an unscoped pile, and collections
         with no source have no root to be written beneath. Reporting "configured" for half of
-        it would move the refusal from the setting to the first call.
+        it would move the refusal from the setting to the first call. The collections half is
+        either the list or ``collections_from_directories``.
         """
-        return bool(self.source and self.collections)
+        return bool(self.source and (self.collections or self.collections_from_directories))
 
 
 # --- root ------------------------------------------------------------------------------------
