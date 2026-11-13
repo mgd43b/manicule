@@ -3592,7 +3592,7 @@ class ApplicationService:
         if found is None:
             return None
         directory = connector.root / name
-        if directory_existed or _rule_selects(found, directory):
+        if directory_existed or _rule_selects(found, directory, self.settings.authoring.source):
             return found
         msg = (
             f"collection {name!r} already exists in workspace {self.workspace!r} and is not the "
@@ -3620,7 +3620,7 @@ class ApplicationService:
         rule = CollectionRule(uri_prefixes=frozenset({directory_prefix(str(directory))}))
         store = await self._backend.organization()
         try:
-            await self.collection_create(name, rule=rule)
+            made = await store.create_collection(name, rule=rule)
         except NameInUseError:
             # Another process created it between the lookup and here. Not this call's to make,
             # so it is not this call's to take back if the write fails.
@@ -3630,10 +3630,16 @@ class ApplicationService:
             if existing is None:  # deleted again in between; nothing sensible left to do
                 raise
             return existing, None
-        made = await store.find_collection(name)
-        if made is None:  # pragma: no cover - the store just reported creating it
-            msg = f"collection {name!r} was created and could not be read back"
-            raise UnknownEntityError(msg)
+        # The audit write comes after the commit and can fail on its own. The id is held from
+        # the create itself rather than looked up by name — another writer may own the name by
+        # then — so the collection this call made is the one taken back.
+        try:
+            await self._audit(
+                "collection.created", details={"collection_id": made.id, "name": made.name}
+            )
+        except BaseException:
+            await self._take_back(made.id, directory, directory_existed=True)
+            raise
         return made, made.id
 
     async def _take_back(
@@ -3716,16 +3722,25 @@ class ApplicationService:
     ) -> r.DocumentRemoved:
         """The part of :meth:`document_remove` that runs under the authoring lock."""
         connector = await self._filesystem_source(authoring.source, require_profiles=False)
-        target = await asyncio.to_thread(
-            _authored_path, connector, collection=collection, slug=slug
-        )
+        target = await self._existing_authored_target(connector, authoring, collection, slug)
         identifier = document_id_of(self.workspace, authoring.source, str(target))
         store = await self._backend.documents()
-        stored = await self._visible(await store.get_document(identifier))
-        if stored is not None:
-            require_owns(self.workspace, stored)
+        # Every identity ingestion may have stored this file under: the path, and — for a file
+        # whose sidecar manifest declares one — the declared identity. Ingestion falls back to
+        # the path when two files declare the same identity, so both are asked rather than
+        # predicting which one won.
+        candidates = [identifier]
+        declared = await asyncio.to_thread(_declared_identity, target)
+        if declared:
+            candidates.append(document_id_of(self.workspace, authoring.source, declared))
+        live: list[str] = []
+        for candidate in candidates:
+            stored = await self._visible(await store.get_document(candidate))
+            if stored is not None:
+                require_owns(self.workspace, stored)
+                live.append(stored.id)
         on_disk = await asyncio.to_thread(target.is_file)
-        if stored is None and not on_disk:
+        if not live and not on_disk:
             msg = (
                 f"no authored document {slug!r} in collection {collection!r}: neither {target} "
                 f"nor a live document indexed from it exists in workspace {self.workspace!r}"
@@ -3733,17 +3748,44 @@ class ApplicationService:
             raise UnknownEntityError(msg)
         if on_disk:
             await asyncio.to_thread(target.unlink)
-        if stored is not None:
-            await store.soft_delete_document(identifier)
+        for document in live:
+            await store.soft_delete_document(document)
         return r.DocumentRemoved(
-            document_id=identifier,
+            document_id=live[0] if live else identifier,
             path=str(target),
             slug=slug,
             collection=collection,
             source=authoring.source,
             file_removed=on_disk,
-            index_removed=stored is not None,
+            index_removed=bool(live),
         )
+
+    async def _existing_authored_target(
+        self,
+        connector: FilesystemConnector,
+        authoring: AuthoringSettings,
+        collection: str,
+        slug: str,
+    ) -> Path:
+        """The path an existing authored document is at, held to creation's checks.
+
+        Removing and moving read and delete a file, so they get every non-mutating check
+        :meth:`document_create` makes before it writes one: under directory mode the name must be
+        a real directory (not a link, a file or a case variant), and in either mode the path must
+        be one the source walks. Without them a link inside the root would let a remove reach a
+        directory ``exclude`` keeps out, which creation would have refused.
+
+        Raises:
+            PolicyError: The name is not a usable directory, or the path is excluded.
+            ConfigError: The path resolves outside the root.
+        """
+        if authoring.collections_from_directories:
+            await asyncio.to_thread(_directory_collection_state, connector, collection)
+        target = await asyncio.to_thread(
+            _authored_path, connector, collection=collection, slug=slug
+        )
+        _require_not_excluded(target, connector, authoring.source)
+        return target
 
     async def document_move(
         self, *, slug: str, from_collection: str, to_collection: str
@@ -3786,8 +3828,8 @@ class ApplicationService:
         found = await self._listed_collection(authoring, to_collection)
         async with self._authoring:
             connector = await self._filesystem_source(authoring.source, require_profiles=False)
-            origin = await asyncio.to_thread(
-                _authored_path, connector, collection=from_collection, slug=slug
+            origin = await self._existing_authored_target(
+                connector, authoring, from_collection, slug
             )
             try:
                 # `newline=""` so line endings arrive as they are on disk; `_write_authored`
@@ -3821,7 +3863,23 @@ class ApplicationService:
                     f"({type(exc).__name__}: {exc}). Both hold the document now; remove the "
                     f"original with document_remove({from_collection!r}, {slug!r}).",
                 )
+            if moved.indexed:
+                await self._reclaim(Path(moved.path), authoring.source)
         return r.DocumentMoved(moved=moved, removed=removed)
+
+    async def _reclaim(self, path: Path, source: str) -> None:
+        """Re-run ingest over a moved document once its original is retired.
+
+        The destination was indexed while the original was still live, and a stage that resolves
+        a slug to one document — the wikilink middleware — keeps a live incumbent rather than
+        letting a newcomer take its slug. Run again now, the incumbent is gone, so the slug
+        resolves to the destination and the inbound links that stage repairs are written to it.
+        Best effort: the move is complete without it, so a failure is logged, not raised.
+        """
+        try:
+            await self.index_path(path, source=source, force=True)
+        except (ManiculeError, ValueError, OSError, SQLAlchemyError) as exc:
+            _log.warning("could not re-index %s after moving it: %s", path, exc)
 
     async def document_delete(self, document_id: str, *, hard: bool = False) -> r.DocumentDeleted:
         """Remove a document, into the trash by default.
@@ -5139,7 +5197,7 @@ class ApplicationService:
                 if connector.excludes(connector.root / name):
                     excluded.append(name)
                     continue
-                if not _rule_selects(found, connector.root / name):
+                if not _rule_selects(found, connector.root / name, authoring.source):
                     uncovered.append(name)
         except (ManiculeError, SQLAlchemyError, OSError) as exc:
             return r.Check(
@@ -5250,7 +5308,7 @@ class ApplicationService:
                     missing.append(name)
                     continue
                 identifiers[name] = found.id
-                if not _rule_selects(found, connector.root / name):
+                if not _rule_selects(found, connector.root / name, authoring.source):
                     uncovered.append(name)
         except (ManiculeError, SQLAlchemyError, OSError) as exc:
             return r.Check(
@@ -11657,11 +11715,20 @@ def _require_directory_collection_name(name: str) -> None:
     Raises:
         ValueError: Either rule is broken; the message says which.
     """
+    from manicule.connectors.filesystem import IGNORED_DIRECTORIES  # noqa: PLC0415 - connectors load lazily
+
     if name.startswith("."):
         msg = (
             f"{name!r} is a hidden directory name, and the filesystem source does not walk "
             f"hidden directories, so nothing written there would ever be indexed. Choose a "
             f"collection name that does not start with '.'."
+        )
+        raise ValueError(msg)
+    if name in IGNORED_DIRECTORIES:
+        msg = (
+            f"{name!r} is a directory the filesystem source never walks (a virtual environment, a "
+            f"dependency or build cache), so nothing written there would ever be indexed. "
+            f"Choose another collection name."
         )
         raise ValueError(msg)
     if " ".join(unicodedata.normalize("NFKC", name).split()) != name:
@@ -11761,26 +11828,41 @@ def _collection_directories(connector: FilesystemConnector) -> list[str]:
     Raises:
         OSError: The root cannot be listed.
     """
+    from manicule.connectors.filesystem import IGNORED_DIRECTORIES  # noqa: PLC0415 - connectors load lazily
+
     return sorted(
         entry.name
         for entry in connector.root.iterdir()
         if not entry.name.startswith(".")
+        and entry.name not in IGNORED_DIRECTORIES
         and not entry.is_symlink()
         and entry.is_dir()
         and not connector.excludes(entry)
     )
 
 
-def _rule_selects(collection: Collection, directory: Path) -> bool:
-    """Whether ``collection``'s rule selects every document beneath ``directory``.
+def _rule_selects(collection: Collection, directory: Path, source: str) -> bool:
+    """Whether ``collection``'s rule selects every document ``source`` holds beneath ``directory``.
 
     **An ancestor counts.** A rule naming ``/corpus/`` does select what is under
     ``/corpus/journals/``. Shared by ``doctor`` and by directory-mode authoring so that the two
     never disagree about whether a collection is its directory.
+
+    **A covering prefix is not enough on its own.** A rule ANDs its selectors, so one that also
+    names other sources, media types, tags or a date window selects only part of the directory —
+    and one naming another source selects none of it. Each must leave this source's documents in.
     """
     wanted = directory_prefix(str(directory))
     rule = collection.rule
-    return rule is not None and any(wanted.startswith(prefix) for prefix in rule.uri_prefixes)
+    if rule is None or not any(wanted.startswith(prefix) for prefix in rule.uri_prefixes):
+        return False
+    return (
+        (not rule.sources or source in rule.sources)
+        and not rule.media_types
+        and not rule.tag_ids
+        and rule.updated_after is None
+        and rule.updated_before is None
+    )
 
 
 def _authored_markdown(body: str, *, slug: str, local_evidence: frozenset[str]) -> str:
@@ -11909,6 +11991,13 @@ def _authored_path(connector: FilesystemConnector, *, collection: str, slug: str
     return target
 
 
+def _declared_identity(target: Path) -> str:
+    """The identity ``target``'s sidecar manifest declares, or ``""``. Blocking."""
+    from manicule.connectors import sidecar  # noqa: PLC0415 - only removal needs it
+
+    return sidecar.declared_identity(target) if target.is_file() else ""
+
+
 def _write_authored(target: Path, content: str, *, replace: bool) -> None:
     """Write the file, creating the collection's directory if it is the first document in it.
 
@@ -11930,8 +12019,19 @@ def _write_authored(target: Path, content: str, *, replace: bool) -> None:
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if replace else os.O_EXCL)
-    with os.fdopen(os.open(target, flags, 0o644), "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(content)
+    descriptor = os.open(target, flags, 0o644)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+    except BaseException:
+        # An exclusive create made this file, so a write or close that fails (a full disk) has
+        # left a partial one that is this call's and nothing else's. Removed, so the caller's
+        # take-back can remove the directory too and no truncated document is later indexed.
+        # A replacement is not undone: the bytes it truncated are already gone.
+        if not replace:
+            with contextlib.suppress(OSError):
+                target.unlink()
+        raise
 
 
 def _kept(target: Path, indexed: bool, member: bool, collection: str, exc: Exception) -> str:

@@ -13,16 +13,21 @@ The filesystem is real and the ingest is faked, for the reason ``test_document_c
 
 from __future__ import annotations
 
+import os
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import JsonValue, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from manicule.api.app import build_app
-from manicule.app.service import ApplicationService
+from manicule.app.service import (
+    ApplicationService,
+    _write_authored,  # pyright: ignore[reportPrivateUsage]
+)
 from manicule.config.settings import (
     AuthMode,
     AuthoringSettings,
@@ -34,10 +39,11 @@ from manicule.config.settings import (
 from manicule.core.errors import PolicyError, UnknownEntityError
 from manicule.core.organization import CollectionRule, directory_prefix
 from manicule.mcp.server import build_server
-from tests.app.fakes import FakeBackend
+from tests.app.fakes import FakeBackend, make_chunk, make_document
 from tests.app.test_document_create import (
     BODY,
     SOURCE,
+    IndexingIngestion,
     _authoring_check,  # pyright: ignore[reportPrivateUsage]
     backend_for,
     written_under,
@@ -298,14 +304,15 @@ async def test_a_collection_created_by_another_writer_first_is_used(
 ) -> None:
     """The cross-process race: the store refuses the duplicate and the write uses the winner."""
     service, backend = await directory_service(root)
-    original = ApplicationService.collection_create
+    store = backend.organization_
+    original = store.create_collection
     rule = CollectionRule(uri_prefixes=frozenset({directory_prefix(str(root / "journal"))}))
 
-    async def lost_the_race(self: ApplicationService, name: str, **kwargs: object) -> object:
-        await backend.organization_.create_collection(name, rule=rule)
-        return await original(self, name, **kwargs)  # pyright: ignore[reportArgumentType]
+    async def lost_the_race(name: str, **kwargs: Any) -> Any:
+        await original(name, rule=rule)  # the other writer, a moment earlier
+        return await original(name, **kwargs)
 
-    monkeypatch.setattr(ApplicationService, "collection_create", lost_the_race)
+    monkeypatch.setattr(store, "create_collection", lost_the_race)
 
     created = await service.document_create(collection="journal", slug="x", body=BODY)
 
@@ -630,3 +637,141 @@ async def test_losing_the_slug_race_keeps_the_collection_it_made(
         await service.document_create(collection="journal", slug="x", body=BODY)
 
     assert collection_names(backend) == ["journal"]
+
+
+# --- review: removal and move are held to creation's checks --------------------------------------
+
+
+async def test_remove_through_a_symlinked_directory_is_refused(root: Path, tmp_path: Path) -> None:
+    """A link inside the root must not let a remove reach what creation would refuse."""
+    private = root / "private"
+    private.mkdir()
+    (private / "x.md").write_text("# Excluded\n", encoding="utf-8")
+    (root / "journal").symlink_to(private, target_is_directory=True)
+    service, _ = await directory_service(root, exclude=["private/**"])
+
+    with pytest.raises(PolicyError, match="symbolic link"):
+        await service.document_remove(collection="journal", slug="x")
+    assert (private / "x.md").exists()
+
+
+async def test_remove_in_an_excluded_directory_is_refused(root: Path) -> None:
+    (root / "private").mkdir()
+    (root / "private" / "x.md").write_text("# Excluded\n", encoding="utf-8")
+    service, _ = await directory_service(root, exclude=["private/**"])
+
+    with pytest.raises(PolicyError, match="exclude"):
+        await service.document_remove(collection="private", slug="x")
+    assert (root / "private" / "x.md").exists()
+
+
+async def test_move_out_of_an_excluded_directory_is_refused(root: Path) -> None:
+    (root / "private").mkdir()
+    (root / "private" / "x.md").write_text("# Excluded\n", encoding="utf-8")
+    service, backend = await directory_service(root, exclude=["private/**"])
+
+    with pytest.raises(PolicyError, match="exclude"):
+        await service.document_move(slug="x", from_collection="private", to_collection="kept")
+    assert written_under(root) == ["private", "private/x.md"]
+    assert collection_names(backend) == []
+
+
+async def test_remove_retires_the_entry_a_sidecar_identity_was_stored_under(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ingestion keys a file whose manifest declares an identity on that identity, not the path."""
+    (root / "journal").mkdir()
+    (root / "journal" / "x.md").write_text("# Mirrored\n", encoding="utf-8")
+    service, backend = await directory_service(root)
+    mirrored = make_document("default", source=SOURCE, source_id="page-1", title="x")
+    backend.store.add(mirrored, make_chunk(mirrored))
+
+    def declares(target: Path) -> str:
+        del target
+        return "page-1"
+
+    monkeypatch.setattr("manicule.app.service._declared_identity", declares)
+
+    removed = await service.document_remove(collection="journal", slug="x")
+
+    assert removed.index_removed is True
+    assert removed.document_id == mirrored.id
+    assert backend.store.deleted == [(mirrored.id, "soft")]
+
+
+async def test_move_reindexes_the_destination_once_the_original_is_retired(root: Path) -> None:
+    """So a slug-resolving stage that kept the live original now resolves to the destination."""
+    service, backend = await directory_service(root)
+    await service.document_create(collection="inbox", slug="fact", body=BODY)
+    ingestion = backend.ingestion_
+    assert isinstance(ingestion, IndexingIngestion)
+    before = len(ingestion.paths)
+
+    await service.document_move(slug="fact", from_collection="inbox", to_collection="kept")
+
+    destination = root / "kept" / "fact.md"
+    assert ingestion.paths[before:] == [destination, destination]
+
+
+@pytest.mark.parametrize("name", ["venv", "node_modules", "__pycache__"])
+async def test_a_directory_the_walk_ignores_is_refused_and_not_reported(
+    root: Path, name: str
+) -> None:
+    (root / name).mkdir()
+    service, backend = await directory_service(root)
+
+    with pytest.raises(ValueError, match="never walks"):
+        await service.document_create(collection=name, slug="x", body=BODY)
+    assert collection_names(backend) == []
+    check = _authoring_check(await service.doctor())
+    assert check.facts["collections"] == []
+
+
+async def test_a_rule_narrowed_to_another_source_is_not_the_directory(root: Path) -> None:
+    """A covering prefix ANDed with another source selects nothing in this directory."""
+    service, backend = await directory_service(root, existing=())
+    await backend.organization_.create_collection(
+        "secrets",
+        rule=CollectionRule(
+            uri_prefixes=frozenset({str(root / "secrets")}), sources=frozenset({"confluence"})
+        ),
+    )
+
+    with pytest.raises(PolicyError, match="does not take over"):
+        await service.document_create(collection="secrets", slug="x", body=BODY)
+    assert written_under(root) == []
+
+
+async def test_a_failed_audit_takes_back_the_collection_it_made(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, backend = await directory_service(root)
+
+    async def unauditable(self: ApplicationService, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+        raise SQLAlchemyError("the audit log is locked")
+
+    monkeypatch.setattr(ApplicationService, "_audit", unauditable)
+
+    with pytest.raises(SQLAlchemyError):
+        await service.document_create(collection="journal", slug="x", body=BODY)
+    assert collection_names(backend) == []
+    assert written_under(root) == []
+
+
+def test_a_failed_exclusive_write_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk mid-write must not leave a truncated document behind."""
+    target = tmp_path / "journal" / "x.md"
+
+    def full(fd: int, mode: str, **kwargs: object) -> object:
+        del mode, kwargs
+        os.close(fd)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("manicule.app.service.os.fdopen", full)
+
+    with pytest.raises(OSError, match="No space"):
+        _write_authored(target, "# x\n", replace=False)
+    assert not target.exists()
