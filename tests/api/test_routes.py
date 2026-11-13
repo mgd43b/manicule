@@ -610,7 +610,8 @@ ABSENT_TOOLS: tuple[tuple[str, str], ...] = (
 )
 """Every mutating tool the network may not reach, named with what it would let a caller do.
 
-**``document_create`` is deliberately not in this list, and it is the only write that is not.**
+**Authoring's three tools — ``document_create``, ``document_remove`` and ``document_move`` — are
+deliberately not in this list, and they are the only writes that are not.**
 Every entry above is excluded for the *authority* it carries rather than for being a write:
 ``index_path`` walks any directory this process can read, ``config_set`` rewrites the
 configuration the server is running from, ``plugin_add`` enables code with this process's full
@@ -659,7 +660,7 @@ to catch a collapse, not to track the size of the surface.
 EVERYWHERE = "0.0.0.0"  # noqa: S104 - named once, so the literal is explained once
 
 AUTHENTICATED = {"security": {"auth": {"mode": "api_key"}}}
-"""Settings for a socket that carries its one write.
+"""Settings for a socket that carries its authoring writes.
 
 **Named because it is now a precondition rather than a detail.**
 ``manicule.mcp.server.network_authoring`` returns nothing when ``security.auth.mode`` is
@@ -687,7 +688,7 @@ async def _network_tools(
 
 
 async def _authenticated_socket() -> tuple[FakeBackend, dict[str, str]]:
-    """A backend whose socket carries its one write, and a viewer key that may list it.
+    """A backend whose socket carries its authoring writes, and a viewer key that may list them.
 
     A *viewer* deliberately: the surface a socket publishes is the same for every role — the
     mount's guard asks for a viewer because it carries the read surface — so listing as the
@@ -787,7 +788,7 @@ async def test_every_published_tool_reads_or_is_the_one_named_write() -> None:
         assert tool.annotations.read_only_hint is True, f"{name} is served on a socket and writes"
 
 
-async def test_the_network_surface_is_the_reads_plus_exactly_one_named_write() -> None:
+async def test_the_network_surface_is_the_reads_plus_exactly_the_authoring_writes() -> None:
     """Asserted as a set operation, so nothing else can drift onto a socket behind authoring.
 
     **This is the test that makes ``NETWORK_AUTHORING`` safe to have at all.** Every assertion
@@ -802,9 +803,9 @@ async def test_the_network_surface_is_the_reads_plus_exactly_one_named_write() -
     backend, credential = await _authenticated_socket()
     published = set(await _network_tools(backend, credential=credential))
     assert published == await _reads_on_the_whole_surface(backend) | NETWORK_AUTHORING
-    assert {"document_create"} == NETWORK_AUTHORING, (
-        "the network surface grew a second write tool. That is a decision with its own threat "
-        "model — see docs/surfaces.md — not a line to update until this passes."
+    assert {"document_create", "document_remove", "document_move"} == NETWORK_AUTHORING, (
+        "the network surface grew a write tool beyond authoring's three. That is a decision with "
+        "its own threat model — see docs/surfaces.md — not a line to update until this passes."
     )
 
 
@@ -1000,7 +1001,7 @@ async def test_the_instructions_tell_a_client_the_write_tools_are_not_here() -> 
     assert "read-only" in instructions, instructions
     assert "manicule serve" in instructions, instructions
     assert "document_create" in instructions, (
-        "the notice lists what a socket does not carry, and authoring is the one write it does. "
+        "the notice lists what a socket does not carry, and authoring is the write it does. "
         "A client told the server is read-only and not told about the exception will not call it."
     )
     assert "## Scope every question to a collection" in instructions, (

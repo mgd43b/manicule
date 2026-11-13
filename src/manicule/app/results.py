@@ -342,13 +342,13 @@ def failed(
     workspace: str,
     error: ErrorInfo,
     *,
-    payload: IngestReport | DocumentCreated | ConnectorReconciled | None = None,
+    payload: IngestReport | DocumentCreated | DocumentMoved | ConnectorReconciled | None = None,
 ) -> Envelope:
     """Wrap a failure, retaining a partial result when the operation produced one.
 
-    Three payload types reach here, and each is an operation that did part of what was asked and
+    Four payload types reach here, and each is an operation that did part of what was asked and
     must say which part. An ingest run that has to be retried names its watermark; an authored
-    document that could not be indexed names the file it left on disk; a reconciliation the
+    or moved document that could not be indexed names the file it left on disk; a reconciliation the
     ceiling refused names how many documents it would have deleted. In every case the
     alternative — an error with no data — would leave a caller unable to find the work that
     was in fact done.
@@ -1169,6 +1169,41 @@ class DocumentCreated(Payload):
     """
 
     elapsed_ms: int = Field(default=0, ge=0)
+
+
+class DocumentRemoved(Payload):
+    """One authored document removed: its file, and its index entry.
+
+    Two booleans because the two halves can each already be gone — a file deleted by hand and
+    not yet reconciled, or an entry a failed ingest never wrote — and the caller is told which
+    of them this call actually removed.
+    """
+
+    document_id: str
+    path: str
+    """The file's absolute path beneath the authoring source's root."""
+
+    slug: str
+    collection: str
+    source: str
+    file_removed: bool
+    """Whether this call deleted the file. False when it was already gone."""
+
+    index_removed: bool
+    """Whether this call moved a live index entry to the trash. False when there was none."""
+
+
+class DocumentMoved(Payload):
+    """An authored document written into another collection, and the original removed.
+
+    ``moved`` is the destination write, with the new ``document_id`` — identity follows the
+    path, so it differs from ``removed.document_id``. When the destination could not be indexed
+    the file is still written, the original still removed, and the envelope reports
+    ``ok: false`` with this payload attached, as ``document_create`` does.
+    """
+
+    moved: DocumentCreated
+    removed: DocumentRemoved
 
 
 class DocumentReindexed(Payload):

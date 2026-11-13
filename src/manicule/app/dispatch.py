@@ -19,6 +19,7 @@ from manicule.app.results import (
     UNSUCCESSFUL_RECONCILIATIONS,
     ConnectorReconciled,
     DocumentCreated,
+    DocumentMoved,
     Envelope,
     ErrorInfo,
     IngestReport,
@@ -194,7 +195,7 @@ async def run_op(op: str, workspace: str, call: Callable[[], Awaitable[Payload]]
     # would offer a partial result there is no partial result of.
     retained = (
         payload
-        if isinstance(payload, IngestReport | DocumentCreated | ConnectorReconciled)
+        if isinstance(payload, IngestReport | DocumentCreated | DocumentMoved | ConnectorReconciled)
         else None
     )
     return failed(op, workspace, reported, payload=retained)
@@ -213,7 +214,10 @@ def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
     "is what happened a failure" — and because keeping them together made a single function with
     one branch per operation, which is the shape that acquires a sixth branch nobody reads.
     """
-    if isinstance(payload, DocumentCreated) and not payload.indexed:
+    # A move's destination is an authored write, and reports the same way when it is not
+    # indexed: the file is there, the original is removed, and the path is on the payload.
+    created = payload.moved if isinstance(payload, DocumentMoved) else payload
+    if isinstance(created, DocumentCreated) and not created.indexed:
         # The file was written and the index did not take it. Reported as a failure **with the
         # payload retained**, because the path on it is the only way back to content the caller
         # has already handed over — and removing the file to make the envelope tidy would
@@ -222,8 +226,8 @@ def _self_reported_failure(op: str, payload: Payload) -> ErrorInfo | None:
         return ErrorInfo(
             type="DocumentNotIndexedError",
             message=(
-                f"{payload.path} was written and could not be indexed"
-                + (f": {payload.detail}" if payload.detail else "")
+                f"{created.path} was written and could not be indexed"
+                + (f": {created.detail}" if created.detail else "")
             ),
             hint=(
                 "The file is on disk and is the record; it was not removed. Fix what the "

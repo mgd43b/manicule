@@ -699,6 +699,8 @@ PAYLOADS: dict[str, type[Payload]] = {
     "document_get": r.DocumentDetail,
     "document_resolve": r.DocumentResolved,
     "document_create": r.DocumentCreated,
+    "document_remove": r.DocumentRemoved,
+    "document_move": r.DocumentMoved,
     "document_delete": r.DocumentDeleted,
     "document_delete_source": r.SourceDocumentsDeleted,
     "document_reindex": r.DocumentReindexed,
@@ -1350,6 +1352,34 @@ def document_resolve(
             max_age_s=max_age,
             content=not no_content,
         ),
+    )
+
+
+@document_app.command("remove")
+def document_remove(
+    collection: Annotated[str, typer.Argument(help="The authoring collection it is in.")],
+    slug: Annotated[str, typer.Argument(help="The document's slug, its filename stem.")],
+) -> None:
+    """Remove an authored document: its file in the corpus, and its index entry.
+
+    The inverse of `document create`, addressed the same way. `document delete` removes only
+    the index entry, which the next sync of an authored file puts back.
+    """
+    submit(Command("document_remove", {"collection": collection, "slug": slug}))
+
+
+@document_app.command("move")
+def document_move(
+    slug: Annotated[str, typer.Argument(help="The document's slug, its filename stem.")],
+    from_collection: Annotated[str, typer.Argument(help="The authoring collection it is in.")],
+    to_collection: Annotated[str, typer.Argument(help="The authoring collection to move it to.")],
+) -> None:
+    """Move an authored document into another collection. Its document id changes."""
+    submit(
+        Command(
+            "document_move",
+            {"slug": slug, "from_collection": from_collection, "to_collection": to_collection},
+        )
     )
 
 

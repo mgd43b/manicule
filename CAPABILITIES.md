@@ -147,7 +147,7 @@ so the mapping is noted where it is not obvious. The output shape is also a cont
   the member holds and clears their password, in one transaction); end every session a member holds without disabling
   them. `docs/surfaces.md` §9.2.1.
 
-## MCP tools — 48
+## MCP tools — 50
 
 Ticket: #8 — **built.** Forty-seven implemented tools over the same application service the command
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
@@ -189,6 +189,8 @@ argument raises its floor to **admin**, the floor `GET /api/v1/search?workspaces
 - [x] `connector_sync`
 - [x] `doctor`
 - [x] `document_create`
+- [x] `document_remove`
+- [x] `document_move`
 - [x] `document_delete`
 - [x] `document_get`
 - [x] `document_resolve`

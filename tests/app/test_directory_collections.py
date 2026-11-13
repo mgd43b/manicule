@@ -13,12 +13,15 @@ The filesystem is real and the ingest is faked, for the reason ``test_document_c
 
 from __future__ import annotations
 
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import JsonValue, ValidationError
 
+from manicule.api.app import build_app
 from manicule.app.service import ApplicationService
 from manicule.config.settings import (
     AuthMode,
@@ -28,7 +31,7 @@ from manicule.config.settings import (
     SecuritySettings,
     Settings,
 )
-from manicule.core.errors import PolicyError
+from manicule.core.errors import PolicyError, UnknownEntityError
 from manicule.core.organization import CollectionRule, directory_prefix
 from manicule.mcp.server import build_server
 from tests.app.fakes import FakeBackend
@@ -396,3 +399,176 @@ async def test_doctor_leaves_out_an_excluded_directory(root: Path) -> None:
     assert check.state == "ok"
     assert check.facts["collections"] == []
     assert check.facts["excluded"] == []
+
+
+# --- removing and moving an authored document --------------------------------------------------
+
+
+async def test_remove_deletes_the_file_and_trashes_the_index_entry(root: Path) -> None:
+    """Both halves, so the next sync has nothing to bring back."""
+    service, backend = await directory_service(root)
+    created = await service.document_create(collection="journal", slug="x", body=BODY)
+
+    removed = await service.document_remove(collection="journal", slug="x")
+
+    assert not (root / "journal" / "x.md").exists()
+    assert removed.document_id == created.document_id
+    assert removed.file_removed is True
+    assert removed.index_removed is True
+    assert backend.store.deleted == [(created.document_id, "soft")], (
+        "soft, as reconciliation would have done it"
+    )
+
+
+async def test_remove_of_a_slug_nothing_holds_is_refused(root: Path) -> None:
+    service, _ = await directory_service(root)
+
+    with pytest.raises(UnknownEntityError, match="no authored document"):
+        await service.document_remove(collection="journal", slug="nothing")
+
+
+async def test_remove_takes_a_file_the_index_never_had(root: Path) -> None:
+    """A write whose ingest failed, or a file committed by hand: the file still goes."""
+    (root / "journal").mkdir()
+    (root / "journal" / "x.md").write_text("# Stray\n", encoding="utf-8")
+    service, _ = await directory_service(root)
+
+    removed = await service.document_remove(collection="journal", slug="x")
+
+    assert (removed.file_removed, removed.index_removed) == (True, False)
+    assert written_under(root) == ["journal"]
+
+
+@pytest.mark.parametrize("slug", ["../escape", "a/b", "..", ""])
+async def test_remove_refuses_a_slug_that_is_not_one_path_component(
+    root: Path, tmp_path: Path, slug: str
+) -> None:
+    (tmp_path / "escape.md").write_text("# Outside\n", encoding="utf-8")
+    service, _ = await directory_service(root)
+
+    with pytest.raises(ValueError, match="slug"):
+        await service.document_remove(collection="journal", slug=slug)
+    assert (tmp_path / "escape.md").exists()
+
+
+async def test_remove_refuses_a_collection_off_the_configured_list(root: Path) -> None:
+    """In list mode the same scope as creating: an unlisted collection is not authoring's."""
+    settings = Settings(
+        connectors={SOURCE: ConnectorSettings(type="filesystem", options={"root": str(root)})},
+        authoring=AuthoringSettings(source=SOURCE, collections=("memory",)),
+        security=SecuritySettings(auth=AuthSettings(mode=AuthMode.API_KEY)),
+    )
+    (root / "secrets").mkdir()
+    (root / "secrets" / "x.md").write_text("# Not authoring's\n", encoding="utf-8")
+    service = ApplicationService(await backend_for(settings))
+
+    with pytest.raises(PolicyError, match=r"authoring\.collections"):
+        await service.document_remove(collection="secrets", slug="x")
+    assert (root / "secrets" / "x.md").exists()
+
+
+async def test_move_writes_the_destination_and_removes_the_origin(root: Path) -> None:
+    service, backend = await directory_service(root)
+    original = await service.document_create(collection="inbox", slug="fact", body=BODY)
+
+    moved = await service.document_move(slug="fact", from_collection="inbox", to_collection="kept")
+
+    assert (root / "kept" / "fact.md").read_text(encoding="utf-8") == BODY
+    assert not (root / "inbox" / "fact.md").exists()
+    assert moved.moved.collection_created is True
+    assert moved.moved.document_id != original.document_id, "identity follows the path"
+    assert moved.removed.document_id == original.document_id
+    assert backend.store.deleted == [(original.document_id, "soft")]
+    kept = backend.organization_.collections[moved.moved.collection_id]
+    assert backend.organization_.members[kept.id] == [moved.moved.document_id]
+
+
+async def test_move_copies_the_bytes_exactly(root: Path) -> None:
+    """A file written by hand is moved as it is, not re-rendered or re-validated."""
+    (root / "inbox").mkdir()
+    exact = "no trailing newline, no front matter"
+    (root / "inbox" / "fact.md").write_text(exact, encoding="utf-8")
+    service, _ = await directory_service(root)
+
+    await service.document_move(slug="fact", from_collection="inbox", to_collection="kept")
+
+    assert (root / "kept" / "fact.md").read_text(encoding="utf-8") == exact
+
+
+async def test_move_onto_a_taken_slug_leaves_the_original_alone(root: Path) -> None:
+    service, _ = await directory_service(root)
+    await service.document_create(collection="inbox", slug="fact", body=BODY)
+    await service.document_create(collection="kept", slug="fact", body="# Other\n")
+
+    with pytest.raises(PolicyError, match="already holds"):
+        await service.document_move(slug="fact", from_collection="inbox", to_collection="kept")
+
+    assert (root / "inbox" / "fact.md").read_text(encoding="utf-8") == BODY
+    assert (root / "kept" / "fact.md").read_text(encoding="utf-8") == "# Other\n"
+
+
+async def test_move_of_a_missing_document_is_refused_and_creates_nothing(root: Path) -> None:
+    service, backend = await directory_service(root)
+
+    with pytest.raises(UnknownEntityError, match="does not exist"):
+        await service.document_move(slug="fact", from_collection="inbox", to_collection="kept")
+
+    assert written_under(root) == []
+    assert collection_names(backend) == []
+
+
+async def test_move_into_the_same_collection_is_refused(root: Path) -> None:
+    service, _ = await directory_service(root)
+    with pytest.raises(ValueError, match="nowhere to move"):
+        await service.document_move(slug="fact", from_collection="inbox", to_collection="inbox")
+
+
+async def test_move_into_a_hidden_name_is_refused_before_anything_moves(root: Path) -> None:
+    service, _ = await directory_service(root)
+    await service.document_create(collection="inbox", slug="fact", body=BODY)
+
+    with pytest.raises(ValueError, match="hidden"):
+        await service.document_move(slug="fact", from_collection="inbox", to_collection=".git")
+
+    assert (root / "inbox" / "fact.md").exists()
+
+
+async def test_remove_and_move_are_tools_over_mcp(root: Path) -> None:
+    service, _ = await directory_service(root)
+    server = build_server(service)
+    await service.document_create(collection="inbox", slug="a", body=BODY)
+    await service.document_create(collection="inbox", slug="b", body=BODY)
+
+    moved = await server.call_tool(
+        "document_move", {"slug": "a", "from_collection": "inbox", "to_collection": "kept"}
+    )
+    removed = await server.call_tool("document_remove", {"collection": "inbox", "slug": "b"})
+
+    assert dict(moved.structured_content or {})["ok"] is True, moved.structured_content
+    assert dict(removed.structured_content or {})["ok"] is True, removed.structured_content
+    assert written_under(root) == ["inbox", "kept", "kept/a.md"]
+
+
+async def test_remove_and_move_are_routes_over_http(root: Path) -> None:
+    """Through the real application with a member's key, as ``POST /documents`` is."""
+    service, _ = await directory_service(root)
+    await service.document_create(collection="inbox", slug="a", body=BODY)
+    await service.document_create(collection="inbox", slug="b", body=BODY)
+    secret = (await service.api_key_create("member", role="member")).secret
+    headers = {"X-API-Key": secret}
+
+    with TestClient(build_app(service), client=("127.0.0.1", 41234)) as client:
+        moved = client.post(
+            "/api/v1/documents/move",
+            json={"slug": "a", "from_collection": "inbox", "to_collection": "kept"},
+            headers=headers,
+        )
+        removed = client.post(
+            "/api/v1/documents/remove",
+            json={"collection": "inbox", "slug": "b"},
+            headers=headers,
+        )
+
+    assert moved.status_code == HTTPStatus.OK, moved.text
+    assert removed.status_code == HTTPStatus.OK, removed.text
+    assert written_under(root) == ["inbox", "kept", "kept/a.md"]

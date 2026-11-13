@@ -296,6 +296,8 @@ WRITERS: frozenset[str] = frozenset(
         # reason. A reader that saw "it writes a file, not the index" and classified it the
         # other way would have an ingest running without the lock.
         "document_create",
+        "document_move",
+        "document_remove",
         "document_delete",
         "document_delete_source",
         "document_redetect_glossary",

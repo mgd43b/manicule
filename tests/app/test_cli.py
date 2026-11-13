@@ -2699,6 +2699,8 @@ MINIMAL: dict[str, list[str]] = {
     # command needs, run against a backend that will usually decline them.
     "document_create": ["document", "create", "memory", "retry-policy"],
     "document_delete": ["document", "delete", "doc-1"],
+    "document_move": ["document", "move", "retry-policy", "memory", "archive"],
+    "document_remove": ["document", "remove", "memory", "retry-policy"],
     "document_delete_source": ["document", "delete-source", "mail", "--yes"],
     "document_redetect_glossary": ["document", "reindex", "--stale-glossary"],
     "document_rescan_relations": ["document", "reindex", "--stale-relations"],

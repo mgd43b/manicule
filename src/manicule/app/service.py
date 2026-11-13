@@ -3372,6 +3372,41 @@ class ApplicationService:
                 the workspace would store spelled differently.
         """
         started = time.monotonic()
+        authoring = self._authorable(collection)
+        _require_segment(slug, "slug")
+        content = _authored_markdown(
+            body, slug=slug, local_evidence=frozenset(authoring.local_evidence)
+        )
+        await self._require_readable_source(authoring.source)
+        # Resolved here for a configured list, where a missing collection is a configuration
+        # fault to refuse before taking the lock. Under directory mode it is resolved inside the
+        # lock instead, because there the answer may be "create it", and two writers deciding
+        # that at once must not both act on it.
+        found = await self._listed_collection(authoring, collection)
+
+        async with self._authoring:
+            return await self._author(
+                authoring,
+                collection=collection,
+                slug=slug,
+                content=content,
+                found=found,
+                overwrite=overwrite,
+                started=started,
+            )
+
+    def _authorable(self, collection: str) -> AuthoringSettings:
+        """The authoring settings, once ``collection`` is one authoring may touch.
+
+        The checks every authoring operation — create, remove, move — makes before it reads or
+        writes anything, so the three cannot disagree about which names are in scope.
+
+        Raises:
+            ConfigError: Authoring is not configured.
+            PolicyError: A configured list does not name the collection.
+            ValueError: The name is not one path segment, or — under directory mode — is hidden
+                or would be stored spelled differently.
+        """
         authoring = self.settings.authoring
         if not authoring.configured:
             msg = (
@@ -3396,25 +3431,27 @@ class ApplicationService:
                 f"to it."
             )
             raise PolicyError(msg)
-        _require_segment(slug, "slug")
         # The collection name is a directory beneath the root as well as a scope, so it is held
-        # to the same rule. Operator-supplied rather than caller-supplied, which makes this
-        # unlikely rather than impossible — and "unlikely" is not what a path check is for.
+        # to the same rule as a slug. Operator-supplied in list mode, which makes this unlikely
+        # rather than impossible — and "unlikely" is not what a path check is for.
         _require_segment(collection, "collection name")
         if from_directories:
             _require_directory_collection_name(collection)
-        content = _authored_markdown(
-            body, slug=slug, local_evidence=frozenset(authoring.local_evidence)
-        )
-        await self._require_readable_source(authoring.source)
+        return authoring
 
-        # Resolved here for a configured list, where a missing collection is a configuration
-        # fault to refuse before taking the lock. Under directory mode it is resolved inside the
-        # lock instead, because there the answer may be "create it", and two writers deciding
-        # that at once must not both act on it.
+    async def _listed_collection(
+        self, authoring: AuthoringSettings, collection: str
+    ) -> Collection | None:
+        """The configured-list collection to author into; ``None`` under directory mode.
+
+        Raises:
+            UnknownEntityError: The list names a collection this workspace does not have.
+        """
+        if authoring.collections_from_directories:
+            return None
         store = await self._backend.organization()
-        found = None if from_directories else await store.find_collection(collection)
-        if found is None and not from_directories:
+        found = await store.find_collection(collection)
+        if found is None:
             msg = (
                 f"no collection {collection!r} in workspace {self.workspace!r}, though "
                 f"`authoring.collections` names it. Create it — `manicule collection create "
@@ -3423,17 +3460,7 @@ class ApplicationService:
                 f"collection on this operation exists to prevent."
             )
             raise UnknownEntityError(msg)
-
-        async with self._authoring:
-            return await self._author(
-                authoring,
-                collection=collection,
-                slug=slug,
-                content=content,
-                found=found,
-                overwrite=overwrite,
-                started=started,
-            )
+        return found
 
     async def _author(
         self,
@@ -3652,6 +3679,133 @@ class ApplicationService:
                 f"there. Pass overwrite to replace it, having read it."
             )
         return None
+
+    async def document_remove(self, *, collection: str, slug: str) -> r.DocumentRemoved:
+        """Remove an authored document: its file beneath the authoring root, and its index entry.
+
+        **The inverse of :meth:`document_create`, held to the same bounds.** It is addressed the
+        same way — a collection authoring may touch and a slug, never a path or an id — so it
+        reaches nothing ``document_create`` could not have written. That is the difference from
+        :meth:`document_delete`, which takes any document's id and removes only the index entry:
+        for an authored document that is undone by the next sync, which finds the file and
+        indexes it again.
+
+        The file goes first and the index entry second, the order a sync would observe: a file
+        that has left its source is soft-deleted from the index by reconciliation, and this does
+        the same thing now rather than at the next pass. Soft, so the entry sits in the trash for
+        the configured grace period like any other document that left its source; the file
+        itself is recovered the way the corpus is versioned, not through manicule.
+
+        Raises:
+            ConfigError: Authoring is not configured, or its source is not a usable filesystem
+                source.
+            PolicyError: The collection is not one authoring may touch.
+            UnknownEntityError: Neither a file nor a live document holds that slug.
+            ValueError: The collection or slug is not a single safe path segment.
+        """
+        authoring = self._authorable(collection)
+        _require_segment(slug, "slug")
+        await self._require_readable_source(authoring.source)
+        async with self._authoring:
+            return await self._unauthor(authoring, collection=collection, slug=slug)
+
+    async def _unauthor(
+        self, authoring: AuthoringSettings, *, collection: str, slug: str
+    ) -> r.DocumentRemoved:
+        """The part of :meth:`document_remove` that runs under the authoring lock."""
+        connector = await self._filesystem_source(authoring.source, require_profiles=False)
+        target = await asyncio.to_thread(
+            _authored_path, connector, collection=collection, slug=slug
+        )
+        identifier = document_id_of(self.workspace, authoring.source, str(target))
+        store = await self._backend.documents()
+        stored = await self._visible(await store.get_document(identifier))
+        if stored is not None:
+            require_owns(self.workspace, stored)
+        on_disk = await asyncio.to_thread(target.is_file)
+        if stored is None and not on_disk:
+            msg = (
+                f"no authored document {slug!r} in collection {collection!r}: neither {target} "
+                f"nor a live document indexed from it exists in workspace {self.workspace!r}"
+            )
+            raise UnknownEntityError(msg)
+        if on_disk:
+            await asyncio.to_thread(target.unlink)
+        if stored is not None:
+            await store.soft_delete_document(identifier)
+        return r.DocumentRemoved(
+            document_id=identifier,
+            path=str(target),
+            slug=slug,
+            collection=collection,
+            source=authoring.source,
+            file_removed=on_disk,
+            index_removed=stored is not None,
+        )
+
+    async def document_move(
+        self, *, slug: str, from_collection: str, to_collection: str
+    ) -> r.DocumentMoved:
+        """Move an authored document to another collection: its file, then its index entry.
+
+        The document is written into ``to_collection`` exactly as it is on disk — the bytes, not
+        a re-rendering — through the same path :meth:`document_create` takes, and only once that
+        write has happened is the original removed through :meth:`document_remove`'s. A refusal
+        at the destination (the slug is taken there, the name cannot be a collection) therefore
+        leaves the original untouched, and nothing is ever in neither place.
+
+        **The document's id changes.** Identity is ``(workspace, source, path)`` and the path
+        is what moved, so a citation or a link that named the old id names a removed document.
+        A ``[[slug]]`` wikilink still resolves, because the slug is unchanged.
+
+        Under ``collections_from_directories`` the destination is created if it is not a
+        collection yet, as for :meth:`document_create`.
+
+        Raises:
+            ConfigError: Authoring is not configured, or its source is not a usable filesystem
+                source.
+            PolicyError: Either collection is not one authoring may touch, or the slug is
+                already taken in the destination.
+            UnknownEntityError: No file holds that slug in ``from_collection``.
+            ValueError: A name is not a single safe path segment, or the two collections are
+                the same.
+        """
+        started = time.monotonic()
+        authoring = self._authorable(from_collection)
+        self._authorable(to_collection)
+        _require_segment(slug, "slug")
+        if from_collection == to_collection:
+            msg = (
+                f"{slug!r} is already in collection {from_collection!r}; there is nowhere to "
+                f"move it"
+            )
+            raise ValueError(msg)
+        await self._require_readable_source(authoring.source)
+        found = await self._listed_collection(authoring, to_collection)
+        async with self._authoring:
+            connector = await self._filesystem_source(authoring.source, require_profiles=False)
+            origin = await asyncio.to_thread(
+                _authored_path, connector, collection=from_collection, slug=slug
+            )
+            try:
+                content = await asyncio.to_thread(origin.read_text, encoding="utf-8")
+            except FileNotFoundError as exc:
+                msg = (
+                    f"no authored document {slug!r} in collection {from_collection!r}: {origin} "
+                    f"does not exist"
+                )
+                raise UnknownEntityError(msg) from exc
+            moved = await self._author(
+                authoring,
+                collection=to_collection,
+                slug=slug,
+                content=content,
+                found=found,
+                overwrite=False,
+                started=started,
+            )
+            removed = await self._unauthor(authoring, collection=from_collection, slug=slug)
+        return r.DocumentMoved(moved=moved, removed=removed)
 
     async def document_delete(self, document_id: str, *, hard: bool = False) -> r.DocumentDeleted:
         """Remove a document, into the trash by default.
