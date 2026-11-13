@@ -363,8 +363,10 @@ and the wildcard invites patterns nobody implemented. Setting both is refused at
 *is* granting write access to it, and that is why it is off by default. The bound that remains:
 
 - **One path segment beneath one root**, held to §4.8's rule like any slug.
-- **No hidden name.** The filesystem source does not walk dot-directories, so `.git` — a
-  top-level directory of any corpus that git versions — would take writes that are never indexed.
+- **No hidden name, and no name the walk always skips.** The filesystem source does not walk
+  dot-directories, so `.git` — a top-level directory of any corpus that git versions — would take
+  writes that are never indexed; the same holds for `venv`, `node_modules`, `__pycache__` and the
+  rest of the connector's ignored directories, which `doctor` leaves out too.
 - **No name the workspace would spell differently.** Collection names are stored NFKC-normalized
   with whitespace collapsed; a directory name is not, so a name that normalizes to something else
   would be two names for one collection.
@@ -377,7 +379,9 @@ and the wildcard invites patterns nobody implemented. Setting both is refused at
   directory exists beneath the root or its rule already selects that directory. A collection that
   is neither — a Confluence space, a hand-curated list — is refused with the
   `collection rule set` command that would make it the directory, rather than written into
-  because its name matched.
+  because its name matched. A rule counts as selecting the directory only when nothing else in it
+  narrows the prefix — no other source, media type, tag or date window — because a rule ANDs its
+  selectors.
 
 Every refusal happens before anything is created. A write that fails after the collection was
 made — the disk refuses the file — takes the collection back, and the directory if it made it;
@@ -404,6 +408,14 @@ bounds:
   the original untouched. The slug is unchanged, so `[[slug]]` links still resolve; the
   `document_id` changes, because identity follows the path (§4.2). Under
   `collections_from_directories` a new destination is created.
+
+Before either reads or deletes a file it makes every check `document_create` makes before it
+writes one: under `collections_from_directories` the name must be a real directory (not a link, a
+file or a case variant), and in either mode the path must be one the source walks. Removal retires
+the index entry under the file's path and, for a file whose sidecar manifest declares an identity,
+under that identity too. A move re-indexes its destination once the original is retired, so the
+wikilink middleware — which keeps a live document's slug rather than letting a newcomer take it —
+resolves the slug to the destination.
 
 Both are on the network surface beside `document_create`, and `document_delete` is not: it would
 let a socket caller remove any document in the workspace, a mailbox's included. The recovery path
