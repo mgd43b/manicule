@@ -46,7 +46,8 @@ headers and the principal resolution reach ``/mcp`` without being restated there
 What does **not** carry over is the full stdio tool surface.
 ``tests/api/test_routes.py`` asserts by name that the destructive operations have no route here;
 a mount that offered ``document_delete`` over the same socket would have made that assertion
-true and meaningless on the same day. The one admitted write is ``document_create``;
+true and meaningless on the same day. The admitted writes are authoring's — ``document_create``,
+``document_remove`` and ``document_move``;
 :mod:`manicule.mcp.serve` decides which tools a transport carries, and this asks it rather
 than deciding again.
 """

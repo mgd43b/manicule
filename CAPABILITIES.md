@@ -153,11 +153,11 @@ Ticket: #8 — **built.** Forty-seven implemented tools over the same applicatio
 line calls, registered with FastMCP decorators. Names are unprefixed: an MCP client namespaces by
 server, so a prefix would be the server's name written twice.
 
-The checklist below has forty-eight capability items because it also records the deliberately
+The checklist below has fifty capability items because it also records the deliberately
 declined catch-all `run-command` surface; that item is not a registered MCP tool.
 
-**All forty-seven over stdio; over a socket the twenty-six read-only ones plus
-`document_create`.** MCP is also served at `/mcp/` on the HTTP port, and every *other* mutating
+**All forty-nine over stdio; over a socket the twenty-six read-only ones plus
+`document_create`, `document_remove` and `document_move`.** MCP is also served at `/mcp/` on the HTTP port, and every *other* mutating
 tool is *absent* from that surface rather than refused on it — see
 [`docs/surfaces.md`](docs/surfaces.md) §6.1. Over stdio the write tools are unreachable from a
 network by construction, and a socket has to replace that property rather than assume it;

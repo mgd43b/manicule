@@ -3010,12 +3010,12 @@ def start(
     HTTP API has no stdio form. ``--transport http`` serves the **HTTP API, the browser surface
     and MCP** on one port, with MCP at ``/mcp/``; add ``--mcp-only`` to serve MCP alone there.
 
-    **MCP over a socket carries the read-only tools, plus ``document_create`` when the socket
-    is authenticated**, whichever of those two modes you are in. Indexing, deleting, syncing,
-    writing configuration and enabling a plugin are not registered on it — over stdio they are
-    unreachable from a network by construction, and a socket has to replace that property
-    rather than assume it. They stay on this command line, on stdio, and on the control socket
-    a served manicule answers write commands on.
+    **MCP over a socket carries the read-only tools, plus ``document_create``,
+    ``document_remove`` and ``document_move``**, whichever of those two modes you are in.
+    Indexing, deleting by id, syncing, writing configuration and enabling a plugin are not
+    registered on it — over stdio they are unreachable from a network by construction, and a
+    socket has to replace that property rather than assume it. They stay on this command line,
+    on stdio, and on the control socket a served manicule answers write commands on.
 
     Either way the address goes through one bind policy: loopback unless a non-loopback host
     is configured **and** ``--allow-public-bind`` is passed **and** authentication is on. Any

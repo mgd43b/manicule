@@ -43,6 +43,8 @@ WRITE_TOOLS = frozenset(
         "connector_reconcile",
         "connector_reconcile_resolve",
         "document_create",
+        "document_remove",
+        "document_move",
         "document_delete",
         "document_reindex",
         "collection_create",
