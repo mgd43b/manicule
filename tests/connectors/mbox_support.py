@@ -78,7 +78,7 @@ def _lines(raw: bytes) -> list[bytes]:
     return text.split(b"\n")[: -1 if text.endswith(b"\n") else None]
 
 
-def encode(raw: bytes, filing: Filing = Filing()) -> bytes:  # noqa: B008 - frozen
+def encode(raw: bytes, filing: Filing = Filing()) -> bytes:
     """One message as an mbox writer of this dialect would file it."""
     lines = _lines(raw)
     if filing.dialect == "mboxo":
@@ -95,7 +95,7 @@ def encode(raw: bytes, filing: Filing = Filing()) -> bytes:  # noqa: B008 - froz
 def write_mbox(
     path: Path,
     raws: Iterable[bytes],
-    filing: Filing = Filing(),  # noqa: B008 - frozen
+    filing: Filing = Filing(),
 ) -> Path:
     """Write ``raws`` to ``path`` as one mbox file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +105,7 @@ def write_mbox(
     return path
 
 
-def append_mbox(path: Path, raws: Iterable[bytes], filing: Filing = Filing()) -> None:  # noqa: B008
+def append_mbox(path: Path, raws: Iterable[bytes], filing: Filing = Filing()) -> None:
     with path.open("ab") as handle:
         for raw in raws:
             handle.write(encode(raw, filing))
