@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.29](https://github.com/mgd43b/manicule/compare/v0.2.28...v0.2.29) (2026-11-19)
+
+
+### Bug Fixes
+
+* **deps:** bump dnspython from 2.9.0 to 2.9.2 ([#562](https://github.com/mgd43b/manicule/issues/562)) ([24e8cbb](https://github.com/mgd43b/manicule/commit/24e8cbb9782f3659108b3402afad61bc2b07b6fb))
+* **deps:** bump opentelemetry-api from 1.45.1 to 1.45.2 ([#563](https://github.com/mgd43b/manicule/issues/563)) ([c8cd0ff](https://github.com/mgd43b/manicule/commit/c8cd0ff601d64ffd51f0fe131698f945b92a1373))
+* **deps:** bump the index-affecting-extraction group with 3 updates ([#565](https://github.com/mgd43b/manicule/issues/565)) ([1aec3b1](https://github.com/mgd43b/manicule/commit/1aec3b1c12b955da794bf974bdeb4cde66f39f89))
+* **deps:** bump the runtime group with 7 updates ([#567](https://github.com/mgd43b/manicule/issues/567)) ([945b1a2](https://github.com/mgd43b/manicule/commit/945b1a2c30c0cd010fa0aa58276f3669dc3cb497))
+
 ## [0.2.28](https://github.com/mgd43b/manicule/compare/v0.2.27...v0.2.28) (2026-11-13)
 
 
