@@ -141,7 +141,7 @@ def test_the_rendering_names_every_arm_and_both_responsiveness_phases() -> None:
 
 
 def test_the_arms_are_named_for_what_they_are() -> None:
-    """The unshipped alternative is labelled as one, so a table cannot be read as a result."""
+    """The unshipped alternative is labeled as one, so a table cannot be read as a result."""
     assert ARMS == ("baseline", "shipped", "candidate-two-branch")
 
 
