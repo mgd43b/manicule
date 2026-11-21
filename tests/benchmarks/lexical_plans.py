@@ -642,6 +642,9 @@ class Measured:
     chosen: Variant
     agree: bool
     matched: int
+    unverified: bool = False
+    """A result filled the limit, so its last score group may have been cut and its members were
+    not compared: the run holds no unlimited baseline to check them against."""
 
 
 def warm(
@@ -686,7 +689,15 @@ def warm(
         if reference is not None
         else True,
         matched=len(reference or []),
+        unverified=any(len(rows) >= shape.limit for rows in results.values()),
     )
+
+
+def _agreement(row: Measured) -> str:
+    """``NO``, or ``yes`` with the caveat that a cut tie group was not checked."""
+    if not row.agree:
+        return "NO"
+    return "yes (cut tie unchecked)" if row.unverified else "yes"
 
 
 def cold(corpus: Corpus, shape: Shape, variant: Variant, *, reps: int, cap: float) -> float | None:
@@ -845,7 +856,7 @@ def render(rows: Sequence[Measured], *, cold_times: dict[str, dict[str, float | 
         ]
         lines.append(
             f"| {row.shape.name} | {row.matched} | {' | '.join(cells)} "
-            f"| {row.chosen.name} | {'yes' if row.agree else 'NO'} |"
+            f"| {row.chosen.name} | {_agreement(row)} |"
         )
     if cold_times:
         lines += ["", "| cold shape | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]

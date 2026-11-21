@@ -51,3 +51,35 @@ def test_percentile_is_nearest_rank_and_zero_for_nothing() -> None:
     assert percentile([5.0], 0.95) == 5.0
     assert percentile([1.0, 2.0, 3.0, 4.0, 5.0], 0.5) == 3.0
     assert percentile([1.0, 2.0, 3.0, 4.0, 5.0], 1.0) == 5.0
+
+
+async def test_a_wait_in_another_task_is_not_charged_to_the_measured_write() -> None:
+    """Queued maintenance acquires the barrier in its own context; only the write's waits count."""
+    import asyncio  # noqa: PLC0415
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    from tests.benchmarks.authoring_latency import MEASURING, Timed  # noqa: PLC0415
+
+    @asynccontextmanager
+    async def slow():  # noqa: ANN202
+        await asyncio.sleep(0.05)
+        yield
+
+    waited: list[float] = []
+
+    async def other_task() -> None:
+        async with Timed(slow()):
+            pass
+
+    token = MEASURING.set(waited)
+    try:
+        # Created inside the measured context, so it inherits the list and IS counted ...
+        await asyncio.create_task(other_task())
+        inherited = len(waited)
+    finally:
+        MEASURING.reset(token)
+    # ... and one created outside it records nothing.
+    await asyncio.create_task(other_task())
+
+    assert inherited == 1
+    assert len(waited) == 1

@@ -31,6 +31,7 @@ import statistics
 import sys
 import tempfile
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, override
@@ -113,36 +114,45 @@ def _as_legacy(runtime: Any) -> None:
     runtime._built = never_built
 
 
-def _timed_waits(runtime: Any, waited: list[float]) -> None:
+MEASURING: ContextVar[list[float] | None] = ContextVar("authoring_latency_waits", default=None)
+"""Where the write being measured collects its barrier waits.
+
+A context variable and not a shared list, so only the measured write and the tasks it starts
+record a wait: a maintenance task queued beside it acquires the barrier in a context that never
+set this, and its own wait is not charged to the write."""
+
+
+def _timed_waits(runtime: Any) -> None:
     """Record how long each lease or exclusive acquisition waited before it was admitted."""
     for name in ("derived_source_lease", "derived_publication_guard"):
         original = getattr(runtime, name)
 
         def wrapped(source: str, original: Any = original) -> Any:
-            return _Timed(original(source), waited)
+            return Timed(original(source))
 
         setattr(runtime, name, wrapped)
     exclusive = runtime.derived_mutation_guard
 
     def wrapped_exclusive() -> Any:
-        return _Timed(exclusive(), waited)
+        return Timed(exclusive())
 
     runtime.derived_mutation_guard = wrapped_exclusive
 
 
-class _Timed:
+class Timed:
     """An async context manager that records how long entering the wrapped one took."""
 
-    def __init__(self, inner: Any, waited: list[float]) -> None:
+    def __init__(self, inner: Any) -> None:
         self._inner = inner
-        self._waited = waited
 
     async def __aenter__(self) -> Any:
         start = time.perf_counter()
         try:
             return await self._inner.__aenter__()
         finally:
-            self._waited.append((time.perf_counter() - start) * 1000.0)
+            waited = MEASURING.get()
+            if waited is not None:
+                waited.append((time.perf_counter() - start) * 1000.0)
 
     async def __aexit__(self, *exc: object) -> Any:
         return await self._inner.__aexit__(*exc)
@@ -177,7 +187,7 @@ async def _once(
         waited: list[float] = []
         # Timed first, so the legacy lease that delegates to the exclusive guard is counted once
         # at that guard and not again around it.
-        _timed_waits(runtime, waited)
+        _timed_waits(runtime)
         if barrier == "legacy":
             _as_legacy(runtime)
 
@@ -213,13 +223,17 @@ async def _once(
         samples: list[Sample] = []
         for number in range(writes):
             waited.clear()
-            start = time.perf_counter()
-            await service.document_create(
-                collection="synthetic",
-                slug=f"note-{number}",
-                body=f"synthetic note number {number} about harbors and tides\n",
-            )
-            samples.append(Sample((time.perf_counter() - start) * 1000.0, sum(waited)))
+            token = MEASURING.set(waited)
+            try:
+                start = time.perf_counter()
+                await service.document_create(
+                    collection="synthetic",
+                    slug=f"note-{number}",
+                    body=f"synthetic note number {number} about harbors and tides\n",
+                )
+                samples.append(Sample((time.perf_counter() - start) * 1000.0, sum(waited)))
+            finally:
+                MEASURING.reset(token)
         for task in (releasing, parked, maintenance):
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)

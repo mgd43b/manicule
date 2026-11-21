@@ -258,6 +258,10 @@ def test_the_report_has_a_column_per_statement_and_flags_a_disagreement(
     assert table.splitlines()[0].startswith(
         "| shape | rows | today | direct | ranked | doc-first |"
     )
-    assert "| ranked | yes |" in table
+    # A result that fills the limit may hold a cut tie group that was not compared, and the
+    # table says so rather than claiming a check it did not make.
+    assert "| ranked | yes (cut tie unchecked) |" in table
+    measured.unverified = False
+    assert "| ranked | yes |" in render([measured], cold_times={})
     measured.agree = False
     assert "| NO |" in render([measured], cold_times={})
