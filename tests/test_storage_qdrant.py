@@ -1913,6 +1913,12 @@ async def test_a_timeout_building_the_new_index_is_a_retryable_error_and_leaves_
     [
         pytest.param(lambda: ResponseHandlingException(ConnectionError("refused")), id="rest"),
         pytest.param(
+            lambda: ResponseHandlingException(httpx.PoolTimeout("")), id="rest-pool-timeout"
+        ),
+        pytest.param(
+            lambda: ResponseHandlingException(httpx.WriteTimeout("")), id="rest-write-timeout"
+        ),
+        pytest.param(
             lambda: ResponseHandlingException(httpx.ConnectTimeout("")), id="rest-connect-timeout"
         ),
         pytest.param(lambda: _ChannelError("UNAVAILABLE"), id="grpc-unavailable"),
@@ -3143,7 +3149,11 @@ async def test_a_real_server_never_reports_impossible_coverage_while_points_come
             for _ in range(12):
                 snapshots.append(await server_store.checksum_coverage())
 
-        await asyncio.gather(churn(), read())
+        # A task group, so that both tasks are finished or canceled and joined before the
+        # collection is dropped, whichever of them fails.
+        async with asyncio.TaskGroup() as group:
+            group.create_task(churn())
+            group.create_task(read())
 
         assert len(snapshots) == 12
         for coverage in snapshots:

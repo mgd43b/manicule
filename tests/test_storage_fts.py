@@ -10,14 +10,19 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from sqlalchemy import bindparam, text, update
+from sqlalchemy import bindparam, event, text, update
 
 from manicule.core.content import DocumentStatus
 from manicule.core.readers import group_principal
 from manicule.core.retrieval import Filter
 from manicule.storage import docstore as docstore_module
 from manicule.storage import models
-from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore, lexical_predicates
+from manicule.storage.docstore import (
+    DEFAULT_WORKSPACE,
+    SHARE_TTL_SECONDS,
+    SqliteDocStore,
+    lexical_predicates,
+)
 from manicule.storage.engine import database_path
 from manicule.storage.fts import (
     CREATE_TRIGGERS,
@@ -28,6 +33,7 @@ from manicule.storage.fts import (
     MAX_RANKED_TERMS,
     MAX_SCOPED_CHUNKS,
     MAX_SCOPED_DOCUMENTS,
+    MIN_RANKED_SHARE,
     REBUILD_FTS,
     SCOPE_PROBE_LIMIT,
     SCOPE_PROBE_SQL,
@@ -39,6 +45,7 @@ from manicule.storage.fts import (
     escape_match_query,
     match_terms,
     needs_scope_probe,
+    needs_workspace_share,
 )
 from manicule.storage.types import UtcDateTime
 from tests.benchmarks.lexical_plans import equivalent
@@ -578,8 +585,11 @@ async def test_every_statement_returns_the_released_statements_ranking(
 
     released = await _ranking(store, LexicalPlan.DIRECT, query, k, as_released=True)
     candidate = await _ranking(store, plan, query, k)
+    every = await _ranking(store, LexicalPlan.DIRECT, query, 500, as_released=True)
 
-    assert equivalent(released, candidate), f"{plan.value} ranked {query!r} differently"
+    assert equivalent(released, candidate, limit=k, full=every), (
+        f"{plan.value} ranked {query!r} differently"
+    )
     assert [score for _, score in released] == [score for _, score in candidate], (
         "scores are the contract and must match exactly, not approximately"
     )
@@ -650,8 +660,12 @@ async def test_search_lexical_returns_what_the_released_statement_ranked(
 
         found = await store.search_lexical(query, 5)
 
+        every = await _ranking(store, LexicalPlan.DIRECT, query, 500, as_released=True)
         assert equivalent(
-            released, [(candidate.chunk.id, -candidate.score) for candidate in found]
+            released,
+            [(candidate.chunk.id, -candidate.score) for candidate in found],
+            limit=5,
+            full=every,
         ), query
         assert [candidate.scores["bm25"] for candidate in found] == [
             candidate.score for candidate in found
@@ -1140,6 +1154,21 @@ async def test_concurrent_searches_of_every_kind_do_not_exhaust_the_connection_p
         ({"terms": MAX_MATCH_WORDS, "scoped_documents": 0}, LexicalPlan.DIRECT),
         ({"terms": 2, "scoped_documents": 0, "narrowed": True}, LexicalPlan.DIRECT),
         ({"terms": 1, "scoped_documents": 0, "narrowed": True}, LexicalPlan.DIRECT),
+        ({"terms": 3, "scoped_documents": 0, "workspace_share": None}, LexicalPlan.RANKED),
+        ({"terms": 3, "scoped_documents": 0, "workspace_share": 1.0}, LexicalPlan.RANKED),
+        (
+            {"terms": 3, "scoped_documents": 0, "workspace_share": MIN_RANKED_SHARE},
+            LexicalPlan.RANKED,
+        ),
+        (
+            {"terms": 3, "scoped_documents": 0, "workspace_share": MIN_RANKED_SHARE - 0.01},
+            LexicalPlan.DIRECT,
+        ),
+        ({"terms": 3, "scoped_documents": 0, "workspace_share": 0.0}, LexicalPlan.DIRECT),
+        (
+            {"terms": 2, "scoped_documents": 1, "scoped_chunks": 4, "workspace_share": 0.001},
+            LexicalPlan.DOCUMENT_FIRST,
+        ),
         ({"terms": 2, "scoped_documents": 1, "scoped_chunks": 0}, LexicalPlan.DOCUMENT_FIRST),
         ({"terms": 1, "scoped_documents": 4, "scoped_chunks": 20}, LexicalPlan.DOCUMENT_FIRST),
         (
@@ -1241,3 +1270,139 @@ async def test_a_backlink_search_for_a_slugs_words_is_ranked_and_still_finds_the
     assert chosen == [LexicalPlan.RANKED]
     assert any(candidate.chunk.document_id == linking.id for candidate in found)
     assert found[0].chunk.document_id == linking.id, "it holds both words, so it ranks first"
+
+
+@pytest.mark.parametrize(
+    ("terms", "documents", "narrowed", "needed"),
+    [
+        (2, 0, False, True),
+        (MAX_RANKED_TERMS, 0, False, True),
+        (1, 0, False, False),
+        (MAX_RANKED_TERMS + 1, 0, False, False),
+        (2, 0, True, False),
+        (2, 3, False, False),
+    ],
+)
+def test_only_a_search_that_could_be_ranked_reads_the_workspaces_share(
+    terms: int, documents: int, narrowed: bool, needed: bool
+) -> None:
+    assert needs_workspace_share(terms, documents, narrowed=narrowed) is needed
+
+
+# --- a small workspace in a large installation --------------------------------------------------
+
+
+async def _crowd(engine: AsyncEngine, documents: int) -> None:
+    """``documents`` live documents in another workspace, enough to make the default one small."""
+    other = SqliteDocStore(engine, workspace_id="large")
+    await other.ensure_workspace()
+    for index in range(documents):
+        document = make_document(workspace_id="large", source_id=f"big-{index}")
+        await other.upsert_document(document)
+        await other.replace_chunks(document.id, [make_chunk(document, 0, "alpha beta filler")])
+
+
+async def test_a_workspace_holding_a_small_share_of_the_installation_runs_the_direct_statement(
+    store: SqliteDocStore, engine: AsyncEngine, chosen: list[LexicalPlan]
+) -> None:
+    """The ranked statement walks every workspace's matches in rank order to find this one's.
+
+    The two workspaces below hold the same text, so what changes the statement is only the
+    share, and both return their own rows and nothing of the other's.
+    """
+    await _document(store, "mine", ["alpha beta here"])
+    await _crowd(engine, 5)
+    large = SqliteDocStore(engine, workspace_id="large")
+
+    mine = await store.search_lexical("alpha beta", 5)
+    theirs = await large.search_lexical("alpha beta", 5)
+
+    assert chosen == [LexicalPlan.DIRECT, LexicalPlan.RANKED]
+    assert [c.chunk.text for c in mine] == ["alpha beta here"]
+    assert len(theirs) == 5
+    assert {c.chunk.id for c in mine}.isdisjoint({c.chunk.id for c in theirs})
+
+
+async def test_the_share_does_not_change_what_any_statement_returns(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    await _document(store, "mine", ["alpha beta here", "alpha again"])
+    await _crowd(engine, 4)
+    wanted = await _ranking(store, LexicalPlan.DIRECT, "alpha beta", 5, as_released=True)
+
+    for plan in (LexicalPlan.DIRECT, LexicalPlan.RANKED):
+        assert equivalent(wanted, await _ranking(store, plan, "alpha beta", 5), limit=5)
+
+
+async def test_a_lone_workspace_and_an_empty_installation_stay_ranked(
+    store: SqliteDocStore, chosen: list[LexicalPlan]
+) -> None:
+    """Nothing to divide by is "unknown", and unknown reads as all of it."""
+    assert await store.search_lexical("alpha beta", 5) == []
+    await _document(store, "only", ["alpha beta here"])
+    store._share_cache = None  # pyright: ignore[reportPrivateUsage]
+
+    assert len(await store.search_lexical("alpha beta", 5)) == 1
+    assert chosen == [LexicalPlan.RANKED, LexicalPlan.RANKED]
+
+
+async def test_the_share_is_read_once_a_minute_and_a_stale_one_is_refreshed(
+    store: SqliteDocStore,
+    engine: AsyncEngine,
+    chosen: list[LexicalPlan],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grouped count is cheap, and a cache means it is not paid per search either way.
+
+    Counted by the statements that reach the driver. The share is stale for exactly
+    ``SHARE_TTL_SECONDS``: a workspace that has become small is still ranked until then, and
+    direct after.
+    """
+    now = [1000.0]
+    monkeypatch.setattr(docstore_module, "_monotonic", lambda: now[0])
+    await _document(store, "mine", ["alpha beta here"])
+    reads = 0
+
+    def count_reads(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+        nonlocal reads
+        reads += "GROUP BY workspace_id" in statement
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_reads)
+    try:
+        for _ in range(3):
+            await store.search_lexical("alpha beta", 5)
+        assert reads == 1, "three searches inside the window read the share three times"
+
+        await _crowd(engine, 5)
+        now[0] += SHARE_TTL_SECONDS - 1
+        await store.search_lexical("alpha beta", 5)
+        assert reads == 1
+        assert chosen[-1] is LexicalPlan.RANKED, "the cached share is used until it expires"
+
+        now[0] += 2
+        await store.search_lexical("alpha beta", 5)
+        assert reads == 2
+        assert chosen[-1] is LexicalPlan.DIRECT, "and the refreshed share is what it now sees"
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_reads)
+
+
+async def test_the_share_is_not_read_by_a_search_that_cannot_use_it(
+    store: SqliteDocStore, engine: AsyncEngine
+) -> None:
+    await _document(store, "mine", ["alpha beta here"])
+    reads = 0
+
+    def count_reads(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+        nonlocal reads
+        reads += "GROUP BY workspace_id" in statement
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_reads)
+    try:
+        await store.search_lexical("alpha", 5)
+        await store.search_lexical("alpha beta", 5, _everything(sources=frozenset({"fs"})))
+        await store.search_lexical("alpha beta", 5, _everything(document_ids=frozenset({"x"})))
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_reads)
+
+    assert reads == 0

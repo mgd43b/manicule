@@ -42,9 +42,10 @@ with the window it belongs to.
 
 **Everything it touches it made.** The program takes no collection name and has no way to be
 given one. Each run makes one collection under the suite's ``manicule_test`` prefix, in a
-workspace named with a fresh UUID, and removes what it made — the collection, its workspace's
-fingerprint record, and the shared record collection only if that is left empty — even when it
-fails. It never lists, reads or writes any other collection.
+workspace named with a fresh UUID, and removes what it made — the collection and its
+workspace's own record — even when it fails. The shared record collection beside it is the
+store's, kept by design, and is neither counted nor dropped. It never writes to or drops any
+other collection.
 
 Everything is synthetic: random words, random vectors, no corpus. Payloads are sized like real
 chunks (``chunk_json`` of a few kilobytes, stored on disk the way the shipped shape stores them),
@@ -79,7 +80,7 @@ from typing import TYPE_CHECKING, Any, Final
 from qdrant_client import AsyncQdrantClient, models
 
 from manicule.core.embedding import VECTOR_CHECKSUM_VERSION, EmbedFingerprint, Pooling
-from manicule.storage.qdrant import CollectionShape, QdrantVectorStore, meta_collection_for
+from manicule.storage.qdrant import CollectionShape, QdrantVectorStore
 from manicule.storage.vector_schema import (
     CHECKSUM_COLUMN,
     CHECKSUM_VERSION_COLUMN,
@@ -192,6 +193,10 @@ class Responsiveness:
     ping_p50_ms: float
     ping_p99_ms: float
     samples: int
+    """Searches taken. Zero means none ran, and the search figures are then not measurements."""
+
+    ping_samples: int
+    """``get_collections`` requests taken, on the same terms."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +237,7 @@ class Run:
     arms: tuple[ArmResult, ...]
 
 
-_NO_SAMPLE: Final = Responsiveness(0.0, 0.0, 0.0, 0.0, samples=0)
+_NO_SAMPLE: Final = Responsiveness(0.0, 0.0, 0.0, 0.0, samples=0, ping_samples=0)
 """What ``during_index_build`` says when no build ran, which cannot happen over the three arms."""
 
 
@@ -443,7 +448,7 @@ async def _populate(
     return truth, total_bytes // max(1, points)
 
 
-async def _sample(
+async def sample_latency(
     client: AsyncQdrantClient,
     collection: str,
     query: list[float],
@@ -456,31 +461,55 @@ async def _sample(
     """Search and ``get_collections`` latency.
 
     Takes ``probes`` of each and keeps going for ``floor_seconds``; or, given ``until``, takes
-    them for as long as that future is unfinished, and at least one.
+    them for as long as that future is unfinished. With ``until`` it is checked before each
+    probe starts, so a probe that began after the work finished is never counted as having run
+    during it, and a probe type that never ran reports no sample rather than a figure.
     """
     searches: list[float] = []
     pings: list[float] = []
     started = time.monotonic()
     while True:
+        if until is not None and until.done():
+            break
         begin = time.perf_counter()
         await client.query_points(collection, query=query, limit=10, with_payload=False)
         searches.append((time.perf_counter() - begin) * 1000)
+        if until is not None and until.done():
+            break
         begin = time.perf_counter()
         await client.get_collections()
         pings.append((time.perf_counter() - begin) * 1000)
         await asyncio.sleep(interval)
-        if until is not None:
-            if until.done():
-                break
-        elif len(searches) >= probes and time.monotonic() - started >= floor_seconds:
+        if (
+            until is None
+            and len(searches) >= probes
+            and time.monotonic() - started >= floor_seconds
+        ):
             break
     return Responsiveness(
-        search_p50_ms=percentile(searches, 0.50),
-        search_p99_ms=percentile(searches, 0.99),
-        ping_p50_ms=percentile(pings, 0.50),
-        ping_p99_ms=percentile(pings, 0.99),
+        search_p50_ms=percentile(searches, 0.50) if searches else 0.0,
+        search_p99_ms=percentile(searches, 0.99) if searches else 0.0,
+        ping_p50_ms=percentile(pings, 0.50) if pings else 0.0,
+        ping_p99_ms=percentile(pings, 0.99) if pings else 0.0,
         samples=len(searches),
+        ping_samples=len(pings),
     )
+
+
+async def _build_version_index(client: AsyncQdrantClient, collection: str) -> tuple[float, float]:
+    """Create the version index and return when the request started and when it finished.
+
+    Timed in here, around the one request, so the figure is the build's and not the build's
+    plus whatever the sampler did around it.
+    """
+    started = time.perf_counter()
+    await client.create_payload_index(
+        collection,
+        field_name=CHECKSUM_VERSION_COLUMN,
+        field_schema=models.PayloadSchemaType.KEYWORD,
+        wait=True,
+    )
+    return started, time.perf_counter()
 
 
 async def _measure_arm(
@@ -539,7 +568,7 @@ async def _measure_arm(
             raise AssertionError(f"arm {arm!r} counted {answer}, but {truth} was planted")
 
     on_phase(arm, "idle", collection)
-    idle = await _sample(
+    idle = await sample_latency(
         client, collection, query, probes=probes, interval=interval, floor_seconds=0.0
     )
 
@@ -559,7 +588,7 @@ async def _measure_arm(
     task = asyncio.create_task(background())
     window_start = time.time()
     try:
-        busy = await _sample(
+        busy = await sample_latency(
             client,
             collection,
             query,
@@ -594,10 +623,9 @@ async def _remove(
     """Remove what this run made and nothing else. Safe to call after any failure."""
     if await client.collection_exists(owned(collection, minted)):
         await client.delete_collection(collection)
+    # Its own record in the shared `<prefix>_meta` collection goes with it. The shared collection
+    # stays, as the store keeps it by design: it is not this run's to count or drop.
     await store.reset_storage()
-    meta = meta_collection_for(TEST_COLLECTION_PREFIX)
-    if await client.collection_exists(meta) and (await client.count(meta, exact=True)).count == 0:
-        await client.delete_collection(meta)
 
 
 async def measure(
@@ -623,6 +651,10 @@ async def measure(
     removed in here, and nothing outside this call can name it.
     """
     announce = on_phase or _silent
+    if repeats < 1:
+        raise ValueError(
+            "repeats must be at least one, or there is nothing to take a percentile of"
+        )
     if points < 12 * planted_each:
         raise ValueError("too few points to plant every kind of unhealthy point in")
     # Not the suite's shared helper, whose timeout is thirty seconds: a baseline count over a
@@ -670,17 +702,9 @@ async def measure(
                 # The build is one request that returns when the index exists. Search and
                 # `get_collections` are sampled beside it, which is what an upgrade's first
                 # prepare does to everyone else using the server.
-                started = time.perf_counter()
-                build = asyncio.ensure_future(
-                    client.create_payload_index(
-                        collection,
-                        field_name=CHECKSUM_VERSION_COLUMN,
-                        field_schema=models.PayloadSchemaType.KEYWORD,
-                        wait=True,
-                    )
-                )
+                build = asyncio.ensure_future(_build_version_index(client, collection))
                 try:
-                    during_build = await _sample(
+                    during_build = await sample_latency(
                         client,
                         collection,
                         query,
@@ -690,8 +714,8 @@ async def measure(
                         until=build,
                     )
                 finally:
-                    await build
-                build_seconds = time.perf_counter() - started
+                    built_from, built_to = await build
+                build_seconds = built_to - built_from
                 await _settle(client, collection, seconds=settle_seconds)
             results.append(
                 await _measure_arm(
@@ -720,8 +744,10 @@ async def measure(
             arms=tuple(results),
         )
     finally:
-        await _remove(client, store, collection, minted)
-        await client.close()
+        try:
+            await _remove(client, store, collection, minted)
+        finally:
+            await client.close()
 
 
 def render(run: Run) -> str:
@@ -733,7 +759,7 @@ def render(run: Run) -> str:
     build = run.during_index_build
     lines = [
         header,
-        f"during the index build ({build.samples} samples), ms: "
+        f"during the index build ({build.samples} searches, {build.ping_samples} pings), ms: "
         f"search p50 {build.search_p50_ms:.1f} p99 {build.search_p99_ms:.1f}, "
         f"ping p50 {build.ping_p50_ms:.1f} p99 {build.ping_p99_ms:.1f}",
         f"{'arm':<{ARM_WIDTH}}{'req':>4}{'half p50':>10}{'half p95':>10}"

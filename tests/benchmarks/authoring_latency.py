@@ -175,9 +175,11 @@ async def _once(
         service = ApplicationService(runtime)
         await service.collection_create("synthetic")
         waited: list[float] = []
+        # Timed first, so the legacy lease that delegates to the exclusive guard is counted once
+        # at that guard and not again around it.
+        _timed_waits(runtime, waited)
         if barrier == "legacy":
             _as_legacy(runtime)
-        _timed_waits(runtime, waited)
 
         parked: asyncio.Task[Any] | None = None
         maintenance: asyncio.Task[None] | None = None

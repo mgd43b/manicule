@@ -31,7 +31,8 @@ async def test_a_parked_source_stalls_the_legacy_barrier_and_not_the_leased_one(
     leased = _result(results, "leased", "parked")
     assert legacy.cold[0].barrier_wait_ms >= PARK_S * 1000 * 0.5, "the write waited out the park"
     assert leased.cold[0].barrier_wait_ms < PARK_S * 1000 * 0.5, "the write did not wait for it"
-    assert leased.cold[0].total_ms < legacy.cold[0].total_ms
+    # No comparison of totals: the two runs have independent storage time, and the waits above
+    # are what the barrier controls.
 
 
 async def test_the_table_names_every_barrier_and_condition_it_measured() -> None:

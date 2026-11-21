@@ -397,3 +397,31 @@ async def test_the_authoring_source_is_read_when_a_lease_is_taken() -> None:
     assert barrier.slot_of("authored") == barrier.slot_of("mail")
     authoring[0] = "authored"
     assert barrier.slot_of("authored") != barrier.slot_of("mail")
+
+
+async def test_a_publication_still_running_after_its_lease_exits_keeps_maintenance_out() -> None:
+    """A worker that outlives the run's block must not let maintenance start under it."""
+    barrier = _barrier()
+    inside, leave = asyncio.Event(), asyncio.Event()
+
+    async def straggler() -> None:
+        async with barrier.publication("mail"):
+            inside.set()
+            await leave.wait()
+
+    async with barrier.source("mail"):
+        task = asyncio.create_task(straggler())
+        await inside.wait()
+    maintenance = _hold(barrier, "exclusive")
+    await _settle()
+
+    assert not _entered(maintenance), "the straggler is still publishing"
+    leave.set()
+    await task
+    await _settle()
+    assert _entered(maintenance)
+    await _release(maintenance)
+    follower = _hold(barrier, "source", "mail")
+    await _settle()
+    assert _entered(follower), "the slot is free again, and was freed exactly once"
+    await _release(follower)

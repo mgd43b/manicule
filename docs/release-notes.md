@@ -25,16 +25,17 @@ The keyword leg of search now picks one of three statements for the same query, 
 carries every restriction (workspace, source, document, type, time, reader) before its limit, so
 the rows returned and their scores are unchanged: a many-word query with no narrow filter lets
 SQLite's FTS5 order by `bm25(1.0, 0.4)` itself instead of sorting every match; a small explicit
-document scope (a collection of a few documents, up to 64) is driven from those documents; and
+document scope (up to 64 documents holding at most 32 chunks) is driven from those documents; and
 everything else, including single words, runs the statement earlier releases ran. A bounded
 indexed probe of the scope's chunk count is a hint for that choice and never a filter. The
 weights, the match rule, the schema and the vectors are untouched, and nothing is rebuilt.
 
 Document and source lists are also written so SQLite cannot seek on them from inside the match
 loop, which on some SQLite versions turned a selective scope into a scan per match. The choices
-were measured on synthetic corpora, with one known cost: a small workspace inside an installation
-holding a large one can be slower on a many-word query, because the ranked statement walks matches
-across all workspaces. Measurements and the rule are in `docs/retrieval.md` §4.1.
+were measured on synthetic corpora. A workspace holding less than half of an installation's
+documents keeps the statement earlier releases ran, because the ranked statement walks matches
+across all workspaces; the share is read from one cheap count, cached for a minute. Measurements
+and the rule are in `docs/retrieval.md` §4.1.
 
 ### Qdrant checksum coverage no longer reads every payload
 

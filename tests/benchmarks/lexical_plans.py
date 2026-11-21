@@ -81,6 +81,7 @@ from manicule.storage.fts import (
     escape_match_query,
     match_terms,
     needs_scope_probe,
+    needs_workspace_share,
 )
 from manicule.storage.migrator import upgrade
 
@@ -307,15 +308,41 @@ def _insert_chunks(
     return seq
 
 
-def build_corpus(directory: Path, chunks: int, *, seed: int = 20260101) -> Corpus:
+OWNER_MARKER = ".lexical-plans-corpus"
+"""Written into a directory this program built a corpus in, and the only thing that lets it
+delete one: a ``--work`` that names somebody's directory must never be emptied."""
+
+
+class DirectoryNotOwnedError(Exception):
+    """``--work`` names a non-empty directory this program may not delete."""
+
+
+def _claim(directory: Path, *, overwrite: bool) -> None:
+    """Make ``directory`` empty and ours, or refuse and touch nothing."""
+    if directory.exists() and any(directory.iterdir()):
+        owned = (directory / OWNER_MARKER).is_file()
+        if not owned:
+            msg = f"{directory} is not empty and was not built by this benchmark; not deleting it"
+            raise DirectoryNotOwnedError(msg)
+        if not overwrite:
+            msg = f"{directory} holds a corpus from an earlier run; pass --overwrite to rebuild it"
+            raise DirectoryNotOwnedError(msg)
+        shutil.rmtree(directory)
+    prepare_data_dir(directory)
+    (directory / OWNER_MARKER).write_text("built by tests.benchmarks.lexical_plans\n")
+
+
+def build_corpus(
+    directory: Path, chunks: int, *, seed: int = 20260101, overwrite: bool = False
+) -> Corpus:
     """A migrated database holding about ``chunks`` synthetic chunks, loaded in one transaction.
 
     Text is generated, and nothing here reads a real document. The triggers that keep the
     lexical index current are left in place so ``chunks_fts`` is built the way the product
-    builds it.
+    builds it. A directory that is not empty is refused unless it carries :data:`OWNER_MARKER`
+    and ``overwrite`` is set.
     """
-    shutil.rmtree(directory, ignore_errors=True)
-    prepare_data_dir(directory)
+    _claim(directory, overwrite=overwrite)
     asyncio.run(_template(directory))
     rng = np.random.default_rng(seed)
     documents, bulk_documents = _plan_documents(rng, chunks)
@@ -504,11 +531,23 @@ def scoped_chunks(db: sqlite3.Connection, shape: Shape) -> int | None:
 
 def chosen(db: sqlite3.Connection, shape: Shape) -> Variant:
     """The statement the shipped chooser picks for ``shape``."""
+    terms = len(match_terms(shape.text))
+    narrowed = lexical_predicates(shape.workspace, shape.filter).narrowed
+    share = None
+    if needs_workspace_share(terms, len(shape.documents()), narrowed=narrowed):
+        counts = dict(
+            db.execute(
+                "SELECT workspace_id, count(*) FROM documents WHERE deleted_at IS NULL "
+                "GROUP BY workspace_id"
+            ).fetchall()
+        )
+        share = counts.get(shape.workspace, 0) / sum(counts.values())
     plan = choose_lexical_plan(
-        terms=len(match_terms(shape.text)),
+        terms=terms,
         scoped_documents=len(shape.documents()),
         scoped_chunks=scoped_chunks(db, shape),
-        narrowed=lexical_predicates(shape.workspace, shape.filter).narrowed,
+        narrowed=narrowed,
+        workspace_share=share,
     )
     return BY_PLAN[plan]
 
@@ -544,21 +583,39 @@ def run(
     return (time.perf_counter() - started) * 1000, [(str(r[0]), float(r[1])) for r in rows]
 
 
-def equivalent(first: list[tuple[str, float]], second: list[tuple[str, float]]) -> bool:
-    """Whether two results are the same ranking.
+def equivalent(
+    first: list[tuple[str, float]],
+    second: list[tuple[str, float]],
+    *,
+    limit: int,
+    full: list[tuple[str, float]] | None = None,
+) -> bool:
+    """Whether two results of a search with ``LIMIT limit`` are the same ranking.
 
-    SQLite does not specify the order of equal scores, and where equal scores straddle ``LIMIT``
-    it does not specify which of them are kept, so ordered equality would be a stricter claim
-    than the statements make. Scores must match position by position; within each score the
-    chunks must match as a set, except for the last score, whose members may be any of the tied.
+    SQLite does not specify the order of equal scores, nor which of them a ``LIMIT`` keeps, so
+    ordered equality would be a stricter claim than the statements make. Scores must match
+    position by position, and the chunks of each score must match as a set, with one exception.
+    When a result fills the limit its last score group may have been cut, and the two results
+    may then hold different members of it: each must hold only members of that group in
+    ``full``, the same search without the limit. Without ``full`` that one group is unchecked.
+    A result shorter than ``limit`` was not cut, so every group of it is checked.
     """
     if [score for _, score in first] != [score for _, score in second]:
         return False
     if not first:
         return True
+    cut = len(first) >= limit
     last = first[-1][1]
-    for score in {score for _, score in first if score != last}:
-        if {c for c, s in first if s == score} != {c for c, s in second if s == score}:
+    for score in {score for _, score in first}:
+        ours = {c for c, s in first if s == score}
+        theirs = {c for c, s in second if s == score}
+        if cut and score == last:
+            if full is None:
+                continue
+            group = {c for c, s in full if s == score}
+            if not (ours <= group and theirs <= group):
+                return False
+        elif ours != theirs:
             return False
     return True
 
@@ -625,7 +682,7 @@ def warm(
             for name, t in times.items()
         },
         chosen=chosen(db, shape),
-        agree=all(equivalent(reference, rows) for rows in results.values())
+        agree=all(equivalent(reference, rows, limit=shape.limit) for rows in results.values())
         if reference is not None
         else True,
         matched=len(reference or []),
@@ -805,6 +862,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--chunks", type=int, default=100_000)
     parser.add_argument("--work", type=Path, default=None, help="keep the corpus here")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="rebuild a corpus this benchmark built earlier in --work (it deletes that directory)",
+    )
     parser.add_argument("--reuse", action="store_true", help="measure an existing corpus in --work")
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument(
@@ -853,7 +915,7 @@ def report(args: argparse.Namespace, work: Path) -> None:  # noqa: PLR0912 - one
         loaded.close()
         corpus = Corpus(work, total, bulk)
     else:
-        corpus = build_corpus(work, args.chunks)
+        corpus = build_corpus(work, args.chunks, overwrite=args.overwrite)
     sys.stdout.write(
         f"sqlite {sqlite3.sqlite_version}; {corpus.chunks} chunks; "
         f"built in {time.perf_counter() - started:.0f}s\n"

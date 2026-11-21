@@ -15,11 +15,13 @@ import pytest
 from manicule.storage.fts import LexicalPlan
 from tests.benchmarks.lexical_plans import (
     FIRST,
+    OWNER_MARKER,
     QUERIES,
     RANKED,
     TODAY,
     VARIANTS,
     Corpus,
+    DirectoryNotOwnedError,
     Shape,
     build_corpus,
     child,
@@ -35,7 +37,7 @@ from tests.benchmarks.lexical_plans import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from pathlib import Path
 
 
 @pytest.fixture(scope="module")
@@ -124,6 +126,7 @@ def test_every_statement_timed_returns_the_same_ranking(
     [
         ("common-3", "no filter", LexicalPlan.RANKED),
         ("common-3", "source 5%", LexicalPlan.DIRECT),
+        ("common-3", "small workspace", LexicalPlan.DIRECT),
         ("single-common", "no filter", LexicalPlan.DIRECT),
         ("paste-16", "no filter", LexicalPlan.DIRECT),
         ("prose-6", "readers 5%", LexicalPlan.RANKED),
@@ -187,13 +190,58 @@ def test_a_cold_run_prints_one_number_for_a_fresh_connection(
 def test_ties_are_compared_as_sets_and_scores_exactly() -> None:
     base = [("a", -3.0), ("b", -2.0), ("c", -2.0), ("d", -1.0)]
 
-    assert equivalent(base, [("a", -3.0), ("c", -2.0), ("b", -2.0), ("e", -1.0)]), (
-        "the last score's members may be any of the tied, and equal scores may swap places"
+    assert equivalent(base, [("a", -3.0), ("c", -2.0), ("b", -2.0), ("d", -1.0)], limit=10)
+    assert not equivalent(base, [("a", -3.0), ("b", -2.0), ("x", -2.0), ("d", -1.0)], limit=10)
+    assert not equivalent(
+        base, [("a", -3.0), ("b", -2.0), ("c", -2.0), ("d", -1.0000001)], limit=10
     )
-    assert not equivalent(base, [("a", -3.0), ("b", -2.0), ("x", -2.0), ("d", -1.0)])
-    assert not equivalent(base, [("a", -3.0), ("b", -2.0), ("c", -2.0), ("d", -1.0000001)])
-    assert not equivalent(base, base[:3])
-    assert equivalent([], [])
+    assert not equivalent(base, base[:3], limit=10)
+    assert equivalent([], [], limit=10)
+
+
+def test_a_complete_result_must_match_in_its_last_score_group_too() -> None:
+    """Fewer rows than the limit means nothing was cut, so there is no tie to be lenient about."""
+    assert not equivalent([("a", -1.0)], [("b", -1.0)], limit=5)
+    assert not equivalent([("a", -2.0), ("b", -1.0)], [("a", -2.0), ("c", -1.0)], limit=5)
+    assert equivalent([("a", -1.0)], [("a", -1.0)], limit=5)
+
+
+def test_a_cut_last_group_may_differ_only_within_the_complete_tie_group() -> None:
+    full = [("a", -3.0), ("b", -2.0), ("c", -2.0), ("d", -2.0), ("e", -1.0)]
+    cut = [("a", -3.0), ("b", -2.0)]
+
+    assert equivalent(cut, [("a", -3.0), ("d", -2.0)], limit=2, full=full)
+    assert not equivalent(cut, [("a", -3.0), ("x", -2.0)], limit=2, full=full)
+    assert not equivalent([("a", -3.0), ("x", -2.0)], cut, limit=2, full=full)
+    assert not equivalent(
+        [("a", -3.0), ("b", -2.0)], [("z", -3.0), ("d", -2.0)], limit=2, full=full
+    )
+
+
+def test_an_unmarked_non_empty_directory_is_refused_and_left_untouched(tmp_path: Path) -> None:
+    victim = tmp_path / "somebodys-directory"
+    victim.mkdir()
+    keep = victim / "precious.txt"
+    keep.write_text("do not delete")
+
+    with pytest.raises(DirectoryNotOwnedError):
+        build_corpus(victim, 10_000)
+    with pytest.raises(DirectoryNotOwnedError):
+        build_corpus(victim, 10_000, overwrite=True)
+
+    assert [p.name for p in victim.iterdir()] == ["precious.txt"]
+    assert keep.read_text() == "do not delete"
+
+
+def test_an_owned_corpus_is_rebuilt_only_when_asked(corpus: Corpus, tmp_path: Path) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / OWNER_MARKER).write_text("")
+    (owned / "stale.db").write_text("x")
+
+    with pytest.raises(DirectoryNotOwnedError, match="--overwrite"):
+        build_corpus(owned, 10_000)
+    assert (owned / "stale.db").exists()
 
 
 def test_the_report_has_a_column_per_statement_and_flags_a_disagreement(

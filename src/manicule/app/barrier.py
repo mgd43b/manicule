@@ -73,6 +73,14 @@ class _Hold:
     kind: _Kind
     source: str | None = None
     active: bool = True
+    inflight: int = 0
+    """Covered publications that entered under this hold and have not yet left.
+
+    A lease's slot is freed when the lease has exited *and* this is zero, so a worker that is
+    still inside a publication when the run's block exits keeps maintenance out until it is
+    done, rather than relying on every run to have joined its workers first."""
+    exited: bool = False
+    freed: bool = False
 
 
 _HELD: ContextVar[tuple[_Hold, ...]] = ContextVar("manicule_derived_barrier_holds", default=())
@@ -182,16 +190,25 @@ class DerivedBarrier:
             yield
         finally:
             hold.active = False
+            hold.exited = True
             _HELD.reset(token)
-            self._state.running[slot] = False
-            self._wake()
+            self._free(hold, slot)
 
     @asynccontextmanager
     async def publication(self, name: str) -> AsyncGenerator[None]:
         """Publish one document of source ``name``: covered, or exclusive when standing alone."""
         held = self._holding()
-        if self._covers(held, name):
-            yield
+        covering = self._covering(held, name)
+        if covering is not None:
+            # Counted against the lease it entered under, so a worker still in here when the
+            # run's block exits holds the slot until it leaves.
+            covering.inflight += 1
+            try:
+                yield
+            finally:
+                covering.inflight -= 1
+                if covering.kind is _Kind.SOURCE and covering.source is not None:
+                    self._free(covering, self.slot_of(covering.source))
             return
         if held:
             msg = (
@@ -208,11 +225,23 @@ class DerivedBarrier:
         return tuple(hold for hold in _HELD.get() if hold.barrier is self and hold.active)
 
     @staticmethod
-    def _covers(held: tuple[_Hold, ...], source: str) -> bool:
-        return any(
-            hold.kind is _Kind.EXCLUSIVE or (hold.kind is _Kind.SOURCE and hold.source == source)
-            for hold in held
-        )
+    def _covering(held: tuple[_Hold, ...], source: str) -> _Hold | None:
+        for hold in held:
+            if hold.kind is _Kind.EXCLUSIVE or (
+                hold.kind is _Kind.SOURCE and hold.source == source
+            ):
+                return hold
+        return None
+
+    def _covers(self, held: tuple[_Hold, ...], source: str) -> bool:
+        return self._covering(held, source) is not None
+
+    def _free(self, hold: _Hold, slot: str) -> None:
+        """Free ``slot`` once its lease has exited and no publication entered under it remains."""
+        if hold.exited and hold.inflight == 0 and not hold.freed:
+            hold.freed = True
+            self._state.running[slot] = False
+            self._wake()
 
     @staticmethod
     def _describe(held: tuple[_Hold, ...]) -> str:

@@ -1433,10 +1433,12 @@ class QdrantVectorStore:
                     f"Qdrant did not finish building the payload index on {field!r} within the "
                     f"request timeout (storage.qdrant.timeout_s). The first prepare after an "
                     f"upgrade that adds an index to a collection builds it before answering, and "
-                    f"a large collection can take longer than one request is allowed. The vector "
-                    f"store was not marked prepared and nothing was written, so retrying is "
-                    f"safe; if it keeps timing out, raise storage.qdrant.timeout_s for that "
-                    f"start."
+                    f"a large collection can take longer than one request is allowed. Preparation "
+                    f"did not finish: changes made on the server before this point, such as the "
+                    f"collection, earlier indexes or a shape change, may already be present, and "
+                    f"the vector store was not marked prepared. Retrying is safe, because "
+                    f"preparation checks the existing collection and declares the indexes again; "
+                    f"if it keeps timing out, raise storage.qdrant.timeout_s for that run."
                 )
                 raise TimeoutError(msg) from exc
 
@@ -1919,16 +1921,15 @@ def _is_timeout(error: Exception) -> bool:
     Over REST the client wraps whatever its HTTP library raised in one exception type whose text
     is the library's own, and a read timeout's text is empty; the wrapped exception says which it
     was, and it is read by name so that this does not import the HTTP library the client happens
-    to be built on. Over gRPC a deadline is not wrapped at all: it arrives as the channel's own
-    error, whose status code is ``DEADLINE_EXCEEDED``, and that is read the same way for the same
-    reason. Every other failure is not this one's to reword.
+    to be built on. Only a read timeout counts: a connect, write or pool timeout never reached
+    the server as a slow index build, so it keeps its own wording. Over gRPC a deadline is not
+    wrapped at all: it arrives as the channel's own error, whose status code is
+    ``DEADLINE_EXCEEDED``, and that is read the same way for the same reason. Every other failure
+    is not this one's to reword.
     """
     if isinstance(error, ResponseHandlingException):
         cause = error.source
-        # A connect timeout never reached the server, so no index was being built; it is the
-        # unreachable-server failure it always was and keeps its own wording.
-        name = type(cause).__name__
-        return isinstance(cause, TimeoutError) or ("Timeout" in name and "Connect" not in name)
+        return isinstance(cause, TimeoutError) or type(cause).__name__ == "ReadTimeout"
     code = getattr(error, "code", None)
     if not callable(code):
         return False

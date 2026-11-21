@@ -1007,8 +1007,8 @@ know (measured: `retrieval.md` §4.1):
 
 | Statement | What differs | Chosen for |
 |---|---|---|
-| `SEARCH_SQL` (direct) | the statement above | one word; two or more with a narrow filter (source, media type, kind, language, time) or a listed scope too big to walk; more than six words |
-| `SEARCH_SQL_RANKED` | `ORDER BY chunks_fts.rank`, weights set per statement by `chunks_fts.rank MATCH 'bm25(1.0, 0.4)'`, no sort | two to six words with no narrowing and no document list (a reader set does not narrow) |
+| `SEARCH_SQL` (direct) | the statement above | one word; two or more with a narrow filter (source, media type, kind, language, time), a listed scope too big to walk, or a workspace holding under half of the installation; more than six words |
+| `SEARCH_SQL_RANKED` | `ORDER BY chunks_fts.rank`, weights set per statement by `chunks_fts.rank MATCH 'bm25(1.0, 0.4)'`, no sort | two to six words with no narrowing, no document list, and a workspace holding at least half of the installation's live documents (a reader set does not narrow) |
 | `SEARCH_SQL_DOCUMENT_FIRST` | `CROSS JOIN` from `documents`, tie-broken on `c.seq` | a listed scope of at most 64 documents holding at most 32 chunks, counted by a bounded indexed probe |
 
 The probe is a hint to choose a statement and never a restriction: every statement carries every

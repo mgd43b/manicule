@@ -17,6 +17,9 @@ correctness of the counts is held by the first of those; this guards the program
 
 from __future__ import annotations
 
+import asyncio
+from typing import cast
+
 import pytest
 from qdrant_client import AsyncQdrantClient
 
@@ -34,6 +37,7 @@ from tests.benchmarks.qdrant_checksum_coverage import (
     payload_for,
     percentile,
     render,
+    sample_latency,
 )
 from tests.qdrant_support import TEST_COLLECTION_PREFIX, remote_client, require_server
 
@@ -97,7 +101,12 @@ def test_the_command_line_has_no_way_to_name_a_collection() -> None:
 def test_the_rendering_names_every_arm_and_both_responsiveness_phases() -> None:
     """Pasted into pull requests, so it has to read without the program."""
     sample = Responsiveness(
-        search_p50_ms=1.0, search_p99_ms=2.0, ping_p50_ms=0.5, ping_p99_ms=0.9, samples=10
+        search_p50_ms=1.0,
+        search_p99_ms=2.0,
+        ping_p50_ms=0.5,
+        ping_p99_ms=0.9,
+        samples=10,
+        ping_samples=10,
     )
     arms = tuple(
         ArmResult(
@@ -145,6 +154,40 @@ def test_the_arms_are_named_for_what_they_are() -> None:
     assert ARMS == ("baseline", "shipped", "candidate-two-branch")
 
 
+async def test_a_probe_that_never_ran_during_the_work_reports_no_sample() -> None:
+    """Whether the work is done is checked before each probe starts, not after it finished."""
+
+    class Untouched:
+        """A client that fails the test if the sampler sends it anything."""
+
+        async def query_points(self, *_: object, **__: object) -> None:
+            raise AssertionError("a probe started after the work had finished")
+
+        async def get_collections(self) -> None:
+            raise AssertionError("a probe started after the work had finished")
+
+    finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    finished.set_result(None)
+
+    sample = await sample_latency(
+        cast("AsyncQdrantClient", Untouched()),
+        "unused",
+        [0.0],
+        probes=10,
+        interval=0.0,
+        floor_seconds=0.0,
+        until=finished,
+    )
+
+    assert (sample.samples, sample.ping_samples) == (0, 0)
+
+
+async def test_a_run_with_nothing_to_repeat_is_refused_before_a_client_is_opened() -> None:
+    """No server is needed to refuse: the check comes first, so nothing is created to clean up."""
+    with pytest.raises(ValueError, match="repeats"):
+        await measure(url="http://127.0.0.1:1", points=240, dimension=8, repeats=0)
+
+
 async def test_a_run_reports_every_arm_exactly_and_removes_only_what_it_made() -> None:
     """Against a throwaway server, small: the arms agree with what was planted, and it cleans up.
 
@@ -179,7 +222,8 @@ async def test_a_run_reports_every_arm_exactly_and_removes_only_what_it_made() -
         assert run.truth == Truth(rows=240, unrecorded=3, half_written=6)
         assert run.collection.startswith(TEST_COLLECTION_PREFIX)
         assert run.index_build_seconds >= 0
-        assert run.during_index_build.samples >= 1
+        assert run.during_index_build.samples >= 0
+        assert run.during_index_build.ping_samples <= run.during_index_build.samples
         for result in run.arms:
             assert result.half_written_p50_ms <= result.half_written_p95_ms
             assert result.coverage_p50_ms <= result.coverage_p95_ms

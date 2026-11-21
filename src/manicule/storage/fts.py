@@ -455,6 +455,25 @@ the direct one at two to six words, a little slower at nine (0.94 times as fast)
 again at sixteen (0.87 times)."""
 
 
+MIN_RANKED_SHARE = 0.5
+"""The least share of the installation's live documents a workspace may hold and still use the
+ranked statement.
+
+The ranked statement orders every match in the index, whichever workspace it belongs to, and
+then walks them in rank order until enough belong to this one; the direct statement scores only
+the rows that pass its joins. So ranked's cost does not fall as the workspace shrinks and the
+direct statement's does. On a synthetic million-chunk index (SQLite 3.50.4, unfiltered searches
+of one workspace, ranked time over direct time): three common words 0.85 at a 76% share, 1.05 at
+47%, 1.23 at 24%, 1.5 at 3% and 1.7 at 1%; six words 1.0, 1.2, 1.4, 1.8 and 2.0; three middling
+words 0.5 to 0.9 down to 1%, and about 1.9 at 0.1%. Half is where ranked stops being
+clearly the better choice for the common words, and below it the loss grows."""
+
+
+def needs_workspace_share(terms: int, scoped_documents: int, *, narrowed: bool) -> bool:
+    """Whether :func:`choose_lexical_plan` would use the workspace's share of the installation."""
+    return scoped_documents == 0 and 1 < terms <= MAX_RANKED_TERMS and not narrowed
+
+
 def needs_scope_probe(terms: int, scoped_documents: int) -> bool:
     """Whether :func:`choose_lexical_plan` needs the chunk count of an explicit document scope."""
     return terms >= 1 and 0 < scoped_documents <= MAX_SCOPED_DOCUMENTS
@@ -466,6 +485,7 @@ def choose_lexical_plan(
     scoped_documents: int,
     scoped_chunks: int | None = None,
     narrowed: bool = False,
+    workspace_share: float | None = None,
 ) -> LexicalPlan:
     """Which statement answers a search, from facts about it that cost nothing to know.
 
@@ -482,13 +502,20 @@ def choose_lexical_plan(
             :data:`SCOPE_PROBE_SQL`. Required exactly when :func:`needs_scope_probe` says so.
         narrowed: Whether a source, media type, chunk kind, language or time bound restricts
             the search. A reader set does not count; see below.
+        workspace_share: The fraction of the installation's live documents this workspace
+            holds, from ``0`` to ``1``, or ``None`` when it is not known. Required for nothing:
+            unknown reads as "all of it", because the ranked statement is the one a lone
+            workspace wants and an estimate that failed must not slow a search. Only
+            :func:`needs_workspace_share` searches look at it.
 
     Returns:
         :attr:`LexicalPlan.DOCUMENT_FIRST` for a listed scope of at most
         :data:`MAX_SCOPED_DOCUMENTS` documents holding at most :data:`MAX_SCOPED_CHUNKS`
         chunks, because the walk is then the size of the scope. Otherwise
         :attr:`LexicalPlan.RANKED` for a disjunction of two to :data:`MAX_RANKED_TERMS` words
-        that is not narrowed and not listed, and :attr:`LexicalPlan.DIRECT` for the rest.
+        that is not narrowed, not listed and in a workspace holding at least
+        :data:`MIN_RANKED_SHARE` of the installation, and :attr:`LexicalPlan.DIRECT` for the
+        rest.
 
     Raises:
         ValueError: ``terms`` is below one, or a probe-sized scope arrives without its count.
@@ -496,12 +523,13 @@ def choose_lexical_plan(
     **Why the rest is direct.** Measured on a synthetic million-chunk index
     (``tests/benchmarks/lexical_plans.py``, ``docs/retrieval.md`` §4.1): the direct statement is
     the released one, so choosing it never regresses a search, and the ranked statement walks the
-    matches in rank order until enough pass. That is why it was 1.6 to 2.3 times *slower* when
-    the workspace is a small part of the index, and 1.2 to 5 times slower under a narrow filter
-    or a listed scope. One word keeps the direct statement, which is the released behavior: the
-    synthetic index says ranked was 1.7 times faster for a common word, but a single term is the
-    shape the released statement was tuned on, so the rule stays cautious there until a
-    measurement on real data says otherwise.
+    matches in rank order until enough pass. That is why it was 1.2 to 5 times slower under a
+    narrow filter or a listed scope, and why a workspace holding less than
+    :data:`MIN_RANKED_SHARE` of the installation's documents (1.6 to 2.3 times slower at
+    0.1%) is sent to the direct statement too. One word keeps the direct statement, which is the
+    released behavior: the synthetic index says ranked was 1.7 times faster for a common word,
+    but a single term is the shape the released statement was tuned on, so the rule stays
+    cautious there until a measurement on real data says otherwise.
 
     **A reader set is the one restriction that does not narrow, and that is a call.** Ranked
     was as fast or faster than direct at every share of the index a reader could see from 95%
@@ -524,6 +552,8 @@ def choose_lexical_plan(
         )
     if terms == 1 or terms > MAX_RANKED_TERMS or narrowed:
         return LexicalPlan.DIRECT
+    if workspace_share is not None and workspace_share < MIN_RANKED_SHARE:
+        return LexicalPlan.DIRECT
     return LexicalPlan.RANKED
 
 
@@ -539,6 +569,7 @@ __all__ = [
     "MAX_MATCH_WORDS",
     "MAX_SCOPED_CHUNKS",
     "MAX_SCOPED_DOCUMENTS",
+    "MIN_RANKED_SHARE",
     "REBUILD_FTS",
     "SCOPE_PROBE_LIMIT",
     "SCOPE_PROBE_SQL",
@@ -552,4 +583,5 @@ __all__ = [
     "match_terms",
     "match_words",
     "needs_scope_probe",
+    "needs_workspace_share",
 ]

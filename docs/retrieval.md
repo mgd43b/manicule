@@ -644,7 +644,28 @@ source holding 0.1% of documents 2,802 to 543; ids of 20 chunks 1,041 to 114; id
 seconds as released at 100,000 chunks and 40 ms with `+d.source`. Ranked was 1.2 to 2.3 times
 faster than direct at two to six words with no filter and about level at nine and sixteen; it
 was 1.6 to 2.3 times slower when the workspace was a small part of the index (3 words, 1M: 589 vs
-320 ms), and slower under a narrow filter or a listed scope, which is why those keep direct. Over
+320 ms), and slower under a narrow filter or a listed scope, which is why those keep direct.
+
+**A workspace's share of the installation.** Ranked orders every match in the index and walks
+them until enough belong to the searching workspace, so its cost does not fall as the workspace
+shrinks and the direct statement's does. Unfiltered searches of one workspace after moving
+documents between workspaces on the same synthetic corpus, ranked time over direct time, at
+1,000,000 chunks: three common words 0.85 at a 76% share, 0.94 at 62%, 1.05 at 47%, 1.23 at
+24%, 1.46 at 10%, 1.51 at 3%, 1.68 at 1%; six words 1.01, 1.10, 1.21, 1.41, 1.71, 1.82, 2.00;
+two words with one rare 0.65 to 1.24 over the same range; three middling words 0.50 to 0.90
+(ranked still ahead) down to 1%, and 1.9 for a workspace of 0.1%. At 100,000 chunks the break-even
+is higher still (three words 0.97 at 75%, 1.06 at 61%, 1.21 at 47%, 2.2 at 3%). The chooser
+therefore sends a multi-word search to the ranked statement only when the workspace holds at
+least half of the installation's live documents (`MIN_RANKED_SHARE`), and to the direct one
+below that. Through `search_lexical` after the change, a workspace holding 0.1% of the documents
+reads the same as the released statement: three common words 308 ms against 308 (1M) and 22
+against 22 (100k); three middling words 90 against 92; six words 322 against 344. The share is
+one grouped count over the covering index on live documents, read at most once a minute per store
+(0.5 ms at 19,000 documents, 1.2 ms at 50,000, 5.8 ms at 200,000), inside the search's own
+session; an installation with no documents, or a failed read, counts as "unknown", which keeps
+the ranked statement. It counts documents, not chunks, which agree on this corpus because its
+documents are all of one size; where they do not, the share is an estimate and only the choice of
+statement moves. Over
 a listed scope the document-first walk beat direct up to about 64 chunks for three common words
 and only to about 20 for sixteen, so the budget is 32 chunks. A reader set was level to 2.5 times
 faster under ranked from 95% to 5% of the index readable and 0.75 to 1.13 times as fast at 0.1%.
