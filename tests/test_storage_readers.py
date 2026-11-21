@@ -8,7 +8,7 @@ are a corpus that answers the same question two ways.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import select, text
@@ -26,8 +26,16 @@ from manicule.core.readers import (
 from manicule.core.retrieval import Filter, Query
 from manicule.retrieval.router import UtilityKind
 from manicule.retrieval.utility import handlers_for
+from manicule.storage import docstore as docstore_module
 from manicule.storage import models
-from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
+from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore, lexical_predicates
+from manicule.storage.fts import (
+    SEARCH_SQL,
+    SEARCH_SQL_DOCUMENT_FIRST,
+    SEARCH_SQL_RANKED,
+    LexicalPlan,
+    escape_match_query,
+)
 from manicule.storage.readers import readable, readable_sql
 from tests.storage_helpers import make_chunk, make_document
 
@@ -37,6 +45,11 @@ if TYPE_CHECKING:
     from manicule.core.content import Document
 
 SCOPE = frozenset({DEFAULT_WORKSPACE})
+TEMPLATES = {
+    LexicalPlan.DIRECT: SEARCH_SQL,
+    LexicalPlan.RANKED: SEARCH_SQL_RANKED,
+    LexicalPlan.DOCUMENT_FIRST: SEARCH_SQL_DOCUMENT_FIRST,
+}
 
 
 async def _person(store: SqliteDocStore, user_id: str) -> str:
@@ -174,6 +187,79 @@ async def test_the_lexical_leg_applies_the_reader_set_before_its_limit(
         restricted.id,
     }
     assert [candidate.chunk.document_id for candidate in first] == [open_document.id]
+
+
+@pytest.mark.parametrize("plan", list(LexicalPlan), ids=lambda plan: plan.value)
+async def test_every_lexical_statement_applies_the_reader_set_before_its_limit(
+    store: SqliteDocStore, plan: LexicalPlan
+) -> None:
+    """The reader predicate is one fragment spliced into three statements, and each of them has
+    to put it before ``LIMIT``: strong chunks of the restricted source outrank the open ones, so
+    a statement that applied it afterwards would return nothing for a reader outside the group.
+    """
+    open_document, restricted = await _corpus(store)
+    member = await _restrict(store)
+    strong = [
+        make_chunk(restricted, position, "authentication tokens authentication tokens")
+        for position in range(1, 9)
+    ]
+    await store.replace_chunks(
+        restricted.id, [make_chunk(restricted, 0, "authentication tokens restricted"), *strong]
+    )
+    await store.replace_chunks(
+        open_document.id,
+        [
+            make_chunk(open_document, 0, "authentication tokens open"),
+            make_chunk(open_document, 1, "tokens of authentication, open"),
+        ],
+    )
+
+    async def ranked(readers: frozenset[str], k: int) -> list[str]:
+        restriction = Filter(workspace_ids=SCOPE, readers=readers)
+        predicates = lexical_predicates(DEFAULT_WORKSPACE, restriction)
+        statement = predicates.statement(
+            TEMPLATES[plan], document_first=plan is LexicalPlan.DOCUMENT_FIRST
+        )
+        params = {"match": escape_match_query("authentication tokens"), "limit": k}
+        async with store.sessions() as session:
+            rows = (await session.execute(statement, params | predicates.params)).all()
+        return [str(row.chunk_id) for row in rows]
+
+    outsider = await ranked(frozenset(), 2)
+    insider = await ranked(frozenset({member}), 20)
+
+    assert len(outsider) == 2, "the restricted rows took the limit's slots"
+    assert {chunk.document_id for chunk in await store.get_chunks(outsider)} == {open_document.id}
+    assert {chunk.document_id for chunk in await store.get_chunks(insider)} == {
+        open_document.id,
+        restricted.id,
+    }
+
+
+async def test_a_reader_set_does_not_move_a_search_off_the_ranked_statement(
+    store: SqliteDocStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gated installation reads through the same statement an ungated one does, because a
+    reader set removes rows without making the search narrow (``choose_lexical_plan``)."""
+    open_document, _ = await _corpus(store)
+    member = await _restrict(store)
+    seen: list[LexicalPlan] = []
+    real = docstore_module.choose_lexical_plan
+
+    def spy(**facts: Any) -> LexicalPlan:
+        seen.append(real(**facts))
+        return seen[-1]
+
+    monkeypatch.setattr(docstore_module, "choose_lexical_plan", spy)
+
+    readers_held: tuple[frozenset[str], ...] = (frozenset(), frozenset({member}))
+    for readers in readers_held:
+        found = await store.search_lexical(
+            "authentication tokens", 10, Filter(workspace_ids=SCOPE, readers=readers)
+        )
+        assert open_document.id in {candidate.chunk.document_id for candidate in found}
+
+    assert seen == [LexicalPlan.RANKED, LexicalPlan.RANKED]
 
 
 @pytest.mark.parametrize("holding", ["nothing", "the group", "another group", "a person"])

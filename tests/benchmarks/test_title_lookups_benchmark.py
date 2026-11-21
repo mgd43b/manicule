@@ -16,9 +16,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from manicule.container import keys
+from manicule.core.retrieval import Filter
 from manicule.plugins.registry import discover
 from manicule.storage import docstore as docstore_module
-from manicule.storage.fts import SEARCH_SQL
+from manicule.storage.docstore import DEFAULT_WORKSPACE, SqliteDocStore
+from manicule.storage.fts import SEARCH_SQL, SEARCH_SQL_DOCUMENT_FIRST, SEARCH_SQL_RANKED
 from tests.benchmarks import thread_duplication
 from tests.benchmarks.lexical_questions import Asked, index_docs, run_docs
 from tests.benchmarks.test_thread_duplication_benchmark import CountingEmbedder
@@ -35,6 +37,7 @@ from tests.benchmarks.title_lookups import (
     rewrite_heading_text,
     unchanged,
 )
+from tests.storage_helpers import make_chunk, make_document
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -64,10 +67,46 @@ def test_a_heading_is_asked_once_and_only_when_its_text_is_unique(tmp_path: Path
     assert {a.group for a in asked} == {"headings"}
 
 
-def test_a_heading_weight_changes_the_statement_and_restores_it() -> None:
+def test_a_heading_weight_changes_every_statement_the_store_may_choose_and_restores_them() -> None:
     with heading_weight(1.0):
         assert docstore_module.SEARCH_SQL.count("bm25(chunks_fts, 1.0, 1.0)") == 2
+        assert docstore_module.SEARCH_SQL_DOCUMENT_FIRST.count("bm25(chunks_fts, 1.0, 1.0)") == 2
+        assert docstore_module.SEARCH_SQL_RANKED.count("'bm25(1.0, 1.0)'") == 1
     assert docstore_module.SEARCH_SQL == SEARCH_SQL
+    assert docstore_module.SEARCH_SQL_DOCUMENT_FIRST == SEARCH_SQL_DOCUMENT_FIRST
+    assert docstore_module.SEARCH_SQL_RANKED == SEARCH_SQL_RANKED
+
+
+async def test_a_changed_heading_weight_reaches_the_statement_a_search_actually_runs(
+    store: SqliteDocStore,
+) -> None:
+    """Every statement the store may run, not just the first one the title lookups take.
+
+    One chunk matches ``alpha beta`` only in its heading. Its score moves with the weight under
+    the direct statement (a single word), the ranked one (two words, no scope) and the
+    document-first one (two words, a one-document scope), which is what asserting that the
+    harness changed them proves and a string comparison cannot.
+    """
+    document = make_document(source_id="weighted")
+    await store.upsert_document(document)
+    await store.replace_chunks(
+        document.id, [make_chunk(document, 0, "nothing", heading_path=("alpha", "beta"))]
+    )
+    scope = Filter(
+        workspace_ids=frozenset({DEFAULT_WORKSPACE}), document_ids=frozenset({document.id})
+    )
+    searches = [("alpha", None), ("alpha beta", None), ("alpha beta", scope)]
+
+    shipped = [(await store.search_lexical(text, 5, scope_))[0].score for text, scope_ in searches]
+    with heading_weight(1.0):
+        raised = [
+            (await store.search_lexical(text, 5, scope_))[0].score for text, scope_ in searches
+        ]
+
+    assert all(after > before for before, after in zip(shipped, raised, strict=True)), (
+        shipped,
+        raised,
+    )
 
 
 def test_only_the_rerank_candidate_names_a_reranker() -> None:

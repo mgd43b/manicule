@@ -23,10 +23,15 @@ import hashlib
 import struct
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Final, cast
 
+import httpx
 import pytest
+from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.conversions.common_types import PointId
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from manicule.config.settings import Settings
 from manicule.container.container import check_wiring
@@ -34,6 +39,7 @@ from manicule.container.keys import ComponentKey
 from manicule.core.content import LEGACY_PUBLICATION, BlockKind, Chunk
 from manicule.core.embedding import (
     VECTOR_CHECKSUM_VERSION,
+    VectorChecksumCoverage,
     VectorIntegrity,
     VectorState,
     canonical_stored_vector,
@@ -105,7 +111,7 @@ from tests.qdrant_support import (
 from tests.storage_helpers import fingerprint, make_chunk, make_document
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 WORKSPACE: Final = "workspace-under-test"
 
@@ -385,7 +391,10 @@ def test_every_field_a_filter_can_name_is_indexed() -> None:
 
     assert {DOCUMENT_ID_COLUMN, KIND_COLUMN, LANG_COLUMN} <= indexed, "search filters on these"
     assert {CHUNK_ID_COLUMN, IDENTITY_COLUMN} <= indexed, "stored_vectors looks these up"
-    assert CHECKSUM_COLUMN in indexed, "the backfill selects on this"
+    assert {CHECKSUM_COLUMN, CHECKSUM_VERSION_COLUMN} <= indexed, (
+        "the checksum count and the backfill select on both halves of the pair, and a count that "
+        "filters on a field with no index reads every payload to answer"
+    )
 
 
 def test_local_mode_is_recognized_without_reaching_for_a_private_attribute(
@@ -1234,6 +1243,707 @@ async def test_a_checksum_cleared_to_an_empty_string_counts_as_unrecorded(
     assert (await store.checksum_coverage(recompute=True)).verified == 1
 
 
+# --- checksum coverage: exactness, cost and repair ------------------------------------------
+#
+# The counting mode of ``checksum_coverage`` and the backfill select points by what two payload
+# fields record, and the selection is Qdrant's. Everything below is written against that
+# selection directly — the point *sets* each filter picks, not only their sizes — because two
+# filters that count alike can pick different points, and the backfill acts on the points.
+
+ABSENT: Final = object()
+"""A payload value that is not there at all, as opposed to one that is ``null``."""
+
+UNRECORDED_VALUES: Final[tuple[object, ...]] = (ABSENT, None, "", [], [""], ["", "x"])
+"""Every shape a field can take that Qdrant reads as "this field records nothing".
+
+``is_empty`` is true for a missing key, a ``null`` and ``[]``; the equality with ``""`` is true
+for the empty string and for an array containing it. Nothing else is either.
+"""
+
+_EMPTY_ARRAY_IN_AN_ARRAY: Final[list[object]] = [[]]
+
+RECORDED_VALUES: Final[tuple[object, ...]] = (
+    [None],
+    _EMPTY_ARRAY_IN_AN_ARRAY,
+    [[""]],
+    "abc",
+    ["a"],
+    5,
+    True,
+    1.5,
+    {},
+    {"a": 1},
+)
+"""Shapes that look empty or wrong and are neither, so the field counts as recorded.
+
+An array holding a ``null`` or an empty array is not empty; a number, a boolean and an object
+are not the empty string. Python's own checksum reader disagrees about some of these, and this
+store's count is Qdrant's, so these are what the count has to say.
+"""
+
+VALUE_MATRIX: Final[tuple[object, ...]] = (*UNRECORDED_VALUES, *RECORDED_VALUES)
+"""Sixteen values for each of the two fields, so every pair of shapes is a point."""
+
+
+def _records_nothing(value: object) -> bool:
+    """Qdrant's reading of "this field records nothing", written out from its semantics."""
+    if value is ABSENT or value is None:
+        return True
+    if isinstance(value, list):
+        return not value or "" in cast("list[object]", value)
+    return value == ""
+
+
+def _payload_of(checksum: object, version: object) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    if checksum is not ABSENT:
+        payload[CHECKSUM_COLUMN] = checksum
+    if version is not ABSENT:
+        payload[CHECKSUM_VERSION_COLUMN] = version
+    return payload
+
+
+def _matrix(dimension: int) -> tuple[list[models.PointStruct], dict[int, tuple[object, object]]]:
+    """One point for every pair of values, and what each pair is, keyed by point id."""
+    points: list[models.PointStruct] = []
+    cells: dict[int, tuple[object, object]] = {}
+    for checksum_index, checksum in enumerate(VALUE_MATRIX):
+        for version_index, version in enumerate(VALUE_MATRIX):
+            point_id = checksum_index * len(VALUE_MATRIX) + version_index + 1
+            cells[point_id] = (checksum, version)
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=spread(dimension, point_id),
+                    payload=_payload_of(checksum, version),
+                )
+            )
+    return points, cells
+
+
+def _expected_sets(
+    cells: dict[int, tuple[object, object]],
+) -> tuple[set[int], set[int], set[int]]:
+    """The points recording neither half, only a checksum, and only a version.
+
+    Derived from :func:`_records_nothing` and nothing in the store. The last two are the
+    half-written kinds, and ``recorded - neither`` is what coverage calls recorded.
+    """
+    neither = {
+        point_id
+        for point_id, (checksum, version) in cells.items()
+        if _records_nothing(checksum) and _records_nothing(version)
+    }
+    only_checksum = {
+        point_id
+        for point_id, (checksum, version) in cells.items()
+        if not _records_nothing(checksum) and _records_nothing(version)
+    }
+    only_version = {
+        point_id
+        for point_id, (checksum, version) in cells.items()
+        if _records_nothing(checksum) and not _records_nothing(version)
+    }
+    return neither, only_checksum, only_version
+
+
+async def _matching(
+    client: AsyncQdrantClient, collection: str, condition: models.Filter | None
+) -> set[int]:
+    """The ids of every point ``condition`` selects, read back page by page."""
+    ids: set[int] = set()
+    offset: PointId | None = None
+    while True:
+        found, offset = await client.scroll(
+            collection_name=collection,
+            scroll_filter=condition,
+            limit=100,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        ids.update(int(cast("int", point.id)) for point in found)
+        if offset is None:
+            return ids
+
+
+def _spy_counts(
+    client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> list[models.Filter | None]:
+    """Every filter a ``count`` is asked with, in order, passed through to the engine."""
+    seen: list[models.Filter | None] = []
+    original = client.count
+
+    async def spying(*args: Any, **kwargs: Any) -> models.CountResult:
+        seen.append(kwargs.get("count_filter"))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(client, "count", spying)
+    return seen
+
+
+def _script_counts(
+    client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch, *answers: int
+) -> list[int]:
+    """Make the next ``count`` calls answer ``answers`` in order, whatever they are asked.
+
+    Returns the answers not yet given, so a test can see that exactly as many requests were made
+    as it expected. A request beyond the script fails the test rather than being answered.
+    """
+    pending = list(answers)
+
+    async def scripted(*_: Any, **__: Any) -> models.CountResult:
+        return models.CountResult(count=pending.pop(0))
+
+    monkeypatch.setattr(client, "count", scripted)
+    return pending
+
+
+def _disagreement(
+    wrong: set[int], expected: set[int], cells: dict[int, tuple[object, object]]
+) -> str:
+    """The points two sets disagree about and the payload shapes they carry, for a failure."""
+    differing = sorted(wrong ^ expected)[:8]
+    shapes = "; ".join(
+        f"point {point_id} ({'selected' if point_id in wrong else 'not selected'}): "
+        f"checksum={cells[point_id][0]!r} version={cells[point_id][1]!r}"
+        for point_id in differing
+    )
+    return f"{len(wrong ^ expected)} point(s) differ, first of them: {shapes}"
+
+
+async def _assert_the_filters_select_what_the_oracle_does(
+    store: QdrantVectorStore,
+    client: AsyncQdrantClient,
+    collection: str,
+    cells: dict[int, tuple[object, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run the counting mode, then scroll with the very filters it sent and compare point sets.
+
+    The filters are captured from the requests rather than imported, so this holds the *wiring*
+    to the oracle: whatever the store sends is what is compared, as the set of points it selects
+    rather than as a count of them, and the oracle is a few lines of Python written from the
+    documented semantics, not another filter. A failure names the points and the payload shapes
+    they carry: on a server it can only mean a cell of the oracle's table is wrong for that
+    server, which is a fix to the table, or that an index changed which points a plan selects,
+    which is the defect this guards against.
+    """
+    seen = _spy_counts(client, monkeypatch)
+
+    coverage = await store.checksum_coverage()
+
+    assert [condition is None for condition in seen] == [True, False, False], (
+        "counting mode is three requests: the whole collection, the points recording neither "
+        "half, and the points recording exactly one"
+    )
+    _, pair, half = seen
+    assert pair is not None
+    assert half is not None
+    neither, only_checksum, only_version = _expected_sets(cells)
+    half_written = only_checksum | only_version
+    selected_by_pair = await _matching(client, collection, pair)
+    selected_by_half = await _matching(client, collection, half)
+
+    assert selected_by_half == half_written, "the half-written count moved: " + _disagreement(
+        selected_by_half, half_written, cells
+    )
+    assert selected_by_pair == neither, "the backfill's set moved: " + _disagreement(
+        selected_by_pair, neither, cells
+    )
+    assert selected_by_pair.isdisjoint(selected_by_half), (
+        "a half-written point is a backfill candidate"
+    )
+
+    assert coverage.rows == len(cells)
+    assert coverage.recorded == len(cells) - len(neither)
+    assert coverage.failed == len(half_written)
+    assert coverage.failures == {VectorIntegrity.MALFORMED.value: len(half_written)}
+
+
+def test_the_oracle_reads_the_values_the_way_qdrant_does() -> None:
+    """The table the rest of this section stands on, written out so the helper cannot drift.
+
+    ``[null]``, ``[[]]`` and ``[[""]]`` are the three that read as empty to a person and are
+    not; ``0`` and ``false`` are the two that read as absent to Python and are not either.
+    """
+    assert [value for value in VALUE_MATRIX if _records_nothing(value)] == list(UNRECORDED_VALUES)
+    assert not _records_nothing(0)
+    assert not _records_nothing(False)
+    assert len(VALUE_MATRIX) == 16
+
+
+async def test_the_half_written_count_selects_the_points_the_oracle_does(
+    store: QdrantVectorStore, client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exact point-set equivalence over every pair of shapes, in the engine local mode runs.
+
+    Local mode implements Qdrant's filter semantics in Python and matches the server on every
+    cell of this matrix, which is what makes it a fair first venue. The server run below repeats
+    it where indexes exist, because an index is what could change a *plan* and the plan must not
+    change which points are selected: the filter is what the semantics say, whatever the
+    server does to find the points.
+    """
+    await prepared(store)
+    collection = collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+    points, cells = _matrix(4)
+    await client.upsert(collection, points=points, wait=True)
+
+    await _assert_the_filters_select_what_the_oracle_does(
+        store, client, collection, cells, monkeypatch
+    )
+
+
+async def test_the_backfill_selects_the_points_that_record_neither_half_and_no_others(
+    store: QdrantVectorStore, client: AsyncQdrantClient
+) -> None:
+    """The backfill's scan is the pair-unrecorded set, and half-written points stay untouched.
+
+    Not a count: the payload of every point the oracle calls half written or recorded is read
+    before and after, and compared whole. A backfill that hashed a half-written pair would
+    replace the contradiction with a pass, and would do it to a point whose payload is the only
+    evidence it was damaged.
+    """
+    await prepared(store)
+    collection = collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+    points, cells = _matrix(4)
+    await client.upsert(collection, points=points, wait=True)
+    neither, only_checksum, only_version = _expected_sets(cells)
+
+    async def payloads() -> dict[int, dict[str, object]]:
+        found, _ = await client.scroll(collection, limit=1000, with_payload=True)
+        return {int(cast("int", point.id)): dict(point.payload or {}) for point in found}
+
+    before = await payloads()
+
+    planned = await store.backfill_checksums(dry_run=True)
+    assert planned.scanned == len(neither)
+    assert await payloads() == before, "a dry run wrote"
+
+    done = await store.backfill_checksums()
+    after = await payloads()
+
+    assert done.scanned == len(neither)
+    assert done.written == len(neither)
+    assert done.remaining == 0
+    untouched = {point_id for point_id in cells if point_id not in neither}
+    assert untouched >= only_checksum | only_version
+    assert {point_id: after[point_id] for point_id in untouched} == {
+        point_id: before[point_id] for point_id in untouched
+    }, "the backfill rewrote a point that records a checksum, a version or both"
+    for point_id in neither:
+        assert after[point_id][CHECKSUM_VERSION_COLUMN] == VECTOR_CHECKSUM_VERSION
+        assert after[point_id][CHECKSUM_COLUMN] != before[point_id].get(CHECKSUM_COLUMN, "")
+
+    again = await store.backfill_checksums()
+    assert (again.scanned, again.written) == (0, 0), "a finished backfill selects nothing"
+
+
+async def test_an_empty_collection_is_counted_in_one_request(
+    store: QdrantVectorStore, client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to cover is not a reason to ask three questions, or to report a failure.
+
+    It is a collection that exists and holds nothing, which is different from no collection at
+    all (``scanned`` is false there, and a test above holds that line). Zero rows, zero of
+    everything, and complete — reached by asking only how many rows there are.
+    """
+    await prepared(store)
+    seen = _spy_counts(client, monkeypatch)
+
+    coverage = await store.checksum_coverage()
+
+    assert (coverage.scanned, coverage.rows, coverage.recorded, coverage.failed) == (True, 0, 0, 0)
+    assert coverage.failures == {}
+    assert coverage.complete
+    assert seen == [None], "an empty collection was asked about its payload"
+
+
+async def test_counting_mode_is_three_count_requests_and_recomputing_asks_for_two(
+    store: QdrantVectorStore, client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cost of the cheap mode is a number of requests, so it is pinned as one.
+
+    Counting asks for the whole collection, the points recording neither half, and the points
+    recording exactly one. An explicit recomputation does not count the half-written ones — the
+    scan it performs finds them — so it asks for two and then reads the vectors. A fourth count
+    appearing in either is a cost somebody should have chosen.
+    """
+    await prepared(store)
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    await store.upsert(chunks, [spread(4, index) for index in range(3)])
+    seen = _spy_counts(client, monkeypatch)
+
+    await store.checksum_coverage()
+    counted = list(seen)
+    seen.clear()
+    await store.checksum_coverage(recompute=True)
+
+    assert [condition is None for condition in counted] == [True, False, False]
+    assert [condition is None for condition in seen] == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("answers", "expected"),
+    [
+        pytest.param((3, 5, 0), (0, 0), id="more-unrecorded-than-rows"),
+        pytest.param((3, 0, 4), (3, 3), id="more-half-written-than-rows"),
+        pytest.param((10, 12, 13), (0, 10), id="both-at-once"),
+        pytest.param((10, 4, 2), (6, 2), id="consistent-counts-are-left-alone"),
+    ],
+)
+async def test_counts_that_disagree_cannot_manufacture_impossible_coverage(
+    store: QdrantVectorStore,
+    client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    answers: tuple[int, int, int],
+    expected: tuple[int, int],
+) -> None:
+    """Three requests are three moments, and another process may write between any two.
+
+    The counts are scripted to disagree the way a concurrent write can make them: more points
+    recording nothing than there were rows a moment before, or more half-written ones. What may
+    never come out is a figure above the number of rows or below zero. ``expected`` is the
+    recorded and failed counts.
+    """
+    await prepared(store)
+    pending = _script_counts(client, monkeypatch, *answers)
+
+    coverage = await store.checksum_coverage()
+
+    recorded, failed = expected
+    assert pending == [], "counting mode asked for fewer or more counts than the script"
+    assert coverage.rows == answers[0]
+    assert coverage.recorded == recorded
+    assert 0 <= coverage.recorded <= coverage.rows
+    assert coverage.failed == failed
+    assert 0 <= coverage.failed <= coverage.rows
+    assert 0 <= coverage.unverified <= coverage.rows
+    assert coverage.failures == ({VectorIntegrity.MALFORMED.value: failed} if failed else {})
+
+
+@pytest.mark.parametrize(
+    ("write", "recorded"),
+    [
+        pytest.param("insert", 0, id="points-arrive-after-the-rows-were-counted"),
+        pytest.param("delete", 3, id="points-leave-after-the-rows-were-counted"),
+    ],
+)
+async def test_a_write_between_the_counts_neither_hides_a_failure_nor_exceeds_the_rows(
+    store: QdrantVectorStore,
+    client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    write: str,
+    recorded: int,
+) -> None:
+    """A real collection changing under the count, through the engine and not a script.
+
+    Three points: two recording a checksum and a version, one with the version removed. After
+    the first request has counted the rows, a writer either adds five points recording nothing
+    or removes the two good ones. Local mode cannot interleave on its own, so the write is made
+    from inside the request, which is the moment a second process would make it.
+    """
+    await prepared(store)
+    collection = collection_for(TEST_COLLECTION_PREFIX, WORKSPACE, fingerprint(4))
+    chunks = [chunk(f"chunk-{index}", position=index) for index in range(3)]
+    await store.upsert(chunks, [spread(4, index) for index in range(3)])
+    await client.delete_payload(
+        collection, keys=[CHECKSUM_VERSION_COLUMN], points=[point_id_for(chunks[2].id)], wait=True
+    )
+    original = client.count
+    asked = 0
+
+    async def counting(*args: Any, **kwargs: Any) -> models.CountResult:
+        nonlocal asked
+        result = await original(*args, **kwargs)
+        asked += 1
+        if asked != 1:
+            return result
+        if write == "insert":
+            await client.upsert(
+                collection,
+                points=[
+                    models.PointStruct(id=1000 + index, vector=spread(4, index), payload={})
+                    for index in range(5)
+                ],
+                wait=True,
+            )
+        else:
+            await client.delete(
+                collection,
+                points_selector=models.PointIdsList(
+                    points=[point_id_for(chunks[0].id), point_id_for(chunks[1].id)]
+                ),
+                wait=True,
+            )
+        return result
+
+    monkeypatch.setattr(client, "count", counting)
+
+    coverage = await store.checksum_coverage()
+
+    assert coverage.rows == 3
+    assert coverage.recorded == recorded
+    assert 0 <= coverage.recorded <= coverage.rows
+    assert coverage.failed == 1, "the half-written point was there for every count and was missed"
+    assert coverage.failures == {VectorIntegrity.MALFORMED.value: 1}
+    assert not coverage.complete
+
+
+# --- the version index: declared, repaired, and never a second kind of index ----------------
+
+
+def test_the_version_is_indexed_as_a_keyword_because_it_is_asked_about_as_a_string() -> None:
+    """An integer index cannot answer a string match, so it would exist and help nothing.
+
+    The version this store writes is the string ``"1"``, an adopted legacy row writes ``""``,
+    and "records nothing" is a string equality beside an emptiness test. Nothing about the
+    field is numeric as far as a query is concerned, however small the values are.
+    """
+    declared = dict(INDEXED_PAYLOAD_FIELDS)
+
+    assert declared[CHECKSUM_VERSION_COLUMN] is models.PayloadSchemaType.KEYWORD
+    assert isinstance(VECTOR_CHECKSUM_VERSION, str)
+    assert declared[CHECKSUM_COLUMN] is models.PayloadSchemaType.KEYWORD
+
+
+def _named_fields(node: object) -> set[str]:
+    """Every payload key a filter, or anything holding one, names."""
+    if isinstance(node, (models.FieldCondition, models.PayloadField)):
+        return {node.key}
+    if isinstance(node, BaseModel):
+        found: set[str] = set()
+        for value in vars(node).values():
+            found |= _named_fields(value)
+        return found
+    if isinstance(node, (list, tuple)):
+        found = set()
+        for item in cast("Sequence[object]", node):
+            found |= _named_fields(item)
+        return found
+    return set()
+
+
+async def test_every_filter_the_store_sends_names_only_fields_it_indexes(
+    store: QdrantVectorStore, client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule, checked against what the store does rather than against a list of its fields.
+
+    Every operation that sends a filter is driven, the requests are captured, and the keys in
+    them are compared with :data:`INDEXED_PAYLOAD_FIELDS` in both directions: a filter on an
+    unindexed field is a scan that returns the right rows, and an index nothing filters on is
+    memory for nothing. Adding a filter means adding it here, which is what makes this a guard.
+    """
+    seen: list[object] = []
+
+    def recording(method: str) -> None:
+        original = getattr(client, method)
+
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            seen.extend(kwargs.values())
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(client, method, wrapper)
+
+    for method in ("count", "scroll", "query_points", "delete"):
+        recording(method)
+    await prepared(store)
+    chunks = [chunk("prose", lang="en"), chunk("table", position=1, lang="fr")]
+    await store.upsert(chunks, [spread(4, 0), spread(4, 1)])
+
+    await store.search(
+        spread(4, 0),
+        k=2,
+        filter=Filter(
+            workspace_ids=frozenset({WORKSPACE}),
+            document_ids=frozenset({chunks[0].document_id}),
+            kinds=frozenset({BlockKind.PROSE}),
+            langs=frozenset({"en"}),
+        ),
+    )
+    await store.stored_vectors(chunks)
+    # A chunk nothing stores by id is looked for by its embedding input instead, which is the
+    # second filter `stored_vectors` can send.
+    await store.stored_vectors([chunk("renamed", position=7)])
+    await store.checksum_coverage()
+    await store.backfill_checksums(dry_run=True)
+    await store.delete_document(chunks[0].document_id)
+
+    named = _named_fields(seen)
+
+    assert named == {field for field, _ in INDEXED_PAYLOAD_FIELDS}, (
+        "a filter names a field with no index, or an index is declared for a field nothing "
+        "filters on"
+    )
+
+
+# --- preparing the collection: the index loop and what a slow one leaves behind --------------
+
+
+@pytest.fixture
+def as_a_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the store treat the in-process client as one that talks to a server.
+
+    Local mode ignores payload indexes and warns when asked for one, which this project turns
+    into an error, so the store never asks it. Answering ``False`` to ``is_local`` is what lets
+    ``_ensure_collection`` run its index loop, and the reshape that precedes it is switched off
+    because the in-process engine reports dials a server would not; whatever stands in for
+    ``create_payload_index`` then decides what the loop meets. That exercises the loop — which
+    fields, which types, how often, what happens when a request fails — and nothing about what
+    a server does with an index, which the tests against a real one cover.
+    """
+
+    def not_local(_client: AsyncQdrantClient) -> bool:
+        return False
+
+    async def never_reshape(*_: Any, **__: Any) -> None:
+        """The in-process engine reports dials of its own and ignores every update."""
+
+    monkeypatch.setattr("manicule.storage.qdrant.is_local", not_local)
+    monkeypatch.setattr(QdrantVectorStore, "_reshape", never_reshape)
+
+
+@pytest.fixture
+def declared(
+    client: AsyncQdrantClient, as_a_server: None, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[str, Any]]:
+    """Every payload index the store asks for, in order, built by nothing."""
+    del as_a_server
+    asked: list[tuple[str, Any]] = []
+
+    async def record(*_: Any, field_name: str, field_schema: Any, **__: Any) -> None:
+        asked.append((field_name, field_schema))
+
+    monkeypatch.setattr(client, "create_payload_index", record)
+    return asked
+
+
+async def test_preparing_declares_every_indexed_field_on_every_call(
+    store: QdrantVectorStore, declared: list[tuple[str, Any]]
+) -> None:
+    """Repair is the same loop as creation, which is what makes an upgrade need no step.
+
+    The collection an earlier release made is not recreated by this one, so the version index
+    reaches it only because every prepare declares every entry. Declaring an index that exists
+    is a no-op on the server, so doing it again is the whole of idempotence.
+    """
+    await prepared(store)
+    first = list(declared)
+    await prepared(store)
+
+    assert first == list(INDEXED_PAYLOAD_FIELDS)
+    assert declared == [*INDEXED_PAYLOAD_FIELDS, *INDEXED_PAYLOAD_FIELDS]
+    assert (CHECKSUM_VERSION_COLUMN, models.PayloadSchemaType.KEYWORD) in first
+
+
+class _ChannelError(Exception):
+    """What gRPC raises instead of the REST client's wrapper, reduced to what is read from it.
+
+    ``grpc.aio.AioRpcError`` is not wrapped by the client, and carries its status as a
+    ``code()`` whose value has a ``name``. The store reads that rather than importing the
+    channel library, so this double is the whole of the contract it depends on.
+    """
+
+    def __init__(self, status: str) -> None:
+        super().__init__("")
+        self._status = status
+
+    def code(self) -> Any:
+        return SimpleNamespace(name=self._status)
+
+
+def _read_timeout() -> Exception:
+    return ResponseHandlingException(httpx.ReadTimeout(""))
+
+
+def _deadline_exceeded() -> Exception:
+    return _ChannelError("DEADLINE_EXCEEDED")
+
+
+@pytest.mark.usefixtures("as_a_server")
+@pytest.mark.parametrize(
+    "timed_out",
+    [
+        pytest.param(_read_timeout, id="rest-read-timeout"),
+        pytest.param(_deadline_exceeded, id="grpc-deadline-exceeded"),
+    ],
+)
+async def test_a_timeout_building_the_new_index_is_a_retryable_error_and_leaves_nothing_prepared(
+    store: QdrantVectorStore,
+    client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    timed_out: Callable[[], Exception],
+) -> None:
+    """The first prepare after an upgrade builds an index on a populated collection, in-request.
+
+    On a large one that can outlast the client's timeout, over either transport. What an
+    operator sees must name the setting, not an empty message from the transport; the store must
+    not have been marked prepared by a prepare that did not finish; and the next prepare must
+    simply work.
+    """
+    attempts = 0
+
+    async def slow(*_: Any, field_name: str, **__: Any) -> None:
+        nonlocal attempts
+        if field_name == CHECKSUM_VERSION_COLUMN:
+            attempts += 1
+            if attempts == 1:
+                raise timed_out()
+
+    monkeypatch.setattr(client, "create_payload_index", slow)
+
+    with pytest.raises(TimeoutError, match=r"storage\.qdrant\.timeout_s") as raised:
+        await prepared(store)
+
+    assert CHECKSUM_VERSION_COLUMN in str(raised.value)
+    assert isinstance(raised.value.__cause__, (ResponseHandlingException, _ChannelError))
+    with pytest.raises(VectorStoreStateError, match="has not been prepared"):
+        await store.upsert([chunk("chunk-one")], [spread(4, 0)])
+
+    await prepared(store)
+    await store.upsert([chunk("chunk-one")], [spread(4, 0)])
+
+    assert attempts == 2
+    assert await store.count() == 1
+
+
+@pytest.mark.usefixtures("as_a_server")
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(lambda: ResponseHandlingException(ConnectionError("refused")), id="rest"),
+        pytest.param(
+            lambda: ResponseHandlingException(httpx.PoolTimeout("")), id="rest-pool-timeout"
+        ),
+        pytest.param(
+            lambda: ResponseHandlingException(httpx.WriteTimeout("")), id="rest-write-timeout"
+        ),
+        pytest.param(
+            lambda: ResponseHandlingException(httpx.ConnectTimeout("")), id="rest-connect-timeout"
+        ),
+        pytest.param(lambda: _ChannelError("UNAVAILABLE"), id="grpc-unavailable"),
+        pytest.param(lambda: RuntimeError("not a transport failure"), id="anything-else"),
+    ],
+)
+async def test_a_failure_that_is_not_a_timeout_is_not_reworded(
+    store: QdrantVectorStore,
+    client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Callable[[], Exception],
+) -> None:
+    """Only the case this change makes likely is translated; every other failure stays itself."""
+    raised = failure()
+
+    async def refused(*_: Any, **__: Any) -> None:
+        raise raised
+
+    monkeypatch.setattr(client, "create_payload_index", refused)
+
+    with pytest.raises(type(raised)) as caught:
+        await prepared(store)
+    assert caught.value is raised
+
+
 # --- the network ---------------------------------------------------------------------------
 
 
@@ -1864,35 +2574,114 @@ async def test_a_real_server_indexes_the_payload_fields_queries_filter_on(
         schema = info.payload_schema or {}
 
         assert {field for field, _ in INDEXED_PAYLOAD_FIELDS} <= set(schema)
+        assert {field: schema[field].data_type for field, _ in INDEXED_PAYLOAD_FIELDS} == dict(
+            INDEXED_PAYLOAD_FIELDS
+        ), "an index exists under a type its filter cannot be answered from"
     finally:
         await _drop(server_store, server_client, 8)
 
 
+@pytest.mark.parametrize("field", [field for field, _ in INDEXED_PAYLOAD_FIELDS])
 async def test_a_real_server_regains_an_index_that_was_never_created(
-    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient, field: str
 ) -> None:
     """A crash between creating the collection and indexing it must not be permanent.
 
     An index is invisible to correctness — Qdrant answers a filter with or without one — so
     nothing goes red when this is skipped and the corpus simply gets slower as it grows. The
     collection is what ``ensure_ready`` checks for, so the indexes have to be declared on every
-    call rather than only on the one that made it.
+    call rather than only on the one that made it. Every field in the list, not one of them: a
+    field added to the list later is repaired by the same loop only if this says so.
+    """
+    declared = dict(INDEXED_PAYLOAD_FIELDS)
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        collection = server_store.storage_name(fingerprint(8))
+        await server_client.delete_payload_index(collection, field_name=field)
+        dropped = await server_client.get_collection(collection)
+        assert field not in (dropped.payload_schema or {})
+
+        await server_store.ensure_ready(fingerprint(8))
+
+        healed = (await server_client.get_collection(collection)).payload_schema or {}
+        assert field in healed
+        assert healed[field].data_type == declared[field]
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+async def test_a_real_server_prepares_an_indexed_collection_again_without_changing_it(
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+) -> None:
+    """Every prepare declares every index, so declaring one that exists must be a no-op.
+
+    The collection holds points, so an index that was rebuilt would be rebuilt over them, and the
+    schema is compared whole — type, parameters and the number of points each index covers —
+    before and after two more prepares.
     """
     try:
         await server_store.ensure_ready(fingerprint(8))
-        collection = collection_for(
-            TEST_COLLECTION_PREFIX,
-            server_store.workspace_id,
-            fingerprint(8),
+        collection = server_store.storage_name(fingerprint(8))
+        points, _ = _matrix(8)
+        await server_client.upsert(collection, points=points, wait=True)
+        before = (await server_client.get_collection(collection)).payload_schema
+
+        await server_store.ensure_ready(fingerprint(8))
+        await server_store.ensure_ready(fingerprint(8))
+
+        assert (await server_client.get_collection(collection)).payload_schema == before
+        assert (await server_store.checksum_coverage()).rows == len(points)
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+@pytest.mark.parametrize(
+    "integer_index",
+    [
+        pytest.param(models.PayloadSchemaType.INTEGER, id="plain-integer"),
+        pytest.param(
+            models.IntegerIndexParams(
+                type=models.IntegerIndexType.INTEGER, lookup=True, range=False
+            ),
+            id="lookup-only-integer",
+        ),
+    ],
+)
+async def test_a_real_server_replaces_an_integer_index_on_the_version_with_a_keyword_one(
+    server_store: QdrantVectorStore,
+    server_client: AsyncQdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    integer_index: models.PayloadSchemaType | models.IntegerIndexParams,
+) -> None:
+    """An integer index on this field helps nothing, and the repair must not leave it there.
+
+    An operator told to "add an index on the version" can reasonably add an integer one, since
+    the value is a small number, and an integer index cannot answer a string match. Declaring a
+    keyword index over it has to replace it rather than be refused or be ignored — and the
+    counts have to be exactly the oracle's afterwards, because the replacement happens under a
+    collection that is being read.
+    """
+    name = server_store.storage_name(fingerprint(8))
+    try:
+        await server_client.create_collection(
+            collection_name=name,
+            vectors_config=models.VectorParams(size=8, distance=models.Distance.COSINE),
         )
-        await server_client.delete_payload_index(collection, field_name=DOCUMENT_ID_COLUMN)
-        dropped = await server_client.get_collection(collection)
-        assert DOCUMENT_ID_COLUMN not in (dropped.payload_schema or {})
+        await server_client.create_payload_index(
+            name, field_name=CHECKSUM_VERSION_COLUMN, field_schema=integer_index, wait=True
+        )
+        points, cells = _matrix(8)
+        await server_client.upsert(name, points=points, wait=True)
+        before = (await server_client.get_collection(name)).payload_schema or {}
+        assert before[CHECKSUM_VERSION_COLUMN].data_type is models.PayloadSchemaType.INTEGER
 
         await server_store.ensure_ready(fingerprint(8))
 
-        healed = await server_client.get_collection(collection)
-        assert DOCUMENT_ID_COLUMN in (healed.payload_schema or {})
+        after = (await server_client.get_collection(name)).payload_schema or {}
+        assert after[CHECKSUM_VERSION_COLUMN].data_type is models.PayloadSchemaType.KEYWORD
+        await _assert_the_filters_select_what_the_oracle_does(
+            server_store, server_client, name, cells, monkeypatch
+        )
     finally:
         await _drop(server_store, server_client, 8)
 
@@ -2241,6 +3030,140 @@ async def test_a_real_server_keeps_a_quantized_corpus_verifiable(
         assert [found[0].score for found in ranked] == [pytest.approx(1.0, abs=1e-6)] * len(
             probes
         ), "scored against the int8 copy rather than the checksummed originals"
+    finally:
+        await _drop(server_store, server_client, 8)
+
+
+# --- checksum coverage against a real server -------------------------------------------------
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param("index-absent", id="version-index-absent"),
+        pytest.param(
+            "repaired-after-the-data", id="version-index-repaired-on-a-populated-collection"
+        ),
+        pytest.param("created-before-the-data", id="version-index-created-before-the-data"),
+        pytest.param("optimizer-built-segments", id="after-the-optimizer-builds-indexed-segments"),
+    ],
+)
+async def test_a_real_server_selects_the_same_points_whatever_state_the_version_index_is_in(
+    server_client: AsyncQdrantClient, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """The plan may change with the index; the points selected may not.
+
+    The same matrix of payload shapes as the local test, selected by the very filters the store
+    sends, compared as point sets against an oracle written from Qdrant's documented semantics.
+    Four states a real collection can be in:
+    without the index (every collection an earlier release made), after the repair on a
+    populated collection, with the index from the start, and once the optimizer has moved the
+    points into indexed segments, which is where a plan reads a different structure than it does
+    over a plain one.
+    """
+    shape = CollectionShape()
+    # Wide vectors for the scenario that needs segments past the threshold, so that "indexed"
+    # is certain rather than a matter of how much a one-kilobyte threshold counts.
+    dimension = 8
+    if scenario == "optimizer-built-segments":
+        shape = dataclasses.replace(shape, indexing_threshold_kb=1)
+        dimension = 64
+    store = _handle(server_client, f"{WORKSPACE}-{uuid.uuid4()}", shape)
+    collection = store.storage_name(fingerprint(dimension))
+    points, cells = _matrix(dimension)
+    try:
+        await store.ensure_ready(fingerprint(dimension))
+        if scenario in {"index-absent", "repaired-after-the-data"}:
+            await server_client.delete_payload_index(
+                collection, field_name=CHECKSUM_VERSION_COLUMN, wait=True
+            )
+        await server_client.upsert(collection, points=points, wait=True)
+        if scenario == "repaired-after-the-data":
+            await store.ensure_ready(fingerprint(dimension))
+        if scenario == "optimizer-built-segments":
+            await _wait_until_indexed(server_client, collection, len(points))
+
+        schema = (await server_client.get_collection(collection)).payload_schema or {}
+        if scenario == "index-absent":
+            assert CHECKSUM_VERSION_COLUMN not in schema, "the scenario did not start unindexed"
+        else:
+            assert schema[CHECKSUM_VERSION_COLUMN].data_type is models.PayloadSchemaType.KEYWORD
+
+        await _assert_the_filters_select_what_the_oracle_does(
+            store, server_client, collection, cells, monkeypatch
+        )
+    finally:
+        await _drop(store, server_client, dimension)
+
+
+@pytest.mark.contract
+async def test_a_real_server_never_reports_impossible_coverage_while_points_come_and_go(
+    server_store: QdrantVectorStore, server_client: AsyncQdrantClient
+) -> None:
+    """Real concurrency: a writer inserts and deletes while the counting mode runs.
+
+    Local mode cannot interleave, so this is the one place the three requests really are three
+    moments. The writer adds points recording nothing, recording both halves, and recording one,
+    then removes them again; the steady corpus carries one half-written point that is never
+    touched. Every snapshot must be possible — nothing above the rows, nothing below zero — and
+    every snapshot must still count the point that was there for all of them.
+    """
+    try:
+        await server_store.ensure_ready(fingerprint(8))
+        collection = server_store.storage_name(fingerprint(8))
+        steady = [chunk(f"steady-{index}", position=index) for index in range(20)]
+        await server_store.upsert(steady, [spread(8, index) for index in range(20)])
+        await server_client.delete_payload(
+            collection,
+            keys=[CHECKSUM_VERSION_COLUMN],
+            points=[point_id_for(steady[0].id)],
+            wait=True,
+        )
+        shapes: list[dict[str, object]] = [
+            {},
+            {CHECKSUM_COLUMN: "0" * 64, CHECKSUM_VERSION_COLUMN: VECTOR_CHECKSUM_VERSION},
+            {CHECKSUM_COLUMN: "0" * 64},
+        ]
+
+        async def churn() -> None:
+            for round_number in range(12):
+                ids = [10_000 + round_number * 100 + index for index in range(30)]
+                await server_client.upsert(
+                    collection,
+                    points=[
+                        models.PointStruct(
+                            id=point_id, vector=spread(8, point_id), payload=shapes[point_id % 3]
+                        )
+                        for point_id in ids
+                    ],
+                    wait=True,
+                )
+                await server_client.delete(
+                    collection, points_selector=models.PointIdsList(points=list(ids)), wait=True
+                )
+
+        snapshots: list[VectorChecksumCoverage] = []
+
+        async def read() -> None:
+            for _ in range(12):
+                snapshots.append(await server_store.checksum_coverage())
+
+        # A task group, so that both tasks are finished or canceled and joined before the
+        # collection is dropped, whichever of them fails.
+        async with asyncio.TaskGroup() as group:
+            group.create_task(churn())
+            group.create_task(read())
+
+        assert len(snapshots) == 12
+        for coverage in snapshots:
+            assert coverage.rows >= len(steady)
+            assert 0 <= coverage.recorded <= coverage.rows
+            assert 1 <= coverage.failed <= coverage.rows, "the planted failure went uncounted"
+            assert 0 <= coverage.unverified <= coverage.rows
+            assert coverage.failures == {VectorIntegrity.MALFORMED.value: coverage.failed}
+        quiet = await server_store.checksum_coverage()
+        assert (quiet.rows, quiet.recorded, quiet.failed) == (20, 20, 1)
     finally:
         await _drop(server_store, server_client, 8)
 

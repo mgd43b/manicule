@@ -942,9 +942,12 @@ reconcile_interval_s = 86400         # this source daily; unset inherits the def
   `reconciliation-proposals` (a refused deletion waiting), both `degraded` rather than `failing`,
   and both reading the same stored record the scheduler does. Everything reported is a count or a
   connector name: no source id, title or URI.
-- **It shares the data with a sync.** A pass runs under the same in-process barrier a sync
-  takes, so it never interleaves with a sync of the same source in this server. A source that
-  syncs for a long time delays the pass rather than racing it.
+- **It shares the data with a sync.** A pass takes the exclusive side of the in-process barrier
+  that every sync holds a lease on (`docs/ingest.md` §8.4), so it never interleaves with a sync of
+  any source in this server: it begins once the syncs running when it asked have finished, and
+  keeps new ones out until it is done. A source that syncs for a long time delays the pass rather
+  than racing it — and, because a waiting pass closes admission, delays a `document_create`
+  that arrives behind it for the same reason.
 
 ### 6.3 Running it under launchd
 
@@ -1092,11 +1095,34 @@ to suspect *past* corruption, the answer is `manicule rebuild plan <snapshot>` f
 (`docs/storage.md` §7) rather than trusting what is in the vector table. A backfill protects the
 future; a rebuild is what re-establishes the past.
 
-**`failing` means something else entirely.** A recorded checksum that no longer matches its
-vector is a row whose numbers changed after they were written. `manicule vector-checksum
---verify` reports how many and of what kind without printing any of them; the response is a
-rebuild of the affected generation and a look at what is underneath it — the disk for
-`lancedb`, the collection for `qdrant` — not a backfill.
+**`failing` means something else entirely**, and it has two causes that the report keeps apart.
+A row carrying only half of its checksum record — a checksum with no version, or a version with
+no checksum — is found by counting alone, because it takes two fields to see and no vector
+read; nothing can be compared against it, and it is reported as `malformed`. A recorded
+checksum that no longer matches its vector is a row whose numbers changed after they were
+written, and only `manicule vector-checksum --verify` can say so. That command reports how many
+and of what kind without printing any of them; the response to either is a rebuild of the
+affected generation and a look at what is underneath it — the disk for `lancedb`, the
+collection for `qdrant` — not a backfill.
+
+**What the count costs.** `manicule index` and `manicule doctor` count rather than recompute, and
+counting reads no vector. On `lancedb` it is three `count_rows` calls over two string columns. On
+`qdrant` it is the same three, as exact count requests: every point, the points recording neither
+half of the pair, and the points recording exactly one. A count whose filter the server cannot
+answer from an index reads every point's payload, so its cost follows the corpus and the size of
+its payloads rather than the answer, and a healthy corpus returns zero after paying for all of it.
+Both checksum fields are therefore indexed (`docs/storage.md` §6.7); the version field is the one
+an upgrade adds. Counting is the cheap
+mode and not a free one, which is why the rest of the system is arranged around it: the readiness
+probe makes one constant query and never asks for coverage; `doctor` runs the count under a
+per-check time limit and reports `unknown`, never `ok`, when it does not finish; and nothing is
+cached, because a shared collection can be written by a process this one cannot observe, so a
+remembered count could not be told from a current one. The counts are three requests rather than
+one snapshot, so a write between two of them can leave a figure slightly stale; it cannot make
+coverage impossible, and a half-written row that is present when the counts run is always
+reported. `tests/benchmarks/qdrant_checksum_coverage.py` measures the count's latency and the
+server's responsiveness around it on a synthetic corpus, against a throwaway server it is
+pointed at; run it with payloads the size of yours before relying on any figure.
 
 ### 6.5 Running against Qdrant
 
@@ -1129,6 +1155,19 @@ installation's name always has its own workspace digest in between (`storage.md`
 variable when the setting itself is left unset — so a credential need not be written into the
 config file at all.
 
+**Upgrading adds one payload index, and the first prepare builds it before it answers.** Every
+prepare declares every payload index the store filters on (`docs/storage.md` §6.7), and creating
+one that exists is a no-op, so a collection made by an earlier release gains the one it lacks — the
+`keyword` index on `vector_checksum_version`, which the checksum count needs (§6.4) — on the first
+prepare after the release that added it. There is no step to run and no collection to rebuild; Qdrant
+builds the index online, and the request waits for it so that a build which failed fails the
+prepare rather than leaving a collection that is quietly slower. On a collection large enough
+that one build outlasts `storage.qdrant.timeout_s`, the prepare reports a `TimeoutError` naming
+that setting instead of becoming ready. Nothing is left half-prepared, and trying again is safe; if
+it keeps timing out, raise `timeout_s` for that one run. An index an operator added by hand to
+that field as an integer is replaced by the keyword one, because an integer index cannot answer
+the string match the count asks.
+
 **Shaping the collections.** Seven more settings under `storage.qdrant` decide what a collection
 costs the server in memory and how its search trades recall for speed. None of them changes which
 chunks a filter admits, so none is part of a collection's name: changing one creates no new
@@ -1141,7 +1180,7 @@ which of them reach the top of a ranking.
 | `quantization` | `"none"` | `"scalar"` keeps an int8 copy of every vector, a quarter of the originals' size, and searches that. The `float32` originals stay as written, and so does every checksum over them, so the RAM it saves comes from pairing it with `on_disk_vectors`. Setting `"none"` again drops the copy |
 | `quantization_always_ram` | `true` | Holds that copy in RAM even when `on_disk_vectors` puts the originals on disk. Read only when `quantization` is `"scalar"` |
 | `on_disk_vectors` | `false` | Serves the `float32` vectors from disk through the page cache instead of holding them in RAM |
-| `on_disk_payload` | `true` | Keeps each point's payload on disk. The payload carries the whole chunk, a second copy of the corpus text; the fields a query filters on are indexed and stay in RAM either way |
+| `on_disk_payload` | `true` | Keeps each point's payload on disk. The payload carries the whole chunk, a second copy of the corpus text; the fields a query filters on are indexed and stay in RAM either way — including the two checksum fields, indexed so that the coverage count (§6.4) does not have to read every payload off disk to answer |
 | `hnsw_m` | `16` | Edges per node in the HNSW graph: better recall and a larger graph as it rises. At least `4` |
 | `hnsw_ef_construct` | `100` | Neighbors considered for each node while the graph is built: a better graph and a slower build, at no cost per query. At least `4` |
 | `indexing_threshold_kb` | `10000` | Kilobytes of vectors a segment holds before Qdrant builds a graph for it; below that the segment is searched exactly. A 1024-dimension vector is 4 kB, so the default is about 2,500 chunks. `0` never builds a graph. Unrelated to `storage.ann_index_threshold`, which counts vectors and is read only by `lancedb` |

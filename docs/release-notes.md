@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### A write no longer waits behind an unrelated source's sync
+
+`document_create` used to queue behind any sync running in the same process, including one that
+was only waiting on its source's server, because every sync and every publication shared one
+lock. Syncs now take a lease on a barrier with two slots: one for the configured authoring
+source and one for every other source together, so a write publishes while a different source is
+parked in its fetch and is searchable the moment it returns. Maintenance (reset, rebuild,
+re-embed, reconciliation, the sweeps) still takes the barrier alone: it waits for the running
+syncs and keeps new ones out while it waits, so a write that arrives behind queued maintenance
+waits for it. A second background sync still waits for the first, and a write still queues behind
+another run of the authoring source itself. With authoring unconfigured every source shares one
+slot, exactly as before.
+
+A write also no longer counts how many documents the source holds in collections, two reads over
+the whole corpus that nothing in it used; `index_path` still reports them. Details are in `docs/ingest.md` §8.4 and
+`docs/memory-authoring.md` §4.4.
+
+### Multi-word keyword search is faster on a large corpus
+
+The keyword leg of search now picks one of three statements for the same query, and every one
+carries every restriction (workspace, source, document, type, time, reader) before its limit, so
+the rows returned and their scores are unchanged: a many-word query with no narrow filter lets
+SQLite's FTS5 order by `bm25(1.0, 0.4)` itself instead of sorting every match; a small explicit
+document scope (up to 64 documents holding at most 32 chunks) is driven from those documents; and
+everything else, including single words, runs the statement earlier releases ran. A bounded
+indexed probe of the scope's chunk count is a hint for that choice and never a filter. The
+weights, the match rule, the schema and the vectors are untouched, and nothing is rebuilt.
+
+Document and source lists are also written so SQLite cannot seek on them from inside the match
+loop, which on some SQLite versions turned a selective scope into a scan per match. The choices
+were measured on synthetic corpora. A workspace holding less than half of an installation's
+documents keeps the statement earlier releases ran, because the ranked statement walks matches
+across all workspaces; the share is read from one cheap count, cached for a minute. Measurements
+and the rule are in `docs/retrieval.md` §4.1.
+
+### Qdrant checksum coverage no longer reads every payload
+
+Counting checksum coverage on a Qdrant-backed install is cheaper and exactly as strict as
+before. `status` and `doctor` count how many stored vectors carry a checksum without reading any
+vector, but on a large collection that count read every point's payload, because the checksum
+version field had no payload index. The field is now declared as a keyword index, which the
+server uses for the same filters, so the question asked and the answer given are unchanged.
+
+The first prepare after upgrading builds that one index and waits for it. On a very large
+collection the request can outlast `storage.qdrant.timeout_s`; that is now reported as a
+retryable `TimeoutError` naming the setting instead of an empty transport error. What counts as
+recorded, which points the backfill selects, `--verify` recomputation and every failure report
+are unchanged. Because the counts are separate requests, `recorded` and `failed` are held between
+zero and the row count when another process writes between them, an empty collection is answered
+with one request, and `doctor` now words a failing result by its cause: a row carrying half of
+its checksum record, or numbers that no longer match their checksum.
+
 ### A new memory collection is its first write
 
 Adding a collection to an authored corpus used to take three things that had to agree: a

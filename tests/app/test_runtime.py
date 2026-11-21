@@ -1621,7 +1621,11 @@ async def test_concurrent_connector_runs_keep_their_own_retention_policy(
         store = cast("Any", await opened.documents())
         # The runtime's reset/publication barrier is orthogonal to this pipeline-level test;
         # served syncs share the pipeline beneath that barrier, as the concurrency suite proves.
+        # Two non-authoring sources share one slot, so the leases are dropped along with the
+        # exclusive guard rather than left to queue the second run behind the first.
         pipeline._mutation_guard = _unlocked_derived_mutation  # pyright: ignore[reportPrivateUsage]
+        pipeline._source_guard = None  # pyright: ignore[reportPrivateUsage]
+        pipeline._publication_guard = None  # pyright: ignore[reportPrivateUsage]
         retained = GatedConnector({"retained": "private body"}, name="private-site")
         direct = GatedConnector({"direct": "public body"}, name="public-site")
         retained.media_types["retained"] = "text/plain"

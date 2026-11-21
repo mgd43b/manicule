@@ -137,7 +137,7 @@ def test_the_document_still_names_the_settings_the_widths_come_from() -> None:
     """
     section = DOCUMENT.read_text(encoding="utf-8")
     start = section.index("### 8.3 The stage topology, as built")
-    end = section.index("### 8.4 Four exclusions")
+    end = section.index("### 8.4 Five exclusions")
     topology = section[start:end]
 
     for setting in ("fetch_concurrency", "parse_workers", "queue_depth_factor"):

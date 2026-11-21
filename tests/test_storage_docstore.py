@@ -19,6 +19,7 @@ from manicule.storage.docstore import (
     DEFAULT_WORKSPACE,
     CrossWorkspaceCollisionError,
     SqliteDocStore,
+    lexical_predicates,
 )
 from manicule.testing import assert_protocol_signatures, closing
 from tests.storage_helpers import make_chunk, make_document
@@ -464,6 +465,110 @@ async def test_a_document_id_containing_a_quote_cannot_break_the_filter(
         "authentication", k=5, filter=scoped(document_ids=frozenset({hostile}))
     )
     assert results == []
+
+
+def test_the_predicates_are_spelled_so_the_join_cannot_seek_on_them() -> None:
+    """``+d.id`` and ``+d.source``: the same comparison, with SQLite forbidden to seek on it.
+
+    Written as plain columns, a list of ids or sources beside the join's own ``d.id =
+    c.document_id`` costs a seek per listed id, or a scan of the source, for every matching
+    chunk (``tests/test_storage_fts.py`` counts the steps). Everything else is untouched.
+    """
+    restriction = scoped(
+        sources=frozenset({"a"}),
+        document_ids=frozenset({"x", "y"}),
+        media_types=frozenset({"text/html"}),
+        kinds=frozenset({BlockKind.CODE}),
+        langs=frozenset({"en"}),
+    )
+
+    predicates = lexical_predicates(DEFAULT_WORKSPACE, restriction)
+
+    assert predicates.clauses == (
+        "AND d.workspace_id = :workspace_id",
+        "AND +d.source IN (:d_source_0)",
+        "AND +d.id IN (:d_id_0, :d_id_1)",
+        "AND d.media_type IN (:d_media_type_0)",
+        "AND c.kind IN (:c_kind_0)",
+        "AND c.lang IN (:c_lang_0)",
+    )
+    assert predicates.document_ids == ("x", "y")
+    assert predicates.narrowed
+
+
+def test_the_document_first_statement_takes_its_document_list_as_written() -> None:
+    """It wants the list as its driving loop, which ``+`` would forbid; nothing else changes."""
+    predicates = lexical_predicates(
+        DEFAULT_WORKSPACE,
+        scoped(document_ids=frozenset({"x"}), sources=frozenset({"a"})),
+    )
+
+    direct = predicates.text("{extra}")
+    driven = predicates.text("{extra}", document_first=True)
+
+    assert "AND +d.id IN (:d_id_0)" in direct
+    assert "AND d.id IN (:d_id_0)" in driven
+    assert "+d.id" not in driven
+    assert "AND +d.source IN (:d_source_0)" in driven
+    assert driven.replace("AND d.id IN", "AND +d.id IN") == direct
+
+
+@pytest.mark.parametrize(
+    ("restriction", "narrowed", "documents"),
+    [
+        (None, False, ()),
+        (scoped(), False, ()),
+        (scoped(document_ids=frozenset({"b", "a"})), False, ("a", "b")),
+        (scoped(readers=frozenset({"group:g"})), False, ()),
+        (scoped(sources=frozenset({"a"})), True, ()),
+        (scoped(media_types=frozenset({"text/html"})), True, ()),
+        (scoped(kinds=frozenset({BlockKind.CODE})), True, ()),
+        (scoped(langs=frozenset({"en"})), True, ()),
+        (scoped(updated_after=datetime(2000, 1, 1, tzinfo=UTC)), True, ()),
+        (scoped(updated_before=datetime(2000, 1, 1, tzinfo=UTC)), True, ()),
+    ],
+)
+def test_what_narrows_a_search_and_what_is_a_document_list(
+    restriction: Filter | None, narrowed: bool, documents: tuple[str, ...]
+) -> None:
+    predicates = lexical_predicates(DEFAULT_WORKSPACE, restriction)
+
+    assert predicates.narrowed is narrowed
+    assert predicates.document_ids == documents
+
+
+def test_every_value_is_a_bound_parameter_and_never_part_of_the_statement() -> None:
+    hostile = "' OR 1=1 --"
+    predicates = lexical_predicates(
+        DEFAULT_WORKSPACE,
+        scoped(
+            document_ids=frozenset({hostile}),
+            sources=frozenset({hostile}),
+            langs=frozenset({hostile}),
+        ),
+    )
+
+    for first in (False, True):
+        assert hostile not in predicates.text("{extra}", document_first=first)
+    assert list(predicates.params.values()).count(hostile) == 3
+
+
+async def test_a_source_or_document_id_that_looks_like_a_number_matches_only_itself(
+    store: SqliteDocStore,
+) -> None:
+    """Writing ``+d.source`` drops the column's affinity from the comparison, so this is the
+    case it could have changed: a text that is a number, beside a different spelling of it."""
+    for source, source_id in (("007", "a"), ("7", "b"), ("7.0", "c")):
+        document = make_document(source=source, source_id=source_id)
+        await store.upsert_document(document)
+        await store.replace_chunks(document.id, [make_chunk(document, 0, "authentication")])
+
+    for source in ("007", "7", "7.0"):
+        found = await store.search_lexical(
+            "authentication", k=5, filter=scoped(sources=frozenset({source}))
+        )
+        assert [candidate.chunk.text for candidate in found] == ["authentication"]
+        assert len(found) == 1, f"source {source!r} matched another spelling of itself"
 
 
 async def test_a_watermark_is_stored_and_handed_back_uninterpreted(

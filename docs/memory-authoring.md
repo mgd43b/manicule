@@ -143,6 +143,21 @@ The copy-on-write publication flip gives the atomic boundary. Embedding a single
 file is not a reason to go asynchronous — and a filesystem watcher firing after the write is
 *worse* here, which is part of the point.
 
+**What a write waits for, stated exactly.** It publishes under the authoring source's slot of the
+derived-index barrier (`docs/ingest.md` §8.4), so it does not queue behind a background sync of
+another source — one parked on its server, say — and is searchable the moment it returns. It does
+queue behind three things: another run of the authoring source itself (a watcher batch, or a sync of
+that source), maintenance that is running or waiting (a reset, a rebuild, a reconciliation pass or
+the sweep, each of which waits for running syncs and closes admission while it does), and the
+queues no barrier covers (the embedder, the parse pool and the SQLite writer). The first write
+on a process that has not built its pipeline yet builds it under the exclusive side, so it also
+waits for any sync running at that moment, an acquisition-only one included; a served process
+builds it once, ahead of its syncs. A write that
+loses any of those races still returns the typed outcome and the kept file's path (§4.5); it never
+turns into fire-and-forget indexing. A write does no placement counting: the `collected` and
+`uncollected` totals an explicit `index_path` reports are two reads over the corpus that a write
+has no use for.
+
 ### 4.5 Partial failure: keep the file
 
 The file is written, then ingestion fails. The contract is:
@@ -415,7 +430,11 @@ file or a case variant), and in either mode the path must be one the source walk
 the index entry under the file's path and, for a file whose sidecar manifest declares an identity,
 under that identity too. A move re-indexes its destination once the original is retired, so the
 wikilink middleware — which keeps a live document's slug rather than letting a newcomer take it —
-resolves the slug to the destination.
+resolves the slug to the destination. That repair is a forced index, which takes the exclusive side
+of the barrier and so waits for every running sync. It stays inside the authoring lock, because a
+removal of the destination landing between the forced pass reading the file and publishing it
+would leave a searchable entry for a file that is gone; so a create that arrives behind a move
+waits for the repair.
 
 Both are on the network surface beside `document_create`, and `document_delete` is not: it would
 let a socket caller remove any document in the workspace, a mailbox's included. The recovery path
@@ -459,10 +478,11 @@ errors**.
 Of the two available designs — persist unresolved edges and resolve lazily, or re-resolve on each
 target publish — this is the **second**, and the first is not available: `chunk_relations` has real
 foreign keys to `chunks`, so an edge to a document that does not exist has nothing to point at. So
-when a document is stored, the middleware searches the lexical index for stored chunks naming its
-slug, re-scans each with the real rules, and writes the edges that now resolve. The search is
-bounded by `inbound_limit` (200 by default); a linking document outside that bound acquires its
-edge the next time it is itself scanned or repaired.
+when a document is stored, the middleware searches the lexical index for stored chunks containing
+any word of its slug (an unscoped any-word match across the workspace, best BM25 first), re-scans
+each with the real rules, and writes the edges that now resolve. The search is bounded by
+`inbound_limit` (200 by default); a linking document outside that bound acquires its edge the next
+time it is itself scanned or repaired.
 
 ### 5.4 Slug normalization, and what a slug can reach
 

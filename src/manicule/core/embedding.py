@@ -844,10 +844,13 @@ class VectorChecksumCoverage:
     assistant and by whatever a shell pipeline points at.
 
     **:attr:`recomputed` is what keeps this honest.** Counting how many rows *carry* a checksum
-    costs two predicates and is what a status page can afford on every call; recomputing every
-    digest costs a scan of the corpus and is what the operator asks for deliberately. Both are
-    called "coverage" in ordinary speech and they establish very different things, so the report
-    says which one it is rather than letting a cheap count read as a clean bill of health.
+    costs a few counts over the two checksum fields — how many rows, how many record neither
+    half, how many record only one — which is what a status page can afford on every call. It is
+    cheap next to a recomputation, not free: on a network store each count is a request that
+    may read payloads. Recomputing every digest costs a scan of the corpus and is what the
+    operator asks for deliberately. Both are called "coverage" in ordinary speech and they
+    establish very different things, so the report says which one it is rather than letting a
+    cheap count read as a clean bill of health.
     """
 
     rows: int = 0
@@ -861,7 +864,12 @@ class VectorChecksumCoverage:
     """
 
     failed: int = 0
-    """Rows a recomputed checksum refused. See :attr:`failures` for the split by kind."""
+    """Rows whose checksum record was refused. See :attr:`failures` for the split by kind.
+
+    A recomputation can refuse a row for any kind. Counting recomputes nothing, so the one thing
+    it can report here is a row carrying only half of its record, a checksum without its version
+    or the reverse, under ``malformed``; a mismatch is found only by recomputing.
+    """
 
     failures: Mapping[str, int] = field(default_factory=dict[str, int])
     """``VectorIntegrity`` value to count, for the refusals only.

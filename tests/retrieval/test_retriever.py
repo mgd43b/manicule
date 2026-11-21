@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from sqlalchemy import text as sql
@@ -30,7 +30,9 @@ from manicule.retrieval.runner import PipelineRunner
 from manicule.retrieval.tokens import ContextTokenCounter
 from manicule.retrieval.trace import Route
 from manicule.retrieval.utility import handlers_for
+from manicule.storage import docstore as docstore_module
 from manicule.storage.docstore import SqliteDocStore
+from manicule.storage.fts import LexicalPlan
 from tests.fakes import HashEmbedder
 from tests.retrieval.fakes import SCOPE, FixedScorer, ListVectorStore, a_query
 from tests.storage_helpers import make_chunk, make_document
@@ -588,6 +590,82 @@ async def test_a_search_scoped_to_an_empty_collection_returns_nothing_at_all(
         "confidence is absent, which reads as 'we did not look'. We looked and there is "
         "nothing, which is the `none` band with a reason."
     )
+
+
+# The same three questions with a multi-word query. A single word always ran the released
+# statement; two or more words choose among statements by the size of the scope, and one of them
+# probes the scope's chunks first. Neither the probe nor the choice may be where a restriction
+# is lost, so each scope below is asked the way a person asks.
+
+MULTI_WORD = "authentication tokens"
+
+
+def _asking(text: str, *collection_ids: str) -> Query:
+    return Query(
+        text=text,
+        limit=3,
+        filter=Filter(workspace_ids=SCOPE, collection_ids=frozenset(collection_ids)),
+    )
+
+
+@pytest.mark.parametrize("text", ["authentication", MULTI_WORD, "authentication tokens weather"])
+async def test_an_empty_collection_returns_nothing_whatever_the_query_says(
+    store: SqliteDocStore, text: str
+) -> None:
+    """Fail closed, and before the lexical statement: no probe, no scope, no widening."""
+    left, right = await _two_projects(store)
+    empty = await store.create_collection("nothing yet")
+
+    result = await _retriever(store, [*left, *right]).retrieve(_asking(text, empty.id))
+
+    assert list(result.context.passages) == []
+    assert result.candidates == []
+
+
+@pytest.fixture
+def chosen_plans(monkeypatch: pytest.MonkeyPatch) -> list[LexicalPlan]:
+    """The statement each lexical search through the store chose, in order."""
+    seen: list[LexicalPlan] = []
+    real = docstore_module.choose_lexical_plan
+
+    def spy(**facts: Any) -> LexicalPlan:
+        plan = real(**facts)
+        seen.append(plan)
+        return plan
+
+    monkeypatch.setattr(docstore_module, "choose_lexical_plan", spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("documents", "plan"), [(1, LexicalPlan.DOCUMENT_FIRST), (70, LexicalPlan.DIRECT)]
+)
+async def test_a_multi_word_search_in_a_collection_returns_only_its_documents(
+    store: SqliteDocStore, chosen_plans: list[LexicalPlan], documents: int, plan: LexicalPlan
+) -> None:
+    """One member takes the probe and the document-first statement; seventy are past the id
+    budget and take neither. Both leave the other collection's document out.
+
+    The two documents the fixture makes carry the same sentence, so only the restriction can
+    tell them apart, and the assertion is on *which* came back.
+    """
+    left, right = await _two_projects(store)
+    collection = await store.create_collection("alpha")
+    members = [left[0].document_id]
+    for index in range(documents - 1):
+        extra = make_document(source_id=f"filler-{index}", uri=f"file:///filler/{index}.md")
+        await store.upsert_document(extra)
+        await store.replace_chunks(extra.id, [make_chunk(extra, 0, "unrelated prose")])
+        members.append(extra.id)
+    await store.add_to_collection(collection.id, members)
+
+    result = await _retriever(store, [*left, *right]).retrieve(_asking(MULTI_WORD, collection.id))
+
+    found = {candidate.chunk.document_id for candidate in result.context.passages}
+    assert left[0].document_id in found
+    assert right[0].document_id not in found, "a document outside the collection came back"
+    assert found <= set(members), "a document outside the collection came back"
+    assert chosen_plans == [plan], "the scope did not take the statement this test is about"
 
 
 async def test_a_membership_change_is_not_served_from_the_cache(store: SqliteDocStore) -> None:

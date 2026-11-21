@@ -15,6 +15,8 @@ the narrow surface it needs, and a tenancy check exists once.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import TypeAdapter
@@ -47,7 +49,19 @@ from manicule.core.sources import SourceId, Watermark
 from manicule.storage import models
 from manicule.storage.acquisition import AcquisitionJournalMixin
 from manicule.storage.engine import admitted_writer
-from manicule.storage.fts import SEARCH_SQL, escape_match_query
+from manicule.storage.fts import (
+    SCOPE_PROBE_LIMIT,
+    SCOPE_PROBE_SQL,
+    SEARCH_SQL,
+    SEARCH_SQL_DOCUMENT_FIRST,
+    SEARCH_SQL_RANKED,
+    LexicalPlan,
+    choose_lexical_plan,
+    escape_match_query,
+    match_terms,
+    needs_scope_probe,
+    needs_workspace_share,
+)
 from manicule.storage.glossary import GlossaryMixin
 from manicule.storage.history import TrashMixin, VersionsMixin
 from manicule.storage.organization import CollectionsMixin, TagsMixin
@@ -69,7 +83,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
-    from sqlalchemy.sql.elements import ColumnElement
+    from sqlalchemy.sql.elements import ColumnElement, TextClause
 
     from manicule.core.acquisition import AcquisitionFence
     from manicule.core.content import Chunk
@@ -189,6 +203,9 @@ class SqliteDocStore(
     :class:`~manicule.core.protocols.ChunkRelationStore` and
     :class:`~manicule.retrieval.ports.GlossarySource`.
     """
+
+    _share_cache: tuple[float, float | None] | None = None
+    """When this workspace's share of the installation's documents was read, and what it was."""
 
     # --- documents ------------------------------------------------------------------------
 
@@ -1612,54 +1629,23 @@ class SqliteDocStore(
         filters rather than before them. Filtering afterwards silently returns fewer than
         ``k`` live rows, because deferred deletion leaves soft-deleted chunks in the index
         competing for the same slots.
+
+        Which of the statements in :mod:`manicule.storage.fts` runs is a speed decision and
+        never a result one: every one carries every predicate, scores with the same weights and
+        returns the same rows. :func:`~manicule.storage.fts.choose_lexical_plan` makes it.
         """
         self._require_honorable(filter, SEARCHABLE_FILTER_FIELDS, "search")
         match = escape_match_query(text)
         if not match:
             return []
 
-        clauses = ["AND d.workspace_id = :workspace_id"]
-        params: dict[str, Any] = {
-            "match": match,
-            "limit": k,
-            "workspace_id": self._workspace_id,
-        }
-        timestamps: list[str] = []
-        if filter is not None:
-            for column, values in (
-                ("d.source", sorted(filter.sources)),
-                ("d.id", sorted(filter.document_ids)),
-                ("d.media_type", sorted(filter.media_types)),
-                ("c.kind", sorted(kind.value for kind in filter.kinds)),
-                ("c.lang", sorted(filter.langs)),
-            ):
-                if not values:
-                    continue
-                names = _bind_names(column.replace(".", "_"), len(values))
-                clauses.append(f"AND {column} IN ({', '.join(':' + n for n in names)})")
-                params.update(dict(zip(names, values, strict=True)))
-            for name, comparison, moment in (
-                ("updated_after", ">", filter.updated_after),
-                ("updated_before", "<", filter.updated_before),
-            ):
-                if moment is None:
-                    continue
-                clauses.append(f"AND d.updated_at {comparison} :{name}")
-                params[name] = moment
-                timestamps.append(name)
-            if filter.readers is not None:
-                fragment, bound = readable_sql(filter.readers)
-                clauses.append(f"AND {fragment}")
-                params.update(bound)
-
-        statement = sql(SEARCH_SQL.format(extra="\n  ".join(clauses)))
-        if timestamps:
-            # Textual SQL binds nothing by type on its own, so a datetime would reach the
-            # driver as whatever sqlite3 makes of it rather than in the one encoding
-            # `UtcDateTime` writes. Same column, same conversion, one representation.
-            statement = statement.bindparams(
-                *(bindparam(name, type_=UtcDateTime()) for name in timestamps)
-            )
+        predicates = lexical_predicates(self._workspace_id, filter)
+        params: dict[str, Any] = {"match": match, "limit": k, **predicates.params}
+        # At least one: a benchmark that swaps `escape_match_query` can make a match this
+        # function's count does not see, and a plan is a speed choice that a wrong count only
+        # makes slower.
+        terms = max(len(match_terms(text)), 1)
+        scoped = len(predicates.document_ids)
         # **The session closes before the hydration, and that is hold-and-wait rather than
         # tidiness.** `get_chunks` opens a session of its own, so calling it inside this one
         # meant a single search held two of the engine's connections at once. The engine's pool
@@ -1671,8 +1657,34 @@ class SqliteDocStore(
         #
         # `.all()` has already materialized the rows, and a `Row` from a textual statement
         # holds values rather than a live identity-map reference, so nothing here needs the
-        # session to stay open.
+        # session to stay open. The scope probe runs in this session too, ahead of the
+        # statement and never beside it, so a search still holds exactly one connection.
         async with self._sessions() as session:
+            scoped_chunks = (
+                await self._scoped_chunk_count(session, predicates.document_ids)
+                if needs_scope_probe(terms, scoped)
+                else None
+            )
+            share = (
+                await self._workspace_share(session)
+                if needs_workspace_share(terms, scoped, narrowed=predicates.narrowed)
+                else None
+            )
+            plan = choose_lexical_plan(
+                terms=terms,
+                scoped_documents=scoped,
+                scoped_chunks=scoped_chunks,
+                narrowed=predicates.narrowed,
+                workspace_share=share,
+            )
+            templates = {
+                LexicalPlan.DIRECT: SEARCH_SQL,
+                LexicalPlan.RANKED: SEARCH_SQL_RANKED,
+                LexicalPlan.DOCUMENT_FIRST: SEARCH_SQL_DOCUMENT_FIRST,
+            }
+            statement = predicates.statement(
+                templates[plan], document_first=plan is LexicalPlan.DOCUMENT_FIRST
+            )
             rows = (await session.execute(statement, params)).all()
         chunk_ids = [str(row.chunk_id) for row in rows]
         chunks = {chunk.id: chunk for chunk in await self.get_chunks(chunk_ids)}
@@ -1691,6 +1703,48 @@ class SqliteDocStore(
                 )
             )
         return candidates
+
+    async def _workspace_share(self, session: AsyncSession) -> float | None:
+        """This workspace's share of the installation's live documents, or ``None`` if unknown.
+
+        A hint for choosing a statement and nothing else: it changes which statement runs and
+        never what any returns, so a stale or wrong share costs time at worst. One grouped
+        count over ``ix_documents_workspace_live_id``, which covers it (1 ms at 50,000
+        documents, 6 ms at 200,000), kept for :data:`SHARE_TTL_SECONDS` so a busy workspace
+        pays it once a minute. It runs in the search's own session, ahead of the statement. An
+        installation with no live documents answers ``None`` (unknown), which keeps the ranked
+        statement; a database error is not caught, because the statement that follows would
+        fail the same way.
+        """
+        now = _monotonic()
+        cached = self._share_cache
+        if cached is not None and now - cached[0] < SHARE_TTL_SECONDS:
+            return cached[1]
+        statement = sql(
+            "SELECT workspace_id, count(*) FROM documents WHERE deleted_at IS NULL "
+            "GROUP BY workspace_id"
+        )
+        counts = {str(ws): int(n) for ws, n in (await session.execute(statement)).all()}
+        total = sum(counts.values())
+        share = counts.get(self._workspace_id, 0) / total if total else None
+        self._share_cache = (now, share)
+        return share
+
+    async def _scoped_chunk_count(self, session: AsyncSession, document_ids: Sequence[str]) -> int:
+        """How many chunks the live documents among ``document_ids`` hold here, up to a bound.
+
+        A hint for choosing the statement and never a restriction on it: the search that
+        follows carries every predicate whatever this returns, so a count of zero or a wrong one
+        costs time and cannot admit or hide a row.
+        """
+        names = _bind_names("scope_document", len(document_ids))
+        statement = sql(SCOPE_PROBE_SQL.format(ids=", ".join(":" + name for name in names)))
+        params: dict[str, Any] = {
+            "workspace_id": self._workspace_id,
+            "probe_limit": SCOPE_PROBE_LIMIT,
+            **dict(zip(names, document_ids, strict=True)),
+        }
+        return int((await session.execute(statement, params)).scalar_one())
 
     # --- sync state -----------------------------------------------------------------------
 
@@ -1884,6 +1938,130 @@ class SqliteDocStore(
         ).scalar_one_or_none()
 
 
+_FILTERS_NOT_TO_SEEK_ON = frozenset({"d.source", "d.id"})
+"""Columns written ``+column`` in a lexical statement, which forbids SQLite to seek on the test.
+
+The join already finds each match's document by its primary key (``d.id = c.document_id``).
+Beside it, ``d.id IN (...)`` offers the planner a second way in: one seek per listed id, for
+every matching chunk, with the join's equality left to check afterwards. ``d.source IN (...)``
+offers ``(workspace_id, source)``, which finds every document of the source and compares each
+one's id. Neither is a selective lookup from where the loop stands, and nothing tells the planner
+so (the schema has never been analyzed). Unary plus on a column leaves the comparison as it was
+and removes it from the planner's choices, which is the whole effect: the same rows, and at
+100,000 synthetic chunks a source holding half of them went from over 20 seconds to 40
+milliseconds. ``tests/test_storage_fts.py`` counts the steps rather than timing them.
+
+Text columns on both sides, so dropping the column's affinity changes no comparison; the
+tests include sources that are spelled like numbers."""
+_ANCHORED_DOCUMENTS = "AND +d.id IN ("
+_DRIVING_DOCUMENTS = "AND d.id IN ("
+"""The spelling of the document-id test for the join-driven statements, and the one the
+document-first statement takes instead: it is the only one that wants the list as its outer
+loop."""
+
+
+SHARE_TTL_SECONDS: Final = 60.0
+"""How long a workspace's share of the installation's documents is trusted for choosing a
+statement. Ingest moves a share slowly, and a share only matters near its threshold."""
+
+_monotonic = time.monotonic
+"""The clock the share cache reads; a test replaces it rather than waiting."""
+
+
+@dataclass(frozen=True)
+class LexicalPredicates:
+    """The caller's restriction on a lexical search, as SQL fragments over ``d`` and ``c``."""
+
+    clauses: tuple[str, ...]
+    params: dict[str, Any]
+    timestamps: tuple[str, ...]
+    document_ids: tuple[str, ...]
+    narrowed: bool
+    """Whether a source, media type, chunk kind, language or time bound restricts the search.
+
+    Not a document list, which has a plan of its own, and not a reader set, which removes rows
+    but was measured to leave the ranked statement the faster one (``choose_lexical_plan``)."""
+
+    def text(self, template: str, *, document_first: bool = False) -> str:
+        """``template`` with this restriction spliced in.
+
+        ``document_first`` is for the one statement that drives from ``documents``
+        (:data:`~manicule.storage.fts.SEARCH_SQL_DOCUMENT_FIRST`), which wants the document
+        list as its driving loop and so takes it as written.
+        """
+        clauses = self.clauses
+        if document_first:
+            clauses = tuple(
+                clause.replace(_ANCHORED_DOCUMENTS, _DRIVING_DOCUMENTS, 1) for clause in clauses
+            )
+        return template.format(extra="\n  ".join(clauses))
+
+    def statement(self, template: str, *, document_first: bool = False) -> TextClause:
+        """:meth:`text`, ready to execute."""
+        statement = sql(self.text(template, document_first=document_first))
+        if self.timestamps:
+            # Textual SQL binds nothing by type on its own, so a datetime would reach the
+            # driver as whatever sqlite3 makes of it rather than in the one encoding
+            # `UtcDateTime` writes. Same column, same conversion, one representation.
+            statement = statement.bindparams(
+                *(bindparam(name, type_=UtcDateTime()) for name in self.timestamps)
+            )
+        return statement
+
+
+def lexical_predicates(workspace_id: str, filter: Filter | None) -> LexicalPredicates:  # noqa: A002
+    """Every predicate :meth:`SqliteDocStore.search_lexical` adds to the statement's own.
+
+    The workspace is always the first; the rest are the filter's, each one a conjunct. Public
+    so that the benchmark and the tests build the restriction the store builds rather than a
+    copy of it.
+    """
+    clauses = ["AND d.workspace_id = :workspace_id"]
+    params: dict[str, Any] = {"workspace_id": workspace_id}
+    timestamps: list[str] = []
+    documents: list[str] = []
+    narrowed = False
+    if filter is not None:
+        for column, values in (
+            ("d.source", sorted(filter.sources)),
+            ("d.id", sorted(filter.document_ids)),
+            ("d.media_type", sorted(filter.media_types)),
+            ("c.kind", sorted(kind.value for kind in filter.kinds)),
+            ("c.lang", sorted(filter.langs)),
+        ):
+            if not values:
+                continue
+            if column == "d.id":
+                documents = values
+            else:
+                narrowed = True
+            names = _bind_names(column.replace(".", "_"), len(values))
+            written = f"+{column}" if column in _FILTERS_NOT_TO_SEEK_ON else column
+            clauses.append(f"AND {written} IN ({', '.join(':' + n for n in names)})")
+            params.update(dict(zip(names, values, strict=True)))
+        for name, comparison, moment in (
+            ("updated_after", ">", filter.updated_after),
+            ("updated_before", "<", filter.updated_before),
+        ):
+            if moment is None:
+                continue
+            clauses.append(f"AND d.updated_at {comparison} :{name}")
+            params[name] = moment
+            timestamps.append(name)
+            narrowed = True
+        if filter.readers is not None:
+            fragment, bound = readable_sql(filter.readers)
+            clauses.append(f"AND {fragment}")
+            params.update(bound)
+    return LexicalPredicates(
+        clauses=tuple(clauses),
+        params=params,
+        timestamps=tuple(timestamps),
+        document_ids=tuple(documents),
+        narrowed=narrowed,
+    )
+
+
 def _bind_names(prefix: str, count: int) -> list[str]:
     """Named bind parameters, so a set never reaches SQL as interpolated text."""
     return [f"{prefix}_{index}" for index in range(count)]
@@ -1893,6 +2071,9 @@ __all__ = [
     "DEFAULT_WORKSPACE",
     "LISTABLE_FILTER_FIELDS",
     "SEARCHABLE_FILTER_FIELDS",
+    "SHARE_TTL_SECONDS",
     "CrossWorkspaceCollisionError",
+    "LexicalPredicates",
     "SqliteDocStore",
+    "lexical_predicates",
 ]

@@ -1137,6 +1137,10 @@ class IngestPipeline:
         acquisition_cleanup_batch: int = 100,
         snapshot_policy: SnapshotPromotionPolicy = SnapshotPromotionPolicy.REQUIRE_COMPLETE,
         mutation_guard: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        source_guard: Callable[[str], contextlib.AbstractAsyncContextManager[None]] | None = None,
+        publication_guard: (
+            Callable[[str], contextlib.AbstractAsyncContextManager[None]] | None
+        ) = None,
         expected_reset_epoch: int | None = None,
         sensitive_sources: AbstractSet[str] = frozenset(),
         shared_vectors: SharedVectors | None = None,
@@ -1184,6 +1188,11 @@ class IngestPipeline:
         self._acquisition_cleanup_batch = max(1, acquisition_cleanup_batch)
         self._snapshot_policy = snapshot_policy
         self._mutation_guard = mutation_guard or _unlocked_derived_mutation
+        # Two narrower ways in beside the exclusive guard. A caller that supplies only the
+        # exclusive one gets exactly the old behavior from both, which is what keeps a runtime
+        # that knows nothing of source leases correct rather than merely compatible.
+        self._source_guard = source_guard
+        self._publication_guard = publication_guard
         self._expected_reset_epoch = expected_reset_epoch
         # These casts preserve the narrow, non-optional types throughout the derived path. An
         # acquisition-only pipeline never enters that path, and ``run`` refuses any other use
@@ -1459,8 +1468,14 @@ class IngestPipeline:
         acquire_only: bool = False,
         retain_source_bytes: bool | None = None,
     ) -> RunReport:
-        """Run one complete sync under the runtime-wide reset/publication barrier."""
-        async with self._mutation_guard():
+        """Run one complete sync under its source's lease on the reset/publication barrier.
+
+        A lease excludes maintenance and another run of the same slot, and nothing else: a
+        different source's fetch, enumeration or wait on its server does not hold this run up,
+        which is what lets a document an assistant has just written publish while a background
+        sync of another source is still talking to its server.
+        """
+        async with self._source_lease(connector.name):
             await self._assert_current_reset_epoch()
             return await self._run_guarded(
                 connector,
@@ -3594,8 +3609,8 @@ class IngestPipeline:
     async def ingest(
         self, connector: Connector, discovered: DiscoveredDoc
     ) -> list[DocumentOutcome]:
-        """Ingest one discovery under the runtime-wide reset/publication barrier."""
-        async with self._mutation_guard():
+        """Ingest one discovery under the reset/publication barrier."""
+        async with self._publication(connector.name):
             await self._assert_current_reset_epoch()
             return await self._ingest_discovered_guarded(connector, discovered)
 
@@ -3690,8 +3705,12 @@ class IngestPipeline:
         blobs: BlobSink | None = None,
         reuse_vectors: bool = True,
     ) -> list[DocumentOutcome]:
-        """Publish fetched bytes under the runtime-wide reset/publication barrier."""
-        async with self._mutation_guard():
+        """Publish fetched bytes under the reset/publication barrier.
+
+        Covered when the caller is a run of ``source`` (its lease) or a maintenance task (the
+        exclusive hold), and exclusive when it stands alone.
+        """
+        async with self._publication(source):
             await self._assert_current_reset_epoch()
             # The choke point every document write passes through, so a path that does not go
             # through `run` (a forced sync, an archive import) cannot leave mail unmarked.
@@ -3709,6 +3728,18 @@ class IngestPipeline:
                 blobs=blobs,
                 reuse_vectors=reuse_vectors,
             )
+
+    def _source_lease(self, source: str) -> contextlib.AbstractAsyncContextManager[None]:
+        # Resolved at call time, not captured, so a test or a caller that swaps the exclusive
+        # guard on a built pipeline still governs runs that were never given a lease.
+        if self._source_guard is not None:
+            return self._source_guard(source)
+        return self._mutation_guard()
+
+    def _publication(self, source: str) -> contextlib.AbstractAsyncContextManager[None]:
+        if self._publication_guard is not None:
+            return self._publication_guard(source)
+        return self._mutation_guard()
 
     async def _assert_current_reset_epoch(self) -> None:
         if self._expected_reset_epoch is None:
