@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.30](https://github.com/mgd43b/manicule/compare/v0.2.29...v0.2.30) (2026-11-21)
+
+
+### Performance Improvements
+
+* keep authoring responsive during sync, make Qdrant checksum counts and FTS ranking cheap ([#569](https://github.com/mgd43b/manicule/issues/569)) ([8084945](https://github.com/mgd43b/manicule/commit/8084945c0914af10c26689410cfa9426eb83f472))
+
 ## [0.2.29](https://github.com/mgd43b/manicule/compare/v0.2.28...v0.2.29) (2026-11-19)
 
 
