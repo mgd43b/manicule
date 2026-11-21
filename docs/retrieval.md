@@ -492,7 +492,9 @@ returned a passage of a document the set may not read fails, with a message of i
 
 The statement is settled and built ([`storage.md`](storage.md) §6.1): one joined query over
 `chunks_fts`, `chunks` and `documents`, filters inline, `LIMIT` last, `ORDER BY bm25(...)`
-ascending. Retrieval adds three things and changes none of it.
+ascending. Which of three equivalent statements runs it is a per-search speed choice
+([`storage.md`](storage.md) §6.1) and never changes a row or a score. Retrieval adds three things
+and changes none of it.
 
 **It re-keys the score.** `DocStore.search_lexical` returns candidates carrying `scores["bm25"]`
 — a key describing the *algorithm*, not the stage. The stage is named `lexical`, and
@@ -629,6 +631,26 @@ tokenizer cuts `docs/` into 1,198 longer chunks rather than 1,352, so a prose qu
 more rows of each. The miss is a few milliseconds on eleven questions over one corpus, and the
 owner kept the rule. Round 3b agreed under both models: the cap cost the pastes 0.005 of
 reciprocal rank under Qwen3, inside its margin, and missed the time bound either way.
+
+**Which statement runs it, measured (2026-11-21).** Synthetic data only
+(`tests/benchmarks/lexical_plans.py`): a migrated database with the shipped indexes and no
+`ANALYZE`, Zipf text at 120 words a chunk, chunks stored twice, 5% of documents soft-deleted and
+5% unindexed. SQLite **3.50.4**, a warm operating-system cache (never purged, so a corpus larger
+than memory is not represented), medians of 3 to 5 runs. Through `search_lexical` itself, as
+released and as chosen, ms, at 1,000,000 chunks, three common words: no filter 848 to 533;
+source holding 0.1% of documents 2,802 to 543; ids of 20 chunks 1,041 to 114; ids of 512 chunks
+11,877 to 572. Three middling words, no filter: 180 to 82. At 100,000 chunks the same rows read
+51 to 46, 52 to 32, 75 to 14 and 948 to 34. A source holding half the documents took over 20
+seconds as released at 100,000 chunks and 40 ms with `+d.source`. Ranked was 1.2 to 2.3 times
+faster than direct at two to six words with no filter and about level at nine and sixteen; it
+was 1.6 to 2.3 times slower when the workspace was a small part of the index (3 words, 1M: 589 vs
+320 ms), and slower under a narrow filter or a listed scope, which is why those keep direct. Over
+a listed scope the document-first walk beat direct up to about 64 chunks for three common words
+and only to about 20 for sixteen, so the budget is 32 chunks. A reader set was level to 2.5 times
+faster under ranked from 95% to 5% of the index readable and 0.75 to 1.13 times as fast at 0.1%.
+SQLite 3.42.0 plans the plain id and source spelling like the anchored one, and picks the
+`(workspace_id, status)` index for the document lookup when a chunk-kind filter is present (a
+pre-existing plan this change leaves as it was). Versions below 3.42 are unmeasured.
 
 **It changes no identity.** The match is built at query time from the text the leg was given:
 the FTS5 index, its tokenizer, every fingerprint and the `PipelineIdentity` are unchanged, and

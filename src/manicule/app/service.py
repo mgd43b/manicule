@@ -3475,8 +3475,12 @@ class ApplicationService:
     ) -> r.DocumentCreated:
         """The part of :meth:`document_create` that must not interleave with another call.
 
-        Split out so the lock wraps exactly the check-write-index sequence and nothing else: the
+        Split out so the lock wraps the check-write-index sequence and nothing else: the
         validation above it refuses bad arguments without waiting behind somebody else's embed.
+        What the index step waits for inside the lock is the runtime's business, not this
+        method's: it publishes under the authoring source's lease, so it queues behind
+        maintenance and behind another run of that same source, and not behind an unrelated
+        source's sync (``docs/memory-authoring.md`` §4.4).
 
         ``found`` is ``None`` only under ``collections_from_directories``, where the collection
         is resolved here — and created here when it does not exist, **after** every check that
@@ -3540,11 +3544,15 @@ class ApplicationService:
         # looked most likely to.
         indexed, member, detail, chunks = False, False, "", 0
         try:
-            report = await self.index_path(target, source=authoring.source)
+            # `_index_one` rather than `index_path`: this reads the run's error and then the
+            # stored document, and the placement counts `index_path` attaches for a person
+            # reading a report are two more statements over the whole corpus that nothing here
+            # looks at.
+            report = await self._index_one(target, source=authoring.source)
             documents = await self._backend.documents()
             stored = await documents.get_document(identifier)
             indexed = stored is not None and stored.status is DocumentStatus.INDEXED
-            detail = "" if indexed else _not_indexed(report, stored)
+            detail = "" if indexed else _not_indexed(report.error, stored)
             if indexed:
                 chunks = len(await documents.document_chunks(identifier))
                 await self.collection_add(found.id, [identifier])
@@ -3863,8 +3871,12 @@ class ApplicationService:
                     f"({type(exc).__name__}: {exc}). Both hold the document now; remove the "
                     f"original with document_remove({from_collection!r}, {slug!r}).",
                 )
-            if moved.indexed:
-                await self._reclaim(Path(moved.path), authoring.source)
+            reclaim = moved.indexed
+        # Outside the authoring lock. The re-index is forced and so takes the exclusive side of
+        # the derived barrier, which waits for every running sync; held inside the lock, one
+        # move would stop every create behind that wait for the sake of a best-effort repair.
+        if reclaim:
+            await self._reclaim(Path(moved.path), authoring.source)
         return r.DocumentMoved(moved=moved, removed=removed)
 
     async def _reclaim(self, path: Path, source: str) -> None:
@@ -3877,7 +3889,7 @@ class ApplicationService:
         Best effort: the move is complete without it, so a failure is logged, not raised.
         """
         try:
-            await self.index_path(path, source=source, force=True)
+            await self._index_one(path, source=source, force=True)
         except (ManiculeError, ValueError, OSError, SQLAlchemyError) as exc:
             _log.warning("could not re-index %s after moving it: %s", path, exc)
 
@@ -4226,9 +4238,11 @@ class ApplicationService:
             # query scans every vector is not visible in any of the counts above it.
             vector_index=_reported_vector_index(await maintenance.vector_index_state()),
             # Whether the vectors' *numbers* are still the numbers that were written, on the
-            # cheap setting: two predicates over a string column, no vector read. The expensive
-            # setting recomputes every digest and belongs to a command somebody runs, not to a
-            # status page something polls.
+            # cheap setting: a few exact counts over the two checksum fields, no vector read. Cheap
+            # is relative: on a network store each count reads payloads wherever a field has no
+            # index, which is why readiness never asks for this and doctor bounds it. The
+            # expensive setting recomputes every digest and belongs to a command somebody runs,
+            # not to a status page something polls.
             vector_checksums=_reported_vector_checksums(
                 await maintenance.vector_checksum_coverage()
             ),
@@ -6591,9 +6605,14 @@ class ApplicationService:
             connector check applies to a rename that has not happened yet.
 
         ``failing``
-            A recorded checksum was refused somewhere. This one is only reachable when a caller
-            has already recomputed — ``status`` and this check do not — so it is here to make
-            sure a stored failure is never rendered as a coverage percentage.
+            A point's checksum record was refused, for one of two causes. Counting finds the
+            first by reading the two payload fields and no vector: a point carrying only half of
+            its record, a checksum without its version or a version without its checksum, which
+            nothing can be compared against. A recomputation finds that and the second, numbers
+            on disk that no longer match the checksum written beside them. ``status`` and this
+            check only count, so the first is the one they can reach; the wording says which
+            cause was found rather than claiming a comparison nobody made, and a refusal is
+            never rendered as a coverage percentage.
         """
         try:
             maintenance = await self._backend.maintenance()
@@ -6626,13 +6645,40 @@ class ApplicationService:
             "recomputed": coverage.recomputed,
         }
         if coverage.failed:
+            # Two causes reach here and they are not the same finding. Counting reads two payload
+            # fields and compares nothing, so what it can report is a point whose record is
+            # half written; only a recomputation can say the numbers no longer match. Naming
+            # the cause found, rather than the more alarming of the two, keeps the remedy
+            # honest: a half-written record is not evidence that any vector changed.
+            malformed = coverage.failures.get("malformed", 0)
+            mismatched = coverage.failures.get("mismatched", 0)
+            other = max(0, coverage.failed - malformed - mismatched)
+            causes: list[str] = []
+            if malformed:
+                shape = (
+                    "a checksum record that is not well formed (a checksum or its version "
+                    "missing, or a checksum that is not a digest)"
+                    if coverage.recomputed
+                    else "only half of their checksum record (a checksum with no version, or a "
+                    "version with no checksum)"
+                )
+                causes.append(f"{malformed} carry {shape}, so nothing can be compared")
+            if mismatched:
+                causes.append(
+                    f"{mismatched} no longer match the checksum written beside them: the "
+                    f"numbers on disk changed without their checksum changing with them"
+                )
+            if other:
+                causes.append(
+                    f"{other} were refused for another reason that "
+                    f"`manicule vector-checksum --verify` names"
+                )
             return r.Check(
                 name="vector_integrity",
                 state="failing",
                 detail=(
-                    f"{coverage.failed} stored vector(s) no longer match the checksum written "
-                    f"beside them. The numbers on disk changed without their checksum changing "
-                    f"with them, which no identity or fingerprint check can see."
+                    f"{coverage.failed} stored vector(s) failed the numerical-integrity check: "
+                    f"{'; '.join(causes)}. No identity or fingerprint check can see this."
                 ),
                 facts=facts,
                 remedy="manicule vector-checksum --verify",
@@ -12052,7 +12098,7 @@ def _kept(target: Path, indexed: bool, member: bool, collection: str, exc: Excep
     return f"{target} is on disk and was not indexed: {failure}"
 
 
-def _not_indexed(report: r.IngestReport, stored: Document | None) -> str:
+def _not_indexed(error: str, stored: Document | None) -> str:
     """Why a written file is not searchable, in one sentence for the caller who wrote it.
 
     The ingest run's own error first, because it is the specific one. Then the stored
@@ -12060,8 +12106,8 @@ def _not_indexed(report: r.IngestReport, stored: Document | None) -> str:
     that is true whatever happened — the counters are on the envelope's payload, and a sentence
     that claimed more than that would be guessing.
     """
-    if report.error:
-        return report.error
+    if error:
+        return error
     if stored is not None:
         return f"the document is {stored.status.value}" + (
             f": {stored.status_detail}" if stored.status_detail else ""
@@ -12519,9 +12565,11 @@ def _checksum_detail(coverage: VectorChecksumCoverage, pass_: VectorChecksumBack
     if coverage.failed:
         listed = ", ".join(f"{count} {kind}" for kind, count in sorted(coverage.failures.items()))
         return (
-            f"{coverage.failed} row(s) failed numerical integrity ({listed}). The stored "
-            f"numbers are not the numbers their checksum was taken from; rebuild the affected "
-            f"generation from retained source bytes rather than trusting these vectors."
+            f"{coverage.failed} row(s) failed numerical integrity ({listed}). A malformed row "
+            f"carries a checksum record that is not well formed, one half of it missing, so "
+            f"nothing can be compared; a mismatched row holds numbers that are not the numbers "
+            f"its checksum was taken from. Rebuild the affected generation from retained "
+            f"source bytes rather than trusting these vectors."
         )
     if pass_.unhashable:
         return (

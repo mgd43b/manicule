@@ -974,16 +974,18 @@ without dominating; a single concatenated column cannot.
 lexical query and the shape is load-bearing:
 
 ```sql
-SELECT c.id, c.text, d.uri, d.title
+SELECT c.id AS chunk_id, bm25(chunks_fts, 1.0, 0.4) AS rank_score
 FROM chunks_fts
 JOIN chunks    c ON c.seq = chunks_fts.rowid
 JOIN documents d ON d.id  = c.document_id
-WHERE chunks_fts MATCH :q
-  AND d.workspace_id IN (:workspaces)
+WHERE chunks_fts MATCH :match
   AND d.deleted_at IS NULL
   AND d.status = 'indexed'
+  AND d.workspace_id = :workspace_id
+  -- and, when asked: source, document ids, media type, chunk kind and language,
+  -- updated_at bounds, and the reader predicate
 ORDER BY bm25(chunks_fts, 1.0, 0.4)
-LIMIT :k
+LIMIT :limit
 ```
 
 The `LIMIT` has to be applied *after* the joins and filters, not before. Running `MATCH … LIMIT k`
@@ -995,8 +997,27 @@ which `chunks_fts` cannot distinguish because the workspace lives on `documents`
 Measured on a fixture with three matching live chunks in the target workspace, five in a
 soft-deleted document and five in another workspace: **`MATCH`-then-hydrate with `k = 5`
 returned zero live in-workspace results; the joined statement returned all three.** Not a
-marginal loss of recall — a total one, silently, with a well-formed empty result set. SQLite
-pushes the `MATCH` down and applies the `LIMIT` last, so the joined form costs nothing.
+marginal loss of recall — a total one, silently, with a well-formed empty result set.
+
+**The joined form is not free, and which of three equivalent statements runs is chosen per
+search.** `ORDER BY bm25(...)` is an expression, so SQLite scores and sorts every match
+(`USE TEMP B-TREE FOR ORDER BY`) before `LIMIT`. `fts.py` therefore holds three statements that
+return the same rows and scores, and `choose_lexical_plan` picks by facts that cost nothing to
+know (measured: `retrieval.md` §4.1):
+
+| Statement | What differs | Chosen for |
+|---|---|---|
+| `SEARCH_SQL` (direct) | the statement above | one word; two or more with a narrow filter (source, media type, kind, language, time) or a listed scope too big to walk; more than six words |
+| `SEARCH_SQL_RANKED` | `ORDER BY chunks_fts.rank`, weights set per statement by `chunks_fts.rank MATCH 'bm25(1.0, 0.4)'`, no sort | two to six words with no narrowing and no document list (a reader set does not narrow) |
+| `SEARCH_SQL_DOCUMENT_FIRST` | `CROSS JOIN` from `documents`, tie-broken on `c.seq` | a listed scope of at most 64 documents holding at most 32 chunks, counted by a bounded indexed probe |
+
+The probe is a hint to choose a statement and never a restriction: every statement carries every
+predicate before `LIMIT`. Equal scores have no specified order in any of the three. Separately,
+a list of ids or sources is written `+d.id IN (...)` and `+d.source IN (...)` in the first two,
+which forbids SQLite to seek on them: beside the join's own `d.id = c.document_id`, SQLite 3.50.4
+otherwise ran one seek per listed id, or one scan of the source, for every matching chunk (it
+plans them the same way on 3.42.0, where the spelling changes nothing). The weights, the tokenizer
+and the table-wide `rank` setting are untouched.
 
 **Tokenizer: `porter unicode61 remove_diacritics 2`.**
 
@@ -1407,6 +1428,40 @@ that "unverified" can never be mistaken for "verified":
   carrying one were merely *counted*, because both get called "coverage" and only one of them is
   affordable on a status page.
 
+**Counting is exact, and exact is not free on a network store.** The counting mode reads no
+vector, and it is still a handful of filtered counts over every point's payload. The embedded
+store makes three `count_rows` calls over two small string columns: every row, the rows recording
+neither half of the pair, and the rows recording exactly one. The Qdrant store makes three
+requests, the same three: every point, the points recording neither half, and the points
+recording exactly one half — a checksum without its version, or a version without its checksum.
+A count whose filter the server cannot plan from an index reads every point's payload to answer,
+and on a healthy corpus it reads all of them to return zero. The count is what costs, not the
+answer: it follows the corpus and the size of its payloads, and the indexes in §6.7 are there so
+that it need not be a scan. The one-half count stays a single filter with a negation in each arm,
+because with the version indexed the server plans it through the index, and the obvious
+alternative — two simple filters whose counts are added — was measured and was slower on both
+Qdrant versions this project pins.
+`tests/benchmarks/qdrant_checksum_coverage.py` keeps that alternative as an arm, so the comparison
+can be taken again on another server version or corpus; nothing here states a figure, because a
+figure depends on the corpus and the payloads. Four things hold regardless:
+
+- **The definition does not move.** "Records nothing" is Qdrant's reading of a payload field:
+  missing, `null` and `[]` are empty, and the empty string — or an array containing it — is
+  matched separately. Anything else counts as recorded, including `[null]`, `[[]]`, `{}`, numbers
+  and booleans; the test suite pins every shape, as point *sets*, against an oracle written from
+  those semantics. A half-written pair is the exclusive or of the two fields recording nothing.
+- **The counts are three moments, not one.** A collection another process can write to changes
+  between two requests, so `recorded` and `failed` are held to between zero and the number of
+  rows. A write can make a figure a little stale and can never make coverage impossible, and a
+  half-written point that is there when the counts run is always reported as failed.
+- **Nothing is cached.** A shared collection can be written by a process this one cannot observe,
+  so there is no moment at which a remembered count is known to be current, and a count that was
+  not fresh must not read as an integrity result. Every call asks the server.
+- **The cheap surfaces stay cheap.** The readiness probe makes one constant query against the
+  document store and never asks for coverage; `doctor` runs it under a per-check time bound and
+  reports `unknown`, not `ok`, when it does not finish. A collection that exists and holds nothing
+  is answered with one request.
+
 `manicule vector-checksum --yes` runs the backfill: one bounded page per pass, hashing vectors
 already on disk, contacting nothing and re-embedding nothing. It is resumable and idempotent by
 construction rather than by bookkeeping — the page is selected by "records **neither** half of
@@ -1424,7 +1479,11 @@ Two kinds of row are deliberately outside every page it selects, and for the sam
   would replace a row announcing a contradiction with one that verifies forever. Half a record is
   evidence; overwriting it is the one thing a backfill must not do. Counting the *pair* is what
   keeps it out — and because half a record is malformed by looking at the two columns alone, the
-  cheap counting mode reports it rather than leaving it to a scan nobody may run.
+  cheap counting mode reports it rather than leaving it to a scan nobody may run. It is reported
+  as `failed`, with `{"malformed": n}` as the failure split, and the count of it shares nothing
+  with the backfill's selection: a point recording neither half is the backfill's and is not
+  counted as half written, and a point recording one half is counted as failed and is never in the
+  backfill's page.
 
 **A backfill fixes the numbers as they are, not as they were.** Hashing a row that was corrupted
 *before* the backfill records a digest over the corrupted bytes, and that row then verifies
@@ -1925,6 +1984,29 @@ return different rows depending on which store an installation configured, which
 collection is, and re-declared on every `ensure_ready`: an index is invisible to correctness, so
 a half-created one is a corpus that silently gets slower rather than a failure anybody sees.
 
+**The rule is that every field a filter names has an index** — a search restriction, a lookup or
+a count — and the test suite holds the list to it from both sides: it drives every operation that
+sends a filter and compares the fields those filters name with the fields indexed. The list is
+`document_id`, `kind` and `lang` (search), `chunk_id` and `embed_identity` (the reuse lookup),
+and `vector_checksum` and `vector_checksum_version` (§6.2.5's count and backfill). All are
+`keyword`. The version is a keyword index although it holds a small number, because the value is
+the string `"1"` and "records nothing" is asked as a string equality beside an emptiness test: a
+string match cannot be answered by an integer index, so one would exist and the count would still
+read every payload. Declaring a keyword index over a field that already carries one of another
+type — an operator's integer index, say — replaces it.
+
+Local mode creates none of them: the in-process engine ignores payload indexes and warns when asked
+for one, so the store never asks, and everything above about an index is observable only against a
+server. Two consequences of the loop being the repair. A collection made before an entry joined the
+list gains it on the first prepare after the upgrade, with no migration step and no rebuild of the
+corpus; Qdrant builds the index online, and `tests/benchmarks/qdrant_checksum_coverage.py` samples
+search latency while it does. And that prepare *waits* for the build, deliberately — an index that failed to build must fail the prepare rather than leave a
+collection that is quietly slower — so on a very large collection the one request can outlast
+`storage.qdrant.timeout_s`. That is reported as a `TimeoutError` naming the setting, not as the
+client's empty-messaged transport error; nothing is recorded as prepared, so the next attempt
+declares the same indexes again and is safe to repeat, and raising the timeout for that one start
+is the remedy if it keeps happening.
+
 **A collection's shape is configuration, and it is applied to the collection that exists.** Seven
 settings under `storage.qdrant` choose what a chunk collection costs to hold and to search.
 `quantization` is `none` or `scalar` — an int8 copy of every vector, searched in place of the
@@ -1967,7 +2049,8 @@ an untuned collection on a stock server is never written to and a server is neve
 re-optimize for a change that is not one. A change that lands logs one line, `reshaped Qdrant
 collection`, naming each dial's old and new value. The same path prepares a migration's destination
 (§6.8) and the collection the next ingest recreates after `reset-index`, so each is born in the
-configured shape.
+configured shape. The payload indexes ride the same loop, which is how a collection made before
+the version index existed has it after the first prepare of the release that added one.
 
 **What differs is written where the server will act on it.** Turning quantization off clears it
 from the collection as well as from the vector, because a vector with none of its own falls back to
@@ -2146,14 +2229,14 @@ read.
 
 **Every refusal here exists because the alternative is a plausible-looking success.**
 
-A real migration takes the derived-mutation guard **before** the preflight reads anything,
+A real migration takes the exclusive side of the derived-index barrier **before** the preflight reads anything,
 rather than around the copy. Both reads that decide whether it may proceed — whether a
 generation is in flight, and which one `index_state.vector_table` names — are worth what they
 are worth only while nothing else can move them. Guarding the copy alone leaves a re-embed free
 to start after the in-flight check, and a generation free to publish after the pointer is read:
 the migration then holds the superseded source and its retarget overwrites the newly published
 pointer with the old space. §8's writer lock closes neither, because it excludes other
-*processes* and both of these are tasks inside one served one. A plan takes no guard, because it
+*processes* and both of these are tasks inside one served one. A plan takes no barrier, because it
 writes nothing and is meant to be runnable while a sync is in flight.
 
 - *The configured store is the one being read from, or cannot adopt rows.* Migrating requires
@@ -2613,12 +2696,15 @@ for top-`k` slots ahead of the join that hides it, and a soft-deleted document's
 never expired because nothing was watching for it to. Three settings described the cadence of a
 loop that did not exist.
 
-**What it yields to, stated exactly.** The pass takes the derived-mutation guard, which
-serializes it against a reset, a rebuild and a re-embed publication — the operations that move
-the publication pointer underneath it. It is deliberately *not* serialized against a running
-sync, and the tombstone design is what makes that safe rather than merely tolerable: the list
-only ever names ids that were already deleted, so a vector written after the pass began cannot
-be in it. **A hot backup is excluded by the backup lock** (§2, §9.1). The pass holds
+**What it yields to, stated exactly.** The pass takes the exclusive side of the derived-index
+barrier (`docs/ingest.md` §8.4), which serializes it against a reset, a rebuild and a re-embed
+publication — the operations that move the publication pointer underneath it — and, because that
+side waits for every source lease to drain and keeps new ones out, against a running sync in the
+same process as well: it begins once the syncs running when it asked have finished, and no sync
+starts until it is done. The tombstone design would make a concurrent sync safe — the list only
+ever names ids that were already deleted, so a vector written after the pass began cannot be in
+it — so that exclusion is the cost of sharing the barrier and not something the sweep needs; it
+is why a long sync delays a pass rather than racing it. **A hot backup is excluded by the backup lock** (§2, §9.1). The pass holds
 `backup.lock` shared from before its first removal to after the blob collection, and a backup holds
 it exclusively, so neither starts inside the other: a backup waits for a running pass, up to a
 bound, and then refuses; a pass that finds a backup running declines with a reason and runs at its
@@ -2818,7 +2904,7 @@ rung on the ladder.
 | Chunks with no vector | Interrupted ingest — rung 2 |
 | Vectors with no chunk | Unswept tombstones or an interrupted delete |
 | Fingerprint agreement across config / `index_state` / `_manicule_meta` | A swapped or half-restored vector directory |
-| Vector-checksum coverage — rows carrying one, counted, never recomputed (§6.2.5) | An unfinished backfill after an upgrade (**degraded**), or a recorded refusal (**failing**). Counted rather than recomputed because `doctor` is what somebody runs when a machine is already misbehaving; `manicule vector-checksum --verify` is the scan |
+| Vector-checksum coverage — rows carrying one, counted, never recomputed (§6.2.5) | An unfinished backfill after an upgrade (**degraded**), or a refused record (**failing**): a point carrying only half of its checksum record — found by counting — or numbers that no longer match their checksum — found only by a recomputation. The detail names the cause that was found. Counted rather than recomputed because `doctor` is what somebody runs when a machine is already misbehaving, and bounded by the per-check time limit, so a count that does not finish is **unknown**, never **ok**; `manicule vector-checksum --verify` is the scan |
 | `alembic current` vs `head` | An un-migrated database |
 | Dangling `original_ref` | The one rung-4 case |
 | Blobs on disk absent from `blobs` | A leaked GC sweep — reports reclaimable bytes |

@@ -23,7 +23,6 @@ import secrets
 import shutil
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,6 +39,7 @@ from pydantic import (
     model_serializer,
 )
 
+from manicule.app.barrier import DerivedBarrier
 from manicule.app.results import ApiKeySummary, Check, CheckState, UserSummary
 from manicule.app.sensitive import sensitive_instances as configured_sensitive_instances
 from manicule.config.loader import load_settings
@@ -64,6 +64,7 @@ from manicule.plugins.manifest import ComponentKind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Sequence
+    from contextlib import AbstractAsyncContextManager
 
     from sqlalchemy.engine import CursorResult
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -152,10 +153,6 @@ ARCHIVE_MANIFEST = "manicule-export.json"
 
 ARCHIVE_VERSION = 1
 """Bumped when the archive layout changes in a way an older import cannot read."""
-
-_DERIVED_MUTATION_GUARDS: ContextVar[frozenset[int]] = ContextVar(
-    "manicule_derived_mutation_guards", default=frozenset()
-)
 
 
 async def _recover_reembed_runs(
@@ -291,7 +288,7 @@ class Runtime:
         self._migrated = False
         self._writer = writer
         self._lock: InstanceLock | None = None
-        self._derived_mutation_lock = asyncio.Lock()
+        self._barrier = DerivedBarrier(authoring_source=self._authoring_source)
         self._health: _Observation | None = None
         self._health_lock = asyncio.Lock()
         self._workspaces = _Workspaces(self)
@@ -468,25 +465,31 @@ class Runtime:
     def workspace(self) -> str:
         return self._settings.workspace
 
-    @property
-    def derived_mutation_lock(self) -> asyncio.Lock:
-        """Process-local half of the filesystem-pinned derived mutation barrier."""
-        return self._derived_mutation_lock
+    def _authoring_source(self) -> str | None:
+        authoring = self._settings.authoring
+        return authoring.source if authoring.configured else None
 
-    @asynccontextmanager
-    async def derived_mutation_guard(self) -> AsyncGenerator[None]:
-        """Serialize a whole derived publication lifecycle against reset, reentrantly."""
-        key = id(self._derived_mutation_lock)
-        held = _DERIVED_MUTATION_GUARDS.get()
-        if key in held:
-            yield
-            return
-        async with self._derived_mutation_lock:
-            token = _DERIVED_MUTATION_GUARDS.set(held | {key})
-            try:
-                yield
-            finally:
-                _DERIVED_MUTATION_GUARDS.reset(token)
+    @property
+    def derived_barrier(self) -> DerivedBarrier:
+        """Process-local half of the filesystem-pinned derived mutation barrier."""
+        return self._barrier
+
+    def derived_mutation_guard(self) -> AbstractAsyncContextManager[None]:
+        """Hold every derived publication off, and wait for the running ones, reentrantly.
+
+        The exclusive side of :class:`~manicule.app.barrier.DerivedBarrier`, and what reset,
+        rebuild, re-embed, reconciliation, the sweeps and a standalone or forced publication
+        take. It waits for every source lease to drain and closes admission while it does.
+        """
+        return self._barrier.exclusive()
+
+    def derived_source_lease(self, source: str) -> AbstractAsyncContextManager[None]:
+        """One run of ``source`` for its whole lifecycle, alongside runs of other slots."""
+        return self._barrier.source(source)
+
+    def derived_publication_guard(self, source: str) -> AbstractAsyncContextManager[None]:
+        """One document of ``source``: covered by its run's lease, exclusive when standalone."""
+        return self._barrier.publication(source)
 
     @asynccontextmanager
     async def maintenance_hold(self) -> AsyncGenerator[MaintenanceHold]:
@@ -522,7 +525,7 @@ class Runtime:
         the very lock :func:`~manicule.storage.backup.create_backup` takes exclusively: a backup
         waits for an open window (up to its own bound) rather than copying beside it. The
         window is advisory and cross-process (``flock`` on ``<data_dir>/backup.lock``,
-        :mod:`manicule.storage.backup_lock`). It does not take the derived-mutation guard, the
+        :mod:`manicule.storage.backup_lock`). It does not take the derived-index barrier, the
         instance lock or any in-process lock; a pass that needs those takes them itself.
 
         Used as::
@@ -648,6 +651,9 @@ class Runtime:
         It is also where a directory holding another model's vectors is refused, before a
         single vector is written into a space it does not belong to.
         """
+        built = self._built("prepared_vectors")
+        if built is not None:
+            return cast("VectorStore", built)
         async with self.derived_mutation_guard():
             return await self._once("prepared_vectors", self._build_prepared_vectors)
 
@@ -1134,8 +1140,55 @@ class Runtime:
 
     async def pipeline(self) -> IngestPipeline:
         """The ingest pipeline, refused before construction if it cannot write to this index."""
+        built = self._built("pipeline")
+        if built is not None:
+            return cast("IngestPipeline", built)
         async with self.derived_mutation_guard():
             return await self._once("pipeline", self._build_pipeline)
+
+    @asynccontextmanager
+    async def leased_pipeline(
+        self, source: str, *, acquire_only: bool = False
+    ) -> AsyncGenerator[IngestPipeline]:
+        """The pipeline for one run of ``source``, fetched *after* its lease is held.
+
+        In that order because a reset that finishes between fetching a pipeline and leasing is
+        what would hand a run a pipeline built against the index identity the reset just
+        retired, and publication would then refuse it. A lease cannot begin while maintenance
+        is waiting or running, and maintenance cannot begin while a lease is held, so a slot
+        read under the lease is the current one.
+
+        A pipeline that is not built yet is built *outside* the lease, because building takes
+        the exclusive side and a lease holder asking for that would be waiting for itself.
+        """
+        if acquire_only:
+            # Never a derived component, so there is nothing a reset can have retired.
+            async with self.derived_source_lease(source):
+                yield await self.acquisition_pipeline()
+            return
+        while True:
+            async with self.derived_source_lease(source):
+                current = self._slots.get("pipeline")
+                if current is not None and current.value is not None:
+                    yield cast("IngestPipeline", current.value)
+                    return
+            await self.pipeline()
+
+    def _built(self, slot: str) -> object | None:
+        """The component in ``slot`` if it is built and no maintenance can have retired it.
+
+        A built component is handed back without the exclusive guard, because queueing behind
+        a running sync to be told what already exists is what made a write wait for a fetch.
+        It is refused while maintenance is pending or running, since a reset retires these
+        slots and a caller arriving mid-reset must queue behind it and receive the new one —
+        unless the caller is itself inside the barrier, which is what keeps maintenance out.
+        """
+        lazy = self._slots.get(slot)
+        if lazy is None or lazy.value is None:
+            return None
+        if self._barrier.maintenance_pending and not self._barrier.holds():
+            return None
+        return lazy.value
 
     async def acquisition_pipeline(self) -> IngestPipeline:
         """The source-only pipeline, assembled without requesting any derived component."""
@@ -1167,6 +1220,8 @@ class Runtime:
             max_fetch_bytes=settings.ingest.max_fetch_bytes,
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
+            source_guard=self.derived_source_lease,
+            publication_guard=self.derived_publication_guard,
             sensitive_sources=self.sensitive_instances(),
             local_evidence=settings.authoring.local_evidence,
         )
@@ -1268,6 +1323,8 @@ class Runtime:
             max_embed_batch=settings.ingest.max_embed_batch,
             snapshot_policy=settings.ingest.snapshot_promotion_policy,
             mutation_guard=self.derived_mutation_guard,
+            source_guard=self.derived_source_lease,
+            publication_guard=self.derived_publication_guard,
             expected_reset_epoch=expected_reset_epoch,
             sensitive_sources=self.sensitive_instances(),
             local_evidence=settings.authoring.local_evidence,
@@ -1459,14 +1516,23 @@ class _Ingestion:
         from manicule.connectors.filesystem import FilesystemConnector  # noqa: PLC0415
 
         connector = FilesystemConnector(path, name=name)
-        pipeline = await self._runtime.pipeline()
         if force:
             mutation_guard = getattr(self._runtime, "derived_mutation_guard", None)
             if mutation_guard is None:  # protocol test doubles; Runtime always supplies it
+                pipeline = await self._runtime.pipeline()
                 return await self._forced(connector, pipeline, limit=limit, watching=watching)
+            # The guard first and the pipeline under it, so a reset that finishes while this
+            # waits cannot leave it holding a pipeline built against the index it retired.
             async with mutation_guard():
+                pipeline = await self._runtime.pipeline()
                 return await self._forced(connector, pipeline, limit=limit, watching=watching)
-        return await pipeline.run(connector, limit=limit, watching=watching)
+        leased = getattr(self._runtime, "leased_pipeline", None)
+        if leased is None:  # protocol test doubles; Runtime always supplies it
+            return await (await self._runtime.pipeline()).run(
+                connector, limit=limit, watching=watching
+            )
+        async with leased(name) as pipeline:
+            return await pipeline.run(connector, limit=limit, watching=watching)
 
     async def _forced(
         self,
@@ -1538,18 +1604,29 @@ class _Ingestion:
         acquire_only: bool = False,
         retain_source_bytes: bool | None = None,
     ) -> RunReport:
-        pipeline = (
-            await self._runtime.acquisition_pipeline()
-            if acquire_only
-            else await self._runtime.pipeline()
-        )
-        return await pipeline.run(
-            await self._runtime.connector(connector),
-            limit=limit,
-            watching=watching,
-            acquire_only=acquire_only,
-            retain_source_bytes=retain_source_bytes,
-        )
+        resolved = await self._runtime.connector(connector)
+        leased = getattr(self._runtime, "leased_pipeline", None)
+        if leased is None:  # protocol test doubles; Runtime always supplies it
+            pipeline = (
+                await self._runtime.acquisition_pipeline()
+                if acquire_only
+                else await self._runtime.pipeline()
+            )
+            return await pipeline.run(
+                resolved,
+                limit=limit,
+                watching=watching,
+                acquire_only=acquire_only,
+                retain_source_bytes=retain_source_bytes,
+            )
+        async with leased(resolved.name, acquire_only=acquire_only) as pipeline:
+            return await pipeline.run(
+                resolved,
+                limit=limit,
+                watching=watching,
+                acquire_only=acquire_only,
+                retain_source_bytes=retain_source_bytes,
+            )
 
     async def connector(self, name: str) -> Connector:
         """The connector :meth:`sync` would run, handed back instead of run.
@@ -1571,16 +1648,17 @@ class _Ingestion:
     ) -> Reconciliation:
         """Enumerate one connector's source and soft-delete what left it.
 
-        The whole pass, enumeration included, runs under the derived-mutation guard, and only
+        The whole pass, enumeration included, runs under the exclusive side of the derived-index
+        barrier, and only
         the step that soft-deletes takes the backup window (``Runtime.maintenance_window``): a
         backup waits for that step, not for an enumeration that can take minutes, and a pass
         that finds a backup running declines with ``blocked`` set and deletes nothing.
 
-        The derived-mutation guard is also what stops a sync of the same connector. A sync
-        holds it across its own network walk, so this adds no new kind of wait, and holding it
+        The exclusive side waits for every running sync to drain and keeps new ones out, which
         is what keeps a sync of the same connector from publishing documents between the
         inventory and the diff — the race the inventory's own newer-evidence rule would
-        otherwise have to catch.
+        otherwise have to catch. It also holds a write to the authoring source behind it
+        (``docs/memory-authoring.md`` §4.4), which is the price of that guarantee.
 
         The connector is built first and outside the guard: building it is where a missing
         session surfaces, and a pass that cannot authenticate should not queue behind a sync
@@ -2278,10 +2356,12 @@ class _Ingestion:
 
         Guarded like the other two sweeps, which is what serializes it against a reset, a
         rebuild and a re-embed publication — the operations that move the publication pointer
-        underneath it. It is deliberately *not* serialized against a running sync: the
-        tombstone design makes that safe rather than merely tolerable, because the list only
-        ever names ids that were already deleted, so a vector written after the pass began
-        cannot be in it (``docs/storage.md`` §8.2).
+        underneath it. The exclusive side of the barrier also waits for every running sync and
+        keeps new ones out, so a sync in this process delays the pass and the pass delays the
+        next one. The tombstone design would make a concurrent sync safe — the list only ever
+        names ids that were already deleted, so a vector written after the pass began cannot be
+        in it — so that is the cost of sharing the barrier, not something the sweep needs
+        (``docs/storage.md`` §8.2).
 
         The plain vector handle rather than the prepared one. Deleting a row needs the
         directory's own recorded fingerprint and no embedder, and a sweep that constructed a

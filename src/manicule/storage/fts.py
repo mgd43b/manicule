@@ -14,6 +14,7 @@ Application-level synchronization covers only the write paths its author remembe
 from __future__ import annotations
 
 import re
+from enum import StrEnum
 
 from manicule.storage.models import FTS_TOKENIZER
 
@@ -200,6 +201,71 @@ ascending. Its first argument must be the table's real name — it is parsed as 
 reference, so a query that aliases the FTS table fails with ``no such column``.
 """
 
+SEARCH_SQL_RANKED = """
+SELECT c.id AS chunk_id, chunks_fts.rank AS rank_score
+FROM chunks_fts
+JOIN chunks c ON c.seq = chunks_fts.rowid
+JOIN documents d ON d.id = c.document_id
+WHERE chunks_fts MATCH :match
+  AND chunks_fts.rank MATCH 'bm25(1.0, 0.4)'
+  AND d.deleted_at IS NULL
+  AND d.status = 'indexed'
+  {extra}
+ORDER BY chunks_fts.rank
+LIMIT :limit
+"""
+"""``SEARCH_SQL`` ordered by FTS5's hidden ``rank`` column instead of by an expression.
+
+Same joins, same predicates, same weights, same ``LIMIT`` after them. What differs is who sorts.
+``ORDER BY bm25(...)`` is an expression over each joined row, so SQLite scores and sorts every
+match: the plan shows ``USE TEMP B-TREE FOR ORDER BY``. ``ORDER BY chunks_fts.rank`` is a
+column of the virtual table, which FTS5 can hand back already in order
+(https://www.sqlite.org/fts5.html#sorting_by_auxiliary_function_results), so the joins run in
+rank order and stop once ``LIMIT`` rows have passed every predicate. That is a win when most
+matches are never looked at, and the whole of its cost when few rows pass: with a selective
+filter it walks, one join lookup apiece, nearly every match in rank order. Hence
+:func:`choose_lexical_plan` sends it only the searches with nothing narrow to find.
+
+**Three things in the text are load-bearing.** The weights are set per statement, by
+``chunks_fts.rank MATCH 'bm25(1.0, 0.4)'``, and not by the table-wide ``rank`` option, which
+every other reader of the table would inherit and which the frozen migrations never set. The
+column must be written ``chunks_fts.rank``, for the same reason ``bm25()``'s first argument must
+be the table's real name. And there is no second sort key: ``ORDER BY chunks_fts.rank, c.seq``
+is an expression again and brings the temporary B-tree back. ``rank`` holds exactly the numbers
+``bm25()`` returns, so ``rank_score`` means what it does in the other two.
+
+Not available to a search over fewer than two words, nor to one with an explicit document scope,
+and why is measured: ``docs/retrieval.md`` §4.1.
+"""
+
+SEARCH_SQL_DOCUMENT_FIRST = """
+SELECT c.id AS chunk_id, bm25(chunks_fts, 1.0, 0.4) AS rank_score
+FROM documents d
+CROSS JOIN chunks c ON c.document_id = d.id
+CROSS JOIN chunks_fts ON chunks_fts.rowid = c.seq
+WHERE chunks_fts MATCH :match
+  AND d.deleted_at IS NULL
+  AND d.status = 'indexed'
+  {extra}
+ORDER BY bm25(chunks_fts, 1.0, 0.4), c.seq
+LIMIT :limit
+"""
+"""``SEARCH_SQL`` with the join order forced: documents, then their chunks, then the index.
+
+For an explicit document list small enough to walk. ``CROSS JOIN`` is how SQLite is told not to
+reorder: the listed documents are the outer loop, each one's chunks are found by
+``(document_id, position)``, and ``chunks_fts`` is asked about one rowid at a time, so the work
+is the size of the list rather than the size of the match. It is the opposite of what is wanted
+for anything bigger, because the index is probed once per chunk and each probe pays for the
+terms' whole posting lists — which is why this is never used without a bound on the chunks
+(:data:`MAX_SCOPED_CHUNKS`) and never as a blanket hint on the others.
+
+``c.seq`` is a second sort key here and only here. This statement sorts in a temporary B-tree
+anyway, so the key costs nothing, and it makes the order of equal scores the order of the
+index, which is what the other two give in practice. SQLite specifies the order of equal scores
+in none of them, nor which of a tied group a ``LIMIT`` keeps, so the tests compare ties as sets.
+"""
+
 
 _FUNCTION_WORDS = (
     # interrogatives
@@ -273,6 +339,18 @@ the index's term statistics, which this function does not read.
 """
 
 
+def match_terms(text: str) -> list[str]:
+    """The words :func:`escape_match_query` searches for, in order: what is left of ``text``.
+
+    The one place a query is cut down to its content words and capped, so the number of
+    alternatives a match carries is read from the same list that writes it. A plan chosen from
+    a count taken some other way could disagree with the expression it was chosen for.
+    """
+    words = match_words(text)
+    content = [word for word in words if word.lower() not in FUNCTION_WORDS]
+    return (content or words)[:MAX_MATCH_WORDS]
+
+
 def escape_match_query(text: str) -> str:
     """Turn user input into an FTS5 ``MATCH`` expression: any content word, each a literal.
 
@@ -296,7 +374,9 @@ def escape_match_query(text: str) -> str:
     the expression matches before ``LIMIT``, and a disjunction matches far more rows than a
     conjunction: at 100,000 chunks the median prose question took 38 to 48 ms against about 1 ms
     for the conjunction. Dropping the function words roughly halves it — with them, the same
-    questions matched nearly every row and took 77 to 98 ms.
+    questions matched nearly every row and took 77 to 98 ms. Those figures are the released
+    statement's; :func:`choose_lexical_plan` now picks among three by what the search is, and
+    ``docs/retrieval.md`` §4.1 measures each.
 
     **At most :data:`MAX_MATCH_WORDS` content words, the first ones.** A long paste is cut, not
     refused: what the cap bounds is the time a long query costs, which it reduces about threefold
@@ -317,10 +397,134 @@ def escape_match_query(text: str) -> str:
     Returns:
         A ``MATCH`` expression, or the empty string when nothing searchable remains.
     """
-    words = match_words(text)
-    content = [word for word in words if word.lower() not in FUNCTION_WORDS]
-    kept = (content or words)[:MAX_MATCH_WORDS]
-    return " OR ".join('"' + word.replace('"', '""') + '"' for word in kept)
+    return " OR ".join('"' + term.replace('"', '""') + '"' for term in match_terms(text))
+
+
+class LexicalPlan(StrEnum):
+    """Which statement runs a lexical search: the same rows and scores, a different route."""
+
+    DIRECT = "direct"
+    RANKED = "ranked"
+    DOCUMENT_FIRST = "document-first"
+
+
+MAX_SCOPED_DOCUMENTS = 64
+"""The most listed documents :func:`choose_lexical_plan` will probe the chunks of."""
+
+MAX_SCOPED_CHUNKS = 32
+"""The most chunks a listed scope may hold and still be walked document-first.
+
+Measured, not derived: the per-chunk cost of :data:`SEARCH_SQL_DOCUMENT_FIRST` grows with how
+common the query's words are, so the size at which the direct statement overtakes it varies by
+query. On a synthetic million-chunk index it was about 64 chunks for three common words, over
+500 for three middling ones, and about 20 for sixteen common words. 32 is inside the break-even
+for every one of those but the last, and where it applies the walk was 2 to 15 times faster
+(``docs/retrieval.md`` §4.1)."""
+
+SCOPE_PROBE_LIMIT = MAX_SCOPED_CHUNKS + 1
+"""How many chunk positions the probe fetches: one more than the budget, so "over" is visible."""
+
+SCOPE_PROBE_SQL = """
+SELECT count(*) FROM (
+    SELECT c.seq
+    FROM chunks c
+    JOIN documents d ON d.id = c.document_id
+    WHERE d.workspace_id = :workspace_id
+      AND d.deleted_at IS NULL
+      AND d.id IN ({ids})
+    LIMIT :probe_limit
+)
+"""
+"""How many chunks, up to :data:`SCOPE_PROBE_LIMIT`, an explicit document list holds here.
+
+A hint for choosing a statement and nothing else. It reads no text and does not touch the
+lexical index, and it never limits or widens a result: the search that follows carries every
+predicate whatever this returns, so a count that is zero, stale or wrong costs time and cannot
+admit or hide a row. Both ``d.workspace_id`` and ``d.deleted_at IS NULL`` stay in it because
+together they are what lets SQLite use ``ix_documents_workspace_live_id`` for the ``id IN``
+bound; without the second, it walks the workspace."""
+
+
+MAX_RANKED_TERMS = 6
+"""The most alternatives for which :func:`choose_lexical_plan` uses the ranked statement.
+
+Ranked has to score every match to order them, where the direct statement scores only the rows
+that pass the joins. With few words that is cheap beside the join lookups it saves; with many it
+is not. On a synthetic million-chunk index the ranked statement was 1.2 to 2.3 times faster than
+the direct one at two to six words, a little slower at nine (0.94 times as fast) and slower
+again at sixteen (0.87 times)."""
+
+
+def needs_scope_probe(terms: int, scoped_documents: int) -> bool:
+    """Whether :func:`choose_lexical_plan` needs the chunk count of an explicit document scope."""
+    return terms >= 1 and 0 < scoped_documents <= MAX_SCOPED_DOCUMENTS
+
+
+def choose_lexical_plan(
+    *,
+    terms: int,
+    scoped_documents: int,
+    scoped_chunks: int | None = None,
+    narrowed: bool = False,
+) -> LexicalPlan:
+    """Which statement answers a search, from facts about it that cost nothing to know.
+
+    The three statements return the same rows with the same scores, so this is a choice of
+    speed and nothing rides on it being right. It is a pure function of its arguments so that
+    the rule can be tested without a database and the benchmark can report what it would pick.
+
+    Args:
+        terms: Alternatives in the match, from :func:`match_terms`.
+        scoped_documents: Documents the caller listed. ``0`` means no list; an empty list is
+            "no restriction" inside the store, and collection scopes are turned into lists
+            (or into "match nothing") before a store is reached.
+        scoped_chunks: Chunks those documents hold, up to :data:`SCOPE_PROBE_LIMIT`, from
+            :data:`SCOPE_PROBE_SQL`. Required exactly when :func:`needs_scope_probe` says so.
+        narrowed: Whether a source, media type, chunk kind, language or time bound restricts
+            the search. A reader set does not count; see below.
+
+    Returns:
+        :attr:`LexicalPlan.DOCUMENT_FIRST` for a listed scope of at most
+        :data:`MAX_SCOPED_DOCUMENTS` documents holding at most :data:`MAX_SCOPED_CHUNKS`
+        chunks, because the walk is then the size of the scope. Otherwise
+        :attr:`LexicalPlan.RANKED` for a disjunction of two to :data:`MAX_RANKED_TERMS` words
+        that is not narrowed and not listed, and :attr:`LexicalPlan.DIRECT` for the rest.
+
+    Raises:
+        ValueError: ``terms`` is below one, or a probe-sized scope arrives without its count.
+
+    **Why the rest is direct.** Measured on a synthetic million-chunk index
+    (``tests/benchmarks/lexical_plans.py``, ``docs/retrieval.md`` §4.1): the direct statement is
+    the released one, so choosing it never regresses a search, and the ranked statement walks the
+    matches in rank order until enough pass. That is why it was 1.6 to 2.3 times *slower* when
+    the workspace is a small part of the index, and 1.2 to 5 times slower under a narrow filter
+    or a listed scope. One word keeps the direct statement, which is the released behavior: the
+    synthetic index says ranked was 1.7 times faster for a common word, but a single term is the
+    shape the released statement was tuned on, so the rule stays cautious there until a
+    measurement on real data says otherwise.
+
+    **A reader set is the one restriction that does not narrow, and that is a call.** Ranked
+    was as fast or faster than direct at every share of the index a reader could see from 95%
+    down to 5% (0.98 to 2.5 times as fast), and slower when 0.1% was readable (0.75 to 0.97
+    times as fast for three of four queries, 1.13 for the fourth). The rule for a restriction
+    nothing measured is to keep the direct statement; this one was measured, a gated
+    installation's readers usually see most of what exists, and the loss is at the extreme.
+    """
+    if terms < 1:
+        msg = "a search with no terms has no statement"
+        raise ValueError(msg)
+    if scoped_documents > 0:
+        if scoped_documents > MAX_SCOPED_DOCUMENTS:
+            return LexicalPlan.DIRECT
+        if scoped_chunks is None:
+            msg = "a scope of up to MAX_SCOPED_DOCUMENTS documents needs its chunk count"
+            raise ValueError(msg)
+        return (
+            LexicalPlan.DOCUMENT_FIRST if scoped_chunks <= MAX_SCOPED_CHUNKS else LexicalPlan.DIRECT
+        )
+    if terms == 1 or terms > MAX_RANKED_TERMS or narrowed:
+        return LexicalPlan.DIRECT
+    return LexicalPlan.RANKED
 
 
 __all__ = [
@@ -333,9 +537,19 @@ __all__ = [
     "FUNCTION_WORDS",
     "INTEGRITY_CHECK_FTS",
     "MAX_MATCH_WORDS",
+    "MAX_SCOPED_CHUNKS",
+    "MAX_SCOPED_DOCUMENTS",
     "REBUILD_FTS",
+    "SCOPE_PROBE_LIMIT",
+    "SCOPE_PROBE_SQL",
     "SEARCH_SQL",
+    "SEARCH_SQL_DOCUMENT_FIRST",
+    "SEARCH_SQL_RANKED",
+    "LexicalPlan",
+    "choose_lexical_plan",
     "create_fts",
     "escape_match_query",
+    "match_terms",
     "match_words",
+    "needs_scope_probe",
 ]

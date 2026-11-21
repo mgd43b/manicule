@@ -339,7 +339,7 @@ class Ingesting(Protocol):
         ``deleted`` and ``proposed``; the service reduces them to counts.
 
         ``eligible`` is for an automatic pass. It is asked, with the connector's standing, only
-        *after* the pass holds the derived-mutation guard, because two automatic passes can both
+        *after* the pass holds the derived-index barrier, because two automatic passes can both
         see 'due' and queue for it: the second would otherwise start a new inventory that
         cancels the proposal the first just recorded, replacing a set an operator may be
         reviewing. When it answers False the result has ``skipped`` set and nothing ran. A

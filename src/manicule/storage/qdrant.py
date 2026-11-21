@@ -95,7 +95,7 @@ from urllib.parse import urlsplit
 
 from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.conversions.common_types import PointId
-from qdrant_client.http.exceptions import ApiException
+from qdrant_client.http.exceptions import ApiException, ResponseHandlingException
 
 from manicule.core.content import LEGACY_PUBLICATION, Chunk
 from manicule.core.embedding import (
@@ -204,14 +204,32 @@ INDEXED_PAYLOAD_FIELDS: Final = (
     (CHUNK_ID_COLUMN, models.PayloadSchemaType.KEYWORD),
     (IDENTITY_COLUMN, models.PayloadSchemaType.KEYWORD),
     (CHECKSUM_COLUMN, models.PayloadSchemaType.KEYWORD),
+    (CHECKSUM_VERSION_COLUMN, models.PayloadSchemaType.KEYWORD),
 )
-"""Every payload field a query filters on, indexed when the collection is created.
+"""Every payload field a filter names, indexed when the collection is created.
+
+**The rule is that every field a filter names has an index**, whether the filter is a search
+restriction, a lookup or a count, and ``tests/test_storage_qdrant.py`` holds the list to it.
+Search restricts on the document, the kind and the language; ``stored_vectors`` looks up the
+chunk and the embedding identity; the checksum count and the backfill select on the checksum
+and on its version. A filter on a field with no index is answered by reading every payload,
+which returns the right rows and costs a full scan, so nothing goes red when one is forgotten.
 
 Created up front rather than when a query first needs one, because Qdrant's filterable-HNSW
 traversal can only use an index the graph was built against: adding one to a populated
 collection leaves the existing graph without the filter-aware edges, so the index is present
-and the query is still a scan. The list is exactly the fields this module filters on — one
-entry per filter this store can build, checked by ``tests/test_storage_qdrant.py``.
+and the query is still a scan. That is the reason for the search fields; the checksum pair
+is counted rather than searched, so for it the reason is the scan alone.
+
+**Keyword for the version, although it holds a small number.** The value this store writes is
+the string ``"1"``, an adopted legacy row writes ``""`` there, and "records nothing" is asked
+as a string equality beside an emptiness test. A string match cannot be answered by an integer
+index, so an integer index on this field would exist and the count would still read every
+payload.
+
+A collection that predates an entry is repaired by :meth:`QdrantVectorStore.ensure_ready`,
+which declares every entry on every call. A field already indexed under a different type is
+replaced by the declared one, which ``tests/test_storage_qdrant.py`` checks against a server.
 """
 
 
@@ -650,7 +668,7 @@ class QdrantVectorStore:
         """Prepare the store for vectors from ``fingerprint``.
 
         The first call creates the collection at the dimension the embedder reports, in the
-        configured shape, indexes every payload field a query filters on, and records the
+        configured shape, indexes every payload field a filter names, and records the
         fingerprint. Later calls compare what is recorded, and bring an existing collection to
         the configured shape.
 
@@ -674,6 +692,9 @@ class QdrantVectorStore:
                 different model, including a different model of the same size.
             VectorStoreStateError: When the collection holds vectors this store cannot write
                 or verify, or the server did not apply a change to its shape.
+            TimeoutError: When the server did not finish building a payload index within the
+                request timeout. Nothing was recorded or marked prepared, so it is safe to call
+                again; see :meth:`_ensure_collection`.
         """
         recorded = await self._recorded_fingerprint()
         if recorded is not None:
@@ -1053,10 +1074,22 @@ class QdrantVectorStore:
         Two modes, because two different questions get called "coverage" and only one of them
         is affordable on a status page.
 
-        **Counting** is three ``count`` calls with a payload filter and reads no vector. It
-        answers "has the backfill finished", and it is what ``status`` and ``doctor`` call —
-        which matters more here than on local disk, where the cheap mode merely saves I/O and
-        here it saves pulling the whole corpus back over a socket.
+        **Counting** is three exact ``count`` calls with a payload filter and reads no vector:
+        every point, the points recording neither half of the checksum pair, and the points
+        recording exactly one half (a checksum without its version, or a version without its
+        checksum). It answers "has the backfill finished", and it is what ``status`` and
+        ``doctor`` call — which matters more here than on local disk, where the cheap mode
+        merely saves I/O and here it saves pulling the whole corpus back over a socket. Exact
+        is not free: a count with a filter on a payload field the collection has not indexed
+        reads every point's payload, which is why both fields of the pair are in
+        :data:`INDEXED_PAYLOAD_FIELDS`.
+
+        **The counts are not one snapshot.** Another process can write to a collection this
+        store shares, and the three requests are three moments, so a write between two of them
+        can make the figures disagree with each other. ``recorded`` and ``failed`` are
+        therefore held to ``[0, rows]``: a concurrent write can make a count a little stale
+        and can never make coverage impossible. A half-written point that is there when the
+        counts run is always counted as failed, however the others move.
 
         **Recomputing** reads every point's vector in bounded pages and hashes it. It answers
         "are the numbers still what they were", costs a scan of the corpus, and is what the
@@ -1081,13 +1114,21 @@ class QdrantVectorStore:
             return VectorChecksumCoverage(scanned=False)
         collection = self._collection(fingerprint)
         rows = await self._count_matching(collection, None)
-        recorded = rows - await self._count_matching(collection, _unrecorded_checksum())
+        if rows == 0 and not recompute:
+            # Nothing to cover, so nothing to ask: one request rather than three, and the
+            # first poll of a collection nothing has written to yet costs no payload reads.
+            return VectorChecksumCoverage()
+        recorded = _within(
+            rows - await self._count_matching(collection, _unrecorded_checksum()), rows
+        )
         if not recompute:
             # A half-written pair is malformed by looking at the two fields, which costs a
             # third count and no vector read. Reported here rather than left to the scan,
             # because a surface that cannot afford a scan is exactly the one that would
             # otherwise call a collection holding such a point complete.
-            half_written = await self._count_matching(collection, _half_written_checksum())
+            half_written = _within(
+                await self._count_matching(collection, _half_written_checksum()), rows
+            )
             return VectorChecksumCoverage(
                 rows=rows,
                 recorded=recorded,
@@ -1352,6 +1393,16 @@ class QdrantVectorStore:
         in-process engine keeps a vector's half of a shape at creation, ignores every update
         without saying so and warns about payload indexes, so what it can be asked is only what
         it can hold.
+
+        **An index added to a populated collection is built before the request returns.** The
+        requests wait for the server, deliberately: an index that failed to build must surface
+        here rather than leave a collection that is quietly slower. The cost is that the first
+        prepare after an upgrade adds an index, and on a large collection one request can
+        outlast the client's timeout. That is reported as a :class:`TimeoutError` naming the
+        setting rather than as the client's empty-messaged transport error. It is retryable by
+        construction: this runs before the fingerprint is recorded and before the handle is
+        marked prepared, so a first call that fails leaves a handle that refuses to write rather
+        than one that believes it is ready, and the next call declares the same indexes again.
         """
         collection = self._collection(fingerprint)
         if not await self._client.collection_exists(collection):
@@ -1369,9 +1420,25 @@ class QdrantVectorStore:
             return
         await self._reshape(collection, config, vector)
         for field, schema in INDEXED_PAYLOAD_FIELDS:
-            await self._client.create_payload_index(
-                collection_name=collection, field_name=field, field_schema=schema
-            )
+            try:
+                await self._client.create_payload_index(
+                    collection_name=collection, field_name=field, field_schema=schema
+                )
+            except Exception as exc:
+                # Broad only to look: anything that is not the transport giving up waiting is
+                # re-raised exactly as it came.
+                if not _is_timeout(exc):
+                    raise
+                msg = (
+                    f"Qdrant did not finish building the payload index on {field!r} within the "
+                    f"request timeout (storage.qdrant.timeout_s). The first prepare after an "
+                    f"upgrade that adds an index to a collection builds it before answering, and "
+                    f"a large collection can take longer than one request is allowed. The vector "
+                    f"store was not marked prepared and nothing was written, so retrying is "
+                    f"safe; if it keeps timing out, raise storage.qdrant.timeout_s for that "
+                    f"start."
+                )
+                raise TimeoutError(msg) from exc
 
     async def _reshape(
         self, collection: str, config: models.CollectionConfig, vector: models.VectorParams
@@ -1773,6 +1840,13 @@ def _unrecorded(field: str) -> models.Filter:
     removing it leaves behind. Both are spelled out for the same reason the embedded store
     spells out ``NULL`` beside ``''``: two absences that mean one thing must be asked about
     together, or a count is right about the rows it happened to see.
+
+    Exactly which values that selects is Qdrant's rather than Python's, and the two disagree in
+    places. ``is_empty`` is true for a missing key, a ``null`` and ``[]``, and for nothing else:
+    not ``[null]``, not ``[[]]``, not ``{}``, not ``0`` or ``false``. The equality is true for
+    ``""`` and for an array containing ``""``. So an unrecorded field is one of: absent, null,
+    ``[]``, ``""``, ``[""]``, or an array holding ``""`` beside other values; a field holding
+    anything else counts as recorded. ``tests/test_storage_qdrant.py`` pins that matrix.
     """
     return models.Filter(
         should=[
@@ -1803,6 +1877,21 @@ def _half_written_checksum() -> models.Filter:
     which is what lets the counting mode of :meth:`QdrantVectorStore.checksum_coverage` report
     them. Without it a half-written point is invisible to every surface that cannot afford a
     scan, and "complete" would be true over a collection holding one.
+
+    **The definition is the exclusive or of the two fields recording nothing**: one ``should``
+    of two arms, each a condition on one field with the other field's condition negated. A point
+    recording both halves or neither is in neither arm, and what is *not* in this filter is the
+    backfill's set — a point recording neither half is selected by :func:`_unrecorded_checksum`
+    and by nothing here.
+
+    **Why the nested filter stays.** Written this way the negation inside each arm looks like
+    something a planner cannot start from, and the obvious alternative is two simple filters
+    whose counts are added. Both were measured, on the two Qdrant versions this project pins,
+    with the checksum version indexed: the server plans this filter through the index, and the
+    sum of the two simple filters was slower on both and costs another request. The index is
+    what makes the count cheap, so it is declared in :data:`INDEXED_PAYLOAD_FIELDS`, and the
+    filter stays as it was. ``tests/benchmarks/qdrant_checksum_coverage.py`` keeps the
+    alternative so that the comparison can be taken again.
     """
     checksum = _unrecorded(CHECKSUM_COLUMN)
     version = _unrecorded(CHECKSUM_VERSION_COLUMN)
@@ -1812,6 +1901,42 @@ def _half_written_checksum() -> models.Filter:
             models.Filter(must=[version], must_not=[checksum]),
         ]
     )
+
+
+def _within(value: int, ceiling: int) -> int:
+    """``value`` held to ``[0, ceiling]``.
+
+    For a count that is one of several taken at different moments: a write between two of them
+    can make the second larger than the first allows, and a figure of "more rows recorded than
+    exist" is worse than a slightly stale one.
+    """
+    return min(max(value, 0), ceiling)
+
+
+def _is_timeout(error: Exception) -> bool:
+    """Whether the transport gave up waiting, as opposed to failing to reach the server.
+
+    Over REST the client wraps whatever its HTTP library raised in one exception type whose text
+    is the library's own, and a read timeout's text is empty; the wrapped exception says which it
+    was, and it is read by name so that this does not import the HTTP library the client happens
+    to be built on. Over gRPC a deadline is not wrapped at all: it arrives as the channel's own
+    error, whose status code is ``DEADLINE_EXCEEDED``, and that is read the same way for the same
+    reason. Every other failure is not this one's to reword.
+    """
+    if isinstance(error, ResponseHandlingException):
+        cause = error.source
+        # A connect timeout never reached the server, so no index was being built; it is the
+        # unreachable-server failure it always was and keeps its own wording.
+        name = type(cause).__name__
+        return isinstance(cause, TimeoutError) or ("Timeout" in name and "Connect" not in name)
+    code = getattr(error, "code", None)
+    if not callable(code):
+        return False
+    try:
+        status = code()
+    except TypeError:  # a `code` that is not the channel's accessor
+        return False
+    return getattr(status, "name", None) == "DEADLINE_EXCEEDED"
 
 
 def is_cleartext_remote(endpoint: str) -> bool:

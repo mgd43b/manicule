@@ -891,9 +891,10 @@ class LanceVectorStore:
         Two modes, because two different questions get called "coverage" and only one of them
         is affordable on a status page.
 
-        **Counting** is two ``count_rows`` predicates over an indexed-by-nothing string column
-        and touches no vector. It answers "has the backfill finished", which is the question an
-        upgrade is actually asking, and it is what ``status`` and ``doctor`` call.
+        **Counting** is three ``count_rows`` calls — every row, the rows recording neither half
+        of the checksum pair, and the rows recording only one — over string columns nothing
+        indexes, and touches no vector. It answers "has the backfill finished", which is the
+        question an upgrade is actually asking, and it is what ``status`` and ``doctor`` call.
 
         **Recomputing** reads every row's vector in bounded pages and hashes it. It answers
         "are the numbers still what they were", costs a scan of the corpus, and is what the

@@ -2569,8 +2569,9 @@ class VectorChecksumCoverageReport(Payload):
     failed: int = Field(
         default=0,
         ge=0,
-        description="Rows a recomputed checksum refused. Non-zero means stored numbers "
-        "changed without their checksum changing with them.",
+        description="Rows whose checksum record was refused. Counting reports only a row "
+        "carrying half of its record (``malformed``); a recomputation can also report numbers "
+        "that no longer match their checksum, split by kind in ``failures``.",
     )
     failures: dict[str, int] = Field(
         default_factory=dict,

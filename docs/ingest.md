@@ -1184,7 +1184,7 @@ they do.
 
 ---
 
-### 8.4 Four exclusions, and none of them is any of the others
+### 8.4 Five exclusions, and none of them is any of the others
 
 They are easy to confuse because they are all "the lock", and confusing them is how a
 lost-update bug ships: for a while this document said a concurrent sync and a corpus-wide
@@ -1195,6 +1195,7 @@ about the model being read as a statement about the database.
 |---|---|---|---|
 | Model / accelerator | `asyncio.Lock` on the pipeline | one process, **all** documents | two batches inside the embedder at once |
 | Per-document mutation | keyed `asyncio.Lock`, one entry per document id | one process, **one** document | two operations writing one document's record, chunks and vectors at once |
+| Derived-index barrier | `DerivedBarrier` in the runtime: an exclusive side and two source-lease slots (below) | one process, all sources | maintenance beside a publication, and two runs of one slot |
 | Data directory | `flock` on `manicule.lock` (§6.5, §8.6) | one machine, all processes | a second *writer* starting at all |
 | Document revision | compare-and-swap at the commit (§8.5) | durable; no process, no lock | a commit derived from a document that has since moved |
 
@@ -1203,13 +1204,46 @@ embedder, one after the other, and then write over each other's documents — wh
 what happened. It is one lock, held around one stage, and the stages either side of it are
 where a document is read and where it is written.
 
-**All four are now reached by a single sync**, which they were not while the loop was sequential.
-Before §8.3, one connector sync had one document in flight, so the second row could only be
-contended by a *second* operation — a sweep beside a sync — and the first row had one caller by
-construction. A staged run contends both from inside one command. Nothing about the four
+**The first two rows are reached by a single sync**, which they were not while the loop was
+sequential. Before §8.3, one connector sync had one document in flight, so the second row could
+only be contended by a *second* operation — a sweep beside a sync — and the first row had one
+caller by construction. A staged run contends both from inside one command. Nothing about them
 changed; what changed is that a run now exercises them, and the tests in
-`tests/ingest/test_concurrency.py` assert each of the first two separately rather than inferring
-one from the other.
+`tests/ingest/test_concurrency.py` assert each separately rather than inferring one from the
+other.
+
+**The derived-index barrier is what a reset, a rebuild, a re-embed, a reconciliation and the
+sweeps take to keep every publication out, and what a sync takes to say it is publishing.** It
+used to be one reentrant lock, which also made it what let one source's wait on its server hold
+every other publication in the process, a document an assistant had just written included. It has
+three ways in (`manicule.app.barrier`):
+
+- **Exclusive** — maintenance. One holder; it closes admission the moment it starts waiting,
+  waits for every running source to finish, then runs alone. A stream of syncs cannot starve it,
+  and a canceled waiter reopens admission. Reentrant, and it covers every lease and publication
+  taken inside it.
+- **Source lease** — one run of one source, for its whole lifecycle (`IngestPipeline.run`). There
+  are two slots: one belongs to the configured authoring source, the other to every other source
+  together. A write to the authoring source therefore runs beside a background sync of anything
+  else; a second background sync waits for the first, because two would fill both slots and put
+  the delay back. With authoring unconfigured every source shares the one slot, which is the old
+  behavior exactly. Two runs of one source never overlap, since the durable acquisition lease is
+  keyed by connector name and the same-source rule is the safe one.
+- **Publication** — one document (`ingest` and `ingest_raw`). Covered by its own source's lease or
+  by the exclusive side; a bare call with neither takes the exclusive side, so a forced ingest, an
+  archive import and a corpus sweep are as strict as they were.
+
+Reentrancy is by hold, not by task: each acquisition pushes a record onto a context variable that
+child tasks inherit and marks it spent before it releases, so a task that outlives its lease finds
+the hold spent and must acquire again. A lease holder asking for the exclusive side, or for another
+source's lease, is refused with a `BarrierError` instead of waited on, since either would wait for
+itself. The reset epoch is still checked *after* admission, which is what fails a handle that
+queued behind a reset.
+
+What it does **not** do: it is the process-local half only (§6.5's flock is the cross-process
+half), it bounds neither the embedder lock above nor the parse pool nor the SQLite writer queue,
+and a maintenance task that is waiting closes admission, so a write behind one queues behind that
+task's wait for running syncs. The scheduler's reconciliation and sweep passes are such tasks.
 
 **The mutation lock is keyed, and that is the whole reason it is affordable.** A document's
 vectors are staged and its relational publication is flipped under this lock; what must not
@@ -1219,10 +1253,11 @@ installation for the length of it, to fix a problem no two unrelated pages have.
 dropped when the last holder leaves, so a sweep does not accumulate one lock per row it has
 finished with.
 
-**A reconciliation pass takes the derived-mutation guard and, to delete, the backup window.** That guard is
-the runtime's process-wide barrier, the one every sync, sweep, reset, rebuild and re-embed also
-takes, and the runtime's reconcile operation (`_Ingestion.reconcile`) holds it for the whole pass,
-source enumeration included. `pipeline.run` holds the same guard for its whole walk, so a pass and a sync of the same
+**A reconciliation pass takes the exclusive side of the derived-index barrier and, to delete, the
+backup window.** That is the runtime's process-wide barrier, the one every sweep, reset, rebuild and
+re-embed also takes exclusively and every sync takes as a source lease, and the runtime's reconcile
+operation (`_Ingestion.reconcile`) holds it for the whole pass, source enumeration included. The
+pass waits for every running sync and keeps new ones out, so a pass and a sync of the same
 connector cannot interleave in one process: the pass does not begin between a sync's publications,
 and the sync does not publish between the pass's inventory and its diff. The one other thing a
 pass takes is the backup window (`Runtime.maintenance_window`, §11.2), and only around the step
@@ -1255,9 +1290,10 @@ of it: a re-parse may retain `indexed` throughout, and transient state is not so
 
 **Who is guarded.** Every operation that derives its content from something already stored and
 has a command to reach it: `document reindex <id>` and `document reindex --stale`, both of which
-run through `reindex.re_parse`. **A connector sync is never guarded**, and that is not an
-omission: it is holding the newest bytes the source has, so there is nothing it could be losing
-to. A sync always wins.
+run through `reindex.re_parse`. **A connector sync is never held to this rule**, and that is not
+an omission: it is holding the newest bytes the source has, so there is nothing it could be losing
+to. A sync always wins. (It does hold a source lease on the derived-index barrier, §8.4; that
+excludes maintenance, not another document's revision.)
 
 `reindex.repair` and `reindex.re_embed` — rungs 1 and 2 of §10's ladder — are **not** guarded.
 Both would need it: each reads a document, derives from it and writes back, which is the shape
@@ -2173,7 +2209,9 @@ generation fences and a monotonic workspace reset epoch prevent an old writer fr
 after reset. Every pipeline checks the epoch before its first acquisition or document mutation;
 vector handles recheck it after acquiring their physical generation pin; and the relational
 fingerprint/stage/publication transactions take an epoch CAS while holding SQLite's writer lock.
-The same-process mutation guard spans the complete external-vector-to-SQLite publication gap.
+The same-process barrier spans the complete external-vector-to-SQLite publication gap: a reset
+takes its exclusive side, which waits for every running source lease to drain before anything is
+retired.
 Repeating a completed reset is a zero-change success.
 
 None of that turns on which vector backend is configured. The tombstone ledger is relational and
@@ -2440,9 +2478,9 @@ a computed answer rather than an operator's habit.
   inventory supersedes the proposal being reviewed (§11.1), so a loop that kept asking would take
   the question away from the person answering it. A disabled connector is not scheduled at all.
   The test is made twice: at the look, so a connector that is not due is never even built, and
-  again once the pass holds the derived-mutation guard (`eligible` on the ingest port), because two
+  again once the pass holds the derived-index barrier (`eligible` on the ingest port), because two
   automatic passes (the scheduled one and the one after a sync) can both see 'due' and queue for
-  the guard, and the second would otherwise begin an inventory that cancels the proposal the first
+  it, and the second would otherwise begin an inventory that cancels the proposal the first
   just recorded. A pass that finds itself no longer eligible steps aside and reports nothing. A
   manual pass is never asked: an operator may replace a proposal deliberately.
 - **A missing session** is handled as a scheduled sync handles it: the loop records that the

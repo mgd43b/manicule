@@ -136,7 +136,7 @@ from manicule.chunking import breadcrumb
 from manicule.cli.render import console
 from manicule.core.retrieval import ConfidenceBand
 from manicule.storage import docstore as docstore_module
-from manicule.storage.fts import SEARCH_SQL
+from manicule.storage.fts import SEARCH_SQL, SEARCH_SQL_DOCUMENT_FIRST, SEARCH_SQL_RANKED
 from tests.benchmarks import lexical_questions as lq
 from tests.benchmarks import thread_duplication
 from tests.benchmarks.thread_corpus import build_corpus
@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     from manicule.storage.docstore import SqliteDocStore
 
 SHIPPED_WEIGHTS = "bm25(chunks_fts, 1.0, 0.4)"
+SHIPPED_RANK_WEIGHTS = "'bm25(1.0, 0.4)'"
 DATABASE = "manicule.db"
 PAGE = 1000
 HALF = 0.5
@@ -271,17 +272,42 @@ def copied(source: Path, target: Path) -> Path:
 
 @contextlib.contextmanager
 def heading_weight(weight: float) -> Generator[None]:
-    """Score the heading column at ``weight`` for the duration, through the store's statement."""
-    statement = SEARCH_SQL.replace(SHIPPED_WEIGHTS, f"bm25(chunks_fts, 1.0, {weight})")
-    if SEARCH_SQL.count(SHIPPED_WEIGHTS) != 2:
-        msg = f"SEARCH_SQL no longer scores with {SHIPPED_WEIGHTS} in both places"
-        raise RuntimeError(msg)
-    shipped = docstore_module.SEARCH_SQL
-    docstore_module.SEARCH_SQL = statement
+    """Score the heading column at ``weight`` for the duration, through the store's statements.
+
+    The store chooses among three statements by the shape of the search (``choose_lexical_plan``),
+    and each spells the weights itself, so the one the title lookups happen to take would
+    otherwise be the only one that moved. All three are changed, and each is checked to still
+    carry the weights this replaces.
+    """
+    changed = {
+        "SEARCH_SQL": (SEARCH_SQL, SHIPPED_WEIGHTS, f"bm25(chunks_fts, 1.0, {weight})", 2),
+        "SEARCH_SQL_DOCUMENT_FIRST": (
+            SEARCH_SQL_DOCUMENT_FIRST,
+            SHIPPED_WEIGHTS,
+            f"bm25(chunks_fts, 1.0, {weight})",
+            2,
+        ),
+        "SEARCH_SQL_RANKED": (
+            SEARCH_SQL_RANKED,
+            SHIPPED_RANK_WEIGHTS,
+            f"'bm25(1.0, {weight})'",
+            1,
+        ),
+    }
+    statements: dict[str, str] = {}
+    for name, (statement, shipped_text, replacement, occurrences) in changed.items():
+        if statement.count(shipped_text) != occurrences:
+            msg = f"{name} no longer scores with {shipped_text} in {occurrences} place(s)"
+            raise RuntimeError(msg)
+        statements[name] = statement.replace(shipped_text, replacement)
+    shipped = {name: getattr(docstore_module, name) for name in statements}
+    for name, statement in statements.items():
+        setattr(docstore_module, name, statement)
     try:
         yield
     finally:
-        docstore_module.SEARCH_SQL = shipped
+        for name, statement in shipped.items():
+            setattr(docstore_module, name, statement)
 
 
 def candidate_overrides(overrides: Mapping[str, Any], candidate: Candidate) -> dict[str, Any]:

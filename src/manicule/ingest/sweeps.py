@@ -21,14 +21,15 @@ small table instead of the whole index.
 storm during a sync.
 
 **What it yields to, stated as it is rather than as it should be.** The caller takes the
-derived-mutation guard, which serializes a pass against a reset, a rebuild and a re-embed
-publication — the operations that move the publication pointer underneath it. It is *not*
-serialized against a running sync, and the tombstone design is what makes that safe rather
-than merely tolerable: the list only ever names ids that were already deleted, so a vector
-written after the pass began cannot be in it. A hot backup *is* excluded: the caller holds the
-backup lock (:mod:`manicule.storage.backup_lock`) shared for the whole pass and hands it in as
-the :class:`SweepGate`, so a backup waits for a running pass and a pass that finds a backup
-running declines.
+exclusive side of the derived-index barrier, which serializes a pass against a reset, a rebuild
+and a re-embed publication — the operations that move the publication pointer underneath it —
+and, because that side waits for every running sync, against a sync in the same process too. The
+tombstone design would make a concurrent sync safe: the list only ever names ids that were
+already deleted, so a vector written after the pass began cannot be in it. The exclusion is what
+sharing the barrier costs, not something the sweep needs. A hot backup *is* excluded: the caller
+holds the backup lock (:mod:`manicule.storage.backup_lock`) shared for the whole pass and hands
+it in as the :class:`SweepGate`, so a backup waits for a running pass and a pass that finds a
+backup running declines.
 
 The soft-delete pass is the same sweep's second half. Within the grace period a restore is
 free. After it, the document is *purged*
