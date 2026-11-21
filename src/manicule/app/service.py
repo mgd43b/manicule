@@ -3871,12 +3871,13 @@ class ApplicationService:
                     f"({type(exc).__name__}: {exc}). Both hold the document now; remove the "
                     f"original with document_remove({from_collection!r}, {slug!r}).",
                 )
-            reclaim = moved.indexed
-        # Outside the authoring lock. The re-index is forced and so takes the exclusive side of
-        # the derived barrier, which waits for every running sync; held inside the lock, one
-        # move would stop every create behind that wait for the sake of a best-effort repair.
-        if reclaim:
-            await self._reclaim(Path(moved.path), authoring.source)
+            # Inside the authoring lock, though the forced re-index waits for every running
+            # sync: outside it, a `document_remove` of the destination could land between the
+            # forced pass reading the file and publishing it, leaving a searchable entry for a
+            # file that is gone. A move is rare and the repair is best effort, so a create that
+            # arrives behind one waits; the barrier does not change that.
+            if moved.indexed:
+                await self._reclaim(Path(moved.path), authoring.source)
         return r.DocumentMoved(moved=moved, removed=removed)
 
     async def _reclaim(self, path: Path, source: str) -> None:
@@ -12566,8 +12567,8 @@ def _checksum_detail(coverage: VectorChecksumCoverage, pass_: VectorChecksumBack
         listed = ", ".join(f"{count} {kind}" for kind, count in sorted(coverage.failures.items()))
         return (
             f"{coverage.failed} row(s) failed numerical integrity ({listed}). A malformed row "
-            f"carries a checksum record that is not well formed, one half of it missing, so "
-            f"nothing can be compared; a mismatched row holds numbers that are not the numbers "
+            f"is missing its checksum or its version, or carries a digest that cannot be read, "
+            f"so nothing can be compared; a mismatched row holds numbers that are not the numbers "
             f"its checksum was taken from. Rebuild the affected generation from retained "
             f"source bytes rather than trusting these vectors."
         )

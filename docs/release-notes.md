@@ -16,9 +16,8 @@ another run of the authoring source itself. With authoring unconfigured every so
 slot, exactly as before.
 
 A write also no longer counts how many documents the source holds in collections, two reads over
-the whole corpus that nothing in it used; `index_path` still reports them. A moved document's
-repair re-index runs after the authoring lock is released, so one slow repair cannot hold up
-every other write. Details are in `docs/ingest.md` §8.4 and `docs/memory-authoring.md` §4.4.
+the whole corpus that nothing in it used; `index_path` still reports them. Details are in `docs/ingest.md` §8.4 and
+`docs/memory-authoring.md` §4.4.
 
 ### Multi-word keyword search is faster on a large corpus
 

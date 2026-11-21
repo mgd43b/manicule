@@ -149,7 +149,10 @@ another source — one parked on its server, say — and is searchable the momen
 queue behind three things: another run of the authoring source itself (a watcher batch, or a sync of
 that source), maintenance that is running or waiting (a reset, a rebuild, a reconciliation pass or
 the sweep, each of which waits for running syncs and closes admission while it does), and the
-queues no barrier covers (the embedder, the parse pool and the SQLite writer). A write that
+queues no barrier covers (the embedder, the parse pool and the SQLite writer). The first write
+on a process that has not built its pipeline yet builds it under the exclusive side, so it also
+waits for any sync running at that moment, an acquisition-only one included; a served process
+builds it once, ahead of its syncs. A write that
 loses any of those races still returns the typed outcome and the kept file's path (§4.5); it never
 turns into fire-and-forget indexing. A write does no placement counting: the `collected` and
 `uncollected` totals an explicit `index_path` reports are two reads over the corpus that a write
@@ -428,8 +431,10 @@ the index entry under the file's path and, for a file whose sidecar manifest dec
 under that identity too. A move re-indexes its destination once the original is retired, so the
 wikilink middleware — which keeps a live document's slug rather than letting a newcomer take it —
 resolves the slug to the destination. That repair is a forced index, which takes the exclusive side
-of the barrier and so waits for every running sync, so it runs after the move has released the
-authoring lock: a slow repair delays that one move's return and no other write.
+of the barrier and so waits for every running sync. It stays inside the authoring lock, because a
+removal of the destination landing between the forced pass reading the file and publishing it
+would leave a searchable entry for a file that is gone; so a create that arrives behind a move
+waits for the repair.
 
 Both are on the network surface beside `document_create`, and `document_delete` is not: it would
 let a socket caller remove any document in the workspace, a mailbox's included. The recovery path

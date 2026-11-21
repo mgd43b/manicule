@@ -443,10 +443,10 @@ async def test_a_failed_index_still_names_the_kept_file(
     assert document_id(WORKSPACE, AUTHORED, created.path) == created.document_id
 
 
-async def test_a_move_re_indexes_outside_the_authoring_lock(
+async def test_a_move_re_indexes_inside_the_authoring_lock(
     opened: Runtime, service: ApplicationService
 ) -> None:
-    """The forced re-index is exclusive and waits for every sync; it must not hold the lock."""
+    """A removal of the destination must not land between the forced pass's read and publish."""
     await service.document_create(collection="memories", slug="travels", body="a traveling fact")
     held_during: list[bool] = []
 
@@ -461,4 +461,4 @@ async def test_a_move_re_indexes_outside_the_authoring_lock(
     )
 
     assert moved.moved.indexed
-    assert held_during == [False]
+    assert held_during == [True]
