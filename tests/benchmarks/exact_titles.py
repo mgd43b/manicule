@@ -28,6 +28,10 @@ identifier with a different intended answer; a promotion is evidence of a title 
 not proof of intent. If several documents outside the pool have the same title, this
 instrument cannot tell; uniqueness here is over the pool.
 
+The mail incumbent and candidates run conversation collapse after fusion. A candidate's
+promotion happens before collapse, as it does in the default pipeline, so mail ranks
+include any change in which quoted chunks survive.
+
 **The round 7 rule.** Use round 6's questions, hybrid MRR@10 and dense baseline, measured
 from the same indexes per model. Close at least half of the dense-over-hybrid title gap
 without worsening any title. Keep the lower end of a 95% paired bootstrap interval above
@@ -111,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         round_number=7,
         families=FAMILIES,
         required_models=frozenset({"BAAI/bge-m3", "qwen3-embedding:0.6b"}),
+        mail_pipeline="hybrid+collapse",
     )
 
 

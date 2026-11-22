@@ -377,6 +377,7 @@ async def measure(
     emit: Callable[[str], None],
     *,
     candidates: Mapping[str, Substitution] | None = None,
+    mail_pipeline: str = "hybrid",
 ) -> Measured:
     """Index each corpus once and ask every candidate everything.
 
@@ -407,7 +408,9 @@ async def measure(
     indexes.append(indexed.data_dir)
     tl.unchanged(indexes, pinned)
     progress("mail threads indexed")
-    thread_settings = lq.settings_for(indexed.data_dir, overrides, lq.PIPELINES["hybrid"])
+    thread_settings = thread_duplication.settings_for(
+        indexed.data_dir, overrides, thread_duplication.PIPELINES[mail_pipeline]
+    )
 
     dense = await lq.run_docs(
         index, asked, variant=lq.SHIPPED_MATCH, pipeline="dense", overrides=overrides
@@ -427,7 +430,7 @@ async def measure(
                 run = await thread_duplication.run_pipeline(
                     indexed,
                     thread_asked,
-                    name="hybrid",
+                    name=mail_pipeline,
                     overrides=overrides,
                     ks=(10,),
                     counted=frozenset({lq.EXHAUSTED_BUDGET}),
@@ -522,6 +525,7 @@ def run_cli(
     round_number: int = 6,
     families: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = FAMILIES,
     required_models: frozenset[str] | None = None,
+    mail_pipeline: str = "hybrid",
 ) -> None:
     """Run a fusion experiment on the docs and mail questions, or combine its verdicts."""
     parser = argparse.ArgumentParser(
@@ -582,7 +586,9 @@ def run_cli(
             work = args.work.resolve()
             work.mkdir(parents=True, exist_ok=True)
         _isolate(work)
-        measured = asyncio.run(measure(args, work, emit, candidates=candidates))
+        measured = asyncio.run(
+            measure(args, work, emit, candidates=candidates, mail_pipeline=mail_pipeline)
+        )
         found = report(measured, emit, round_number=round_number, families=families)
         if args.verdicts is not None:
             _save_verdicts(

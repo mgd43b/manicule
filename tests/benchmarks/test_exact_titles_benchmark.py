@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -11,6 +11,7 @@ from manicule.core.content import DocumentStatus
 from manicule.core.retrieval import Candidate, Filter, Query
 from manicule.retrieval.fusion import RRFStage
 from manicule.retrieval.title_match import TitleMatchStage, promote
+from tests.benchmarks import exact_titles, query_shapes
 from tests.benchmarks.exact_titles import CANDIDATES
 from tests.benchmarks.query_shapes import ModelVerdicts, load_model_verdicts
 from tests.benchmarks.thread_duplication import for_question
@@ -140,3 +141,12 @@ def test_choosing_needs_two_distinct_required_models(tmp_path: Path) -> None:
     assert len(load_model_verdicts([first, second], models)) == 2
     with pytest.raises(ValueError, match="one verdict file per model"):
         load_model_verdicts([first, first], models)
+
+
+def test_round_seven_measures_mail_with_conversation_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = Mock()
+    monkeypatch.setattr(query_shapes, "run_cli", run)
+    exact_titles.main(["--docs", "docs"])
+    assert run.call_args.kwargs.get("mail_pipeline") == "hybrid+collapse"
