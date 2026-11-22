@@ -58,6 +58,8 @@ can fail on.
         ├────────────────┤
         │ rrf            │   per-leg rank ladders → reciprocal rank fusion
         ├────────────────┤
+        │ title_match    │   promotes a unique title supported by the dense leader; §5.4
+        ├────────────────┤
         │ collapse       │   drops what a conversation repeats; §5.5
         ├────────────────┤
         │ rerank         │   cross-encoder over the head; profile- and config-gated
@@ -72,7 +74,8 @@ can fail on.
         Context + Confidence + RetrievalTrace
 ```
 
-The declared part is `rag.pipeline`, which ships as `("dense", "lexical", "rrf", "collapse")`
+The declared part is `rag.pipeline`, which ships as
+`("dense", "lexical", "rrf", "title_match", "collapse")`
 with the reranker appended when the profile asks for one and configuration names one
 (`manicule.container.Container.retrieval_pipeline`). Everything outside the fenced region is
 not a stage, and §2.4 says why that is not a loophole.
@@ -1108,7 +1111,7 @@ bare identifiers, asked as themselves, out of every gate.
 
 So the gap has a repair that works for titles — let a one- or two-word plain query rank by the
 dense leg — and its cost is a noisy, net-positive change on short headings that this corpus has
-too few of to bound. Six rounds have now measured this defect; the title gap stands.
+too few of to bound. The title gap stood at the end of round 6.
 
 **Provenance of round 5.** Every figure in round 5's table was recorded from a checkout pinned
 at `a3e95685` — the rule as committed in `c036a4c5`, with two later changes to the instrument:
@@ -1124,6 +1127,44 @@ it and refuses to go on if one moves. Figures here differ slightly from earlier 
 same configuration — the shipped two-word identifier MRR under BGE-M3 is 0.725 in §4.1, 0.734 in
 round 4 above, 0.721 here — because each round indexed `docs/` as it stood at its own commit,
 and the corpus is the documentation that each of those changes edited.
+
+**Round 7 promoted exact titles with dense support**
+([#489](https://github.com/mgd43b/manicule/issues/489), `tests/benchmarks/exact_titles.py`).
+The rule was committed in `298c9ad0` before scoring. The run used harness commit `2533c3e`
+and the same `docs/` export as rounds 5 and 6 (`9ce34e6e`), plus the synthetic mail corpus.
+Each candidate considered the sole exact-title match in the fused pool. `dense-leader-title`
+required the match to be the dense leg's first document. `shortlist-title` required a dense hit
+for the document anywhere in the pool. Titles, MRR@10:
+
+| Embedder | Dense alone | Shipped hybrid | Dense-leader title | Shortlist title |
+|---|---:|---:|---:|---:|
+| BGE-M3 | 0.934 | 0.879 | 0.932 | 1.000 |
+| Qwen3-Embedding-0.6B | 0.895 | 0.783 | 0.955 | 0.955 |
+
+Both candidates cleared the half-gap threshold with zero titles ranked worse on either model.
+Across 2,895 docs questions and 252 mail queries, including their glossary-expanded forms,
+`Surfaces` was the sole non-title lookup that matched a stored title or file stem. The paired
+check replayed every eligible query through the harness. Queries with no title match in the
+corpus contribute a zero difference because neither candidate can alter their order.
+The original mail comparison at `2533c3e` ended at fusion. The round 7 harness now runs
+conversation collapse after fusion for the incumbent and both candidates, as in the default
+pipeline. The decision command requires that mail pipeline in both verdict files.
+On BGE-M3 both candidates promoted a chunk from the titled document for `Surfaces`, and the
+expected section stayed eighth. On Qwen3 the section stayed fourth. Every non-title family's
+paired MRR difference was zero, including the two-word identifier set, and all 11 unanswerable
+queries stayed in `none` on each model.
+The pre-registered tie-break selects `dense-leader-title` because the non-title gains tie.
+The 19 titles are deliberately simple lookups, and this corpus offers one title/heading
+collision. The measurement gives limited evidence about ambiguous titles in other corpora.
+
+The default `title_match` stage runs after `rrf` and before `collapse`. It compares the
+whole query with visible, current document titles in the candidate pool, folding case and
+collapsing whitespace. A file URI can also match by stem when the stored title equals its
+basename. If exactly one document matches and the best dense hit belongs to it, the stage
+moves that document's highest fused hit with a dense score to first. It keeps every score and
+the relative order of the other hits. It skips the document read when the dense and fused
+leaders already belong to the same document. The trace records whether it moved a hit, and
+the stage name in the pipeline identity distinguishes its rankings in the cache.
 
 ### 5.5 Collapse: what a conversation repeats is shown once
 

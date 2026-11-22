@@ -116,6 +116,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from pydantic import BaseModel
+
 from manicule.app.runtime import Runtime
 from manicule.cli.render import console
 from manicule.core.retrieval import ConfidenceBand
@@ -127,10 +129,15 @@ from tests.benchmarks.thread_corpus import build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Mapping, Sequence
+    from collections.abc import AsyncGenerator, Generator, Iterable, Mapping, Sequence
+    from contextlib import AbstractContextManager
+    from typing import Any
 
+    from manicule.config.settings import Settings
     from manicule.core.retrieval import Query
     from manicule.storage.docstore import SqliteDocStore
+
+    type Substitution = Callable[[SqliteDocStore, set[str]], AbstractContextManager[None]]
 
 SHORT = 2
 PLAIN = 16
@@ -236,20 +243,20 @@ def exactly_the_counted(candidate: Gate, asked: Iterable[str], gated: set[str]) 
 def _reciprocals(
     docs: Sequence[lq.Outcome],
     threads: Sequence[thread_duplication.Outcome],
-    family: str,
+    family: tuple[tuple[str, ...], tuple[str, ...], bool],
     gated: frozenset[str],
 ) -> dict[str, float]:
-    groups, forms, only_gated = FAMILIES[family]
+    groups, forms, only_gated = family
     found = {
-        o.asked.id: lq.reciprocal(o.rank)
+        o.asked.score_id: lq.reciprocal(o.rank)
         for o in docs
-        if o.asked.group in groups and (not only_gated or o.asked.text in gated)
+        if o.asked.group in groups and (not only_gated or o.asked.score_id in gated)
     }
     found.update(
         {
-            o.asked.query.id: lq.reciprocal(o.first)
+            o.asked.score_id: lq.reciprocal(o.first)
             for o in threads
-            if o.asked.form in forms and (not only_gated or o.asked.query.text in gated)
+            if o.asked.form in forms and (not only_gated or o.asked.score_id in gated)
         }
     )
     return found
@@ -260,28 +267,31 @@ def verdicts(
     docs: Mapping[str, Sequence[lq.Outcome]],
     threads: Mapping[str, Sequence[thread_duplication.Outcome]],
     gated: Mapping[str, frozenset[str]],
+    *,
+    families: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = FAMILIES,
 ) -> dict[str, tl.Verdict]:
     """Every candidate against the first, under round 6's rule, as round 5's :class:`Verdict`."""
-    incumbent, *candidates = CANDIDATES
+    incumbent, *candidates = docs
     nothing: frozenset[str] = frozenset()
-    dense_titles = statistics.fmean(_reciprocals(dense, (), "titles", nothing).values())
-    shipped_titles = _reciprocals(docs[incumbent], threads[incumbent], "titles", nothing)
+    title_family = families["titles"]
+    dense_titles = statistics.fmean(_reciprocals(dense, (), title_family, nothing).values())
+    shipped_titles = _reciprocals(docs[incumbent], threads[incumbent], title_family, nothing)
     found: dict[str, tl.Verdict] = {}
     for name in candidates:
-        families: dict[str, tl.Change] = {}
-        for family in FAMILIES:
+        changes: dict[str, tl.Change] = {}
+        for label, family in families.items():
             before = _reciprocals(docs[incumbent], threads[incumbent], family, gated[name])
             if not before:
                 continue
             after = _reciprocals(docs[name], threads[name], family, gated[name])
             differences = [after[key] - value for key, value in before.items()]
-            families[family] = tl.Change(
+            changes[label] = tl.Change(
                 count=len(differences),
                 change=statistics.fmean(differences),
                 interval=lq.bootstrap_interval(differences),
                 split=(sum(d > 0 for d in differences), sum(d < 0 for d in differences)),
             )
-        titles = _reciprocals(docs[name], threads[name], "titles", nothing)
+        titles = _reciprocals(docs[name], threads[name], title_family, nothing)
         found[name] = tl.Verdict(
             titles=(
                 dense_titles,
@@ -289,7 +299,7 @@ def verdicts(
                 statistics.fmean(titles.values()),
             ),
             titles_worse=sum(titles[key] < value for key, value in shipped_titles.items()),
-            families=families,
+            families=changes,
             unanswerable_out_of_none=sum(
                 o.band is not ConfidenceBand.NONE
                 for o in docs[name]
@@ -299,10 +309,14 @@ def verdicts(
     return found
 
 
-def choose(per_model: Sequence[Mapping[str, tuple[bool, float]]]) -> str | None:
+def choose(
+    per_model: Sequence[Mapping[str, tuple[bool, float]]],
+    *,
+    candidates: Iterable[str] = CANDIDATES,
+) -> str | None:
     """The qualifier under every model with the best averaged non-title change; ties go early."""
     qualifying = [
-        name for name in CANDIDATES if all(name in model and model[name][0] for model in per_model)
+        name for name in candidates if all(name in model and model[name][0] for model in per_model)
     ]
     if not qualifying:
         return None
@@ -322,8 +336,54 @@ class Measured:
     gated: dict[str, frozenset[str]]
 
 
-async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], None]) -> Measured:
-    """Index each corpus once and ask every candidate everything."""
+@contextlib.asynccontextmanager
+async def _substituted(
+    settings: Settings,
+    name: str,
+    selected: set[str],
+    candidates: Mapping[str, Substitution] | None,
+) -> AsyncGenerator[None]:
+    if candidates is None:
+        with gated_weighting(CANDIDATES[name], selected):
+            yield
+    else:
+        async with Runtime(settings, writer=False) as runtime:
+            store = cast("SqliteDocStore", await runtime.documents())
+            with candidates[name](store, selected):
+                yield
+
+
+async def _index_mail(
+    args: argparse.Namespace, directory: Path, overrides: Mapping[str, Any], pinned: str
+) -> tuple[thread_duplication.Indexed, list[thread_duplication.Asked]]:
+    corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
+    if args.reuse_mail_index:
+        if not (directory / tl.DATABASE).is_file():
+            msg = f"no reusable mail index at {directory}"
+            raise RuntimeError(msg)
+        tl.unchanged([directory], pinned)
+    else:
+        shutil.rmtree(directory, ignore_errors=True)
+    indexed = await thread_duplication.index(
+        corpus, directory, overrides=overrides, reuse=args.reuse_mail_index
+    )
+    _, asked = thread_duplication.queries(corpus)
+    return indexed, asked
+
+
+async def measure(
+    args: argparse.Namespace,
+    work: Path,
+    emit: Callable[[str], None],
+    *,
+    candidates: Mapping[str, Substitution] | None = None,
+    mail_pipeline: str = "hybrid",
+) -> Measured:
+    """Index each corpus once and ask every candidate everything.
+
+    Other rounds can supply their own stage substitutions, using the store of the corpus
+    being queried. Without substitutions, run round 6's gates and verify their selection.
+    """
     overrides = lq.embedding_overrides(args)
     root = args.docs
     started = time.perf_counter()
@@ -344,13 +404,13 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     tl.unchanged(indexes, pinned)
     emit(f"docs/ from {root}: {len(index.places)} chunks with {args.model}; {len(asked)} queries")
 
-    corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
-    shutil.rmtree(work / "threads", ignore_errors=True)
-    indexed = await thread_duplication.index(corpus, work / "threads", overrides=overrides)
+    indexed, thread_asked = await _index_mail(args, work / "threads", overrides, pinned)
     indexes.append(indexed.data_dir)
     tl.unchanged(indexes, pinned)
-    _, thread_asked = thread_duplication.queries(corpus)
     progress("mail threads indexed")
+    thread_settings = thread_duplication.settings_for(
+        indexed.data_dir, overrides, thread_duplication.PIPELINES[mail_pipeline]
+    )
 
     dense = await lq.run_docs(
         index, asked, variant=lq.SHIPPED_MATCH, pipeline="dense", overrides=overrides
@@ -358,35 +418,47 @@ async def measure(args: argparse.Namespace, work: Path, emit: Callable[[str], No
     docs: dict[str, list[lq.Outcome]] = {}
     threads: dict[str, list[thread_duplication.Outcome]] = {}
     gated: dict[str, frozenset[str]] = {}
-    for name, candidate in CANDIDATES.items():
+    for name in candidates if candidates is not None else CANDIDATES:
         tl.unchanged(indexes, pinned)
         selected: set[str] = set()
-        with gated_weighting(candidate, selected):
+        async with _substituted(settings, name, selected, candidates):
             docs[name] = await lq.run_docs(
                 index, asked, variant=lq.SHIPPED_MATCH, pipeline="hybrid", overrides=overrides
             )
+        async with _substituted(thread_settings, name, selected, candidates):
             with lq.matching(lq.VARIANTS[lq.SHIPPED_MATCH]):
                 run = await thread_duplication.run_pipeline(
                     indexed,
                     thread_asked,
-                    name="hybrid",
+                    name=mail_pipeline,
                     overrides=overrides,
                     ks=(10,),
                     counted=frozenset({lq.EXHAUSTED_BUDGET}),
                 )
         threads[name] = run.outcomes
-        exactly_the_counted(
-            candidate,
-            [item.text for item in asked] + [item.query.text for item in thread_asked],
-            selected,
-        )
+        selected_count = len(selected)
+        if candidates is None:
+            exactly_the_counted(
+                CANDIDATES[name],
+                [item.text for item in asked] + [item.query.text for item in thread_asked],
+                selected,
+            )
+            selected = {item.score_id for item in asked if item.text in selected} | {
+                item.score_id for item in thread_asked if item.query.text in selected
+            }
         gated[name] = frozenset(selected)
-        progress(f"{name} asked, {len(selected)} distinct queries gated")
+        progress(f"{name} asked, {selected_count} distinct queries gated")
     tl.unchanged(indexes, pinned)
     return Measured(dense, docs, threads, gated)
 
 
-def report(measured: Measured, emit: Callable[[str], None]) -> dict[str, tl.Verdict]:
+def report(
+    measured: Measured,
+    emit: Callable[[str], None],
+    *,
+    round_number: int = 6,
+    families: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = FAMILIES,
+) -> dict[str, tl.Verdict]:
     rows: list[tuple[str, str, lq.Row]] = []
     for name, outcomes in [("dense alone", measured.dense), *measured.docs.items()]:
         pipeline = "dense" if name == "dense alone" else "hybrid"
@@ -395,23 +467,78 @@ def report(measured: Measured, emit: Callable[[str], None]) -> dict[str, tl.Verd
             for group in GROUPS
             if (chosen := [o for o in outcomes if o.asked.group == group])
         )
-    emit("\n### round 6: docs/\n")
+    emit(f"\n### round {round_number}: docs/\n")
     emit(lq.render(rows))
-    emit("\n### round 6: mail threads, MRR@10\n")
+    emit(f"\n### round {round_number}: mail threads, MRR@10\n")
     for name, outcomes in measured.threads.items():
         for form in thread_duplication.FORMS:
             chosen = [o for o in outcomes if o.asked.form == form]
             mrr = statistics.fmean(lq.reciprocal(o.first) for o in chosen)
             hits = sum(o.found for o in chosen)
             emit(f"  {name} {form}: found {hits}/{len(chosen)}, MRR {mrr:.3f}")
-    found = verdicts(measured.dense, measured.docs, measured.threads, measured.gated)
+    found = verdicts(
+        measured.dense, measured.docs, measured.threads, measured.gated, families=families
+    )
     for name, verdict in found.items():
-        emit(f"\n{name} against {next(iter(CANDIDATES))}:\n{verdict.describe()}")
+        emit(f"\n{name} against {next(iter(measured.docs))}:\n{verdict.describe()}")
     return found
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
+    run_cli(argv, description=__doc__)
+
+
+class ModelVerdicts(BaseModel):
+    """A verdict file tied to the model and mail pipeline measured."""
+
+    model: str
+    mail_pipeline: tuple[str, ...]
+    verdicts: dict[str, tuple[bool, float]]
+
+
+def load_model_verdicts(
+    paths: Sequence[Path], required: frozenset[str], mail_pipeline: tuple[str, ...]
+) -> list[dict[str, tuple[bool, float]]]:
+    results = [
+        ModelVerdicts.model_validate_json(path.read_text(encoding="utf-8")) for path in paths
+    ]
+    if len(results) != len(required) or frozenset(result.model for result in results) != required:
+        msg = f"--choose requires one verdict file per model: {', '.join(sorted(required))}"
+        raise ValueError(msg)
+    if any(result.mail_pipeline != mail_pipeline for result in results):
+        msg = f"--choose requires both verdicts to use the mail pipeline {mail_pipeline}"
+        raise ValueError(msg)
+    return [result.verdicts for result in results]
+
+
+def _save_verdicts(
+    found: Mapping[str, tl.Verdict], path: Path, model: str | None, mail_pipeline: tuple[str, ...]
+) -> None:
+    if model is None:
+        tl.saved(found, path)
+    else:
+        payload = ModelVerdicts(
+            model=model,
+            mail_pipeline=mail_pipeline,
+            verdicts={name: (v.fixes, v.gain) for name, v in found.items()},
+        )
+        path.write_text(payload.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+
+def run_cli(
+    argv: Sequence[str] | None,
+    *,
+    description: str | None,
+    candidates: Mapping[str, Substitution] | None = None,
+    round_number: int = 6,
+    families: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = FAMILIES,
+    required_models: frozenset[str] | None = None,
+    mail_pipeline: str = "hybrid",
+) -> None:
+    """Run a fusion experiment on the docs and mail questions, or combine its verdicts."""
+    parser = argparse.ArgumentParser(
+        description=description.split("\n\n")[0] if description else None
+    )
     parser.add_argument("--docs", type=Path, help="a docs/ tree exported at one commit")
     parser.add_argument("--verdicts", type=Path, default=None, help="write verdicts here, as JSON")
     parser.add_argument(
@@ -427,6 +554,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--copies", type=int, default=lq.HELD_OUT_COPIES)
     parser.add_argument("--distractors", type=int, default=lq.HELD_OUT_DISTRACTORS)
     parser.add_argument("--work", type=Path, default=None, help="keep the indexes here")
+    parser.add_argument(
+        "--reuse-mail-index", action="store_true", help="reuse and verify the mail index in --work"
+    )
     args = parser.parse_args(argv)
     out = console()
 
@@ -436,11 +566,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     if args.choose:
-        chosen = choose([tl.loaded(path) for path in args.choose])
+        try:
+            per_model = (
+                [tl.loaded(path) for path in args.choose]
+                if required_models is None
+                else load_model_verdicts(
+                    args.choose, required_models, thread_duplication.PIPELINES[mail_pipeline]
+                )
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        chosen = choose(
+            per_model,
+            candidates=CANDIDATES if candidates is None else candidates,
+        )
         emit(f"-> {'ship ' + chosen if chosen else 'no change'}")
         return
     if args.docs is None:
         parser.error("--docs is required to measure")
+    if args.reuse_mail_index and args.work is None:
+        parser.error("--reuse-mail-index requires --work")
     args.docs = args.docs.resolve()
     if args.verdicts is not None:
         args.verdicts = args.verdicts.resolve()
@@ -451,9 +596,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             work = args.work.resolve()
             work.mkdir(parents=True, exist_ok=True)
         _isolate(work)
-        found = report(asyncio.run(measure(args, work, emit)), emit)
+        measured = asyncio.run(
+            measure(args, work, emit, candidates=candidates, mail_pipeline=mail_pipeline)
+        )
+        found = report(measured, emit, round_number=round_number, families=families)
         if args.verdicts is not None:
-            tl.saved(found, args.verdicts)
+            _save_verdicts(
+                found,
+                args.verdicts,
+                args.model if required_models is not None else None,
+                thread_duplication.PIPELINES[mail_pipeline],
+            )
 
 
 if __name__ == "__main__":
