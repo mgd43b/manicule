@@ -8,7 +8,7 @@ import pytest
 
 from manicule.core.content import DocumentStatus
 from manicule.core.retrieval import Candidate, Filter, Query
-from tests.benchmarks.exact_titles import promote
+from manicule.retrieval.title_match import promote
 from tests.storage_helpers import make_chunk, make_document
 
 
@@ -43,7 +43,10 @@ async def test_promotes_one_dense_chunk_and_preserves_the_rest(
     else:
         assert result is ordered
     scope = query.filter.model_copy(update={"document_ids": frozenset({target.id, other.id})})
-    store.list_documents.assert_awaited_once_with(scope, limit=2)
+    if dense_leader and not best_dense:
+        store.list_documents.assert_not_awaited()
+    else:
+        store.list_documents.assert_awaited_once_with(scope, limit=2)
 
 
 async def test_ambiguous_titles_and_lexical_only_hits_do_not_promote() -> None:
@@ -68,3 +71,19 @@ async def test_ambiguous_titles_and_lexical_only_hits_do_not_promote() -> None:
         page.model_copy(update={"status": DocumentStatus.FAILED}),
     ]
     assert await promote(store, query, ordered, require_dense_leader=False) is ordered
+
+
+async def test_a_title_from_a_new_publication_does_not_promote_a_stale_chunk() -> None:
+    first = make_document(source_id="first", title="Other")
+    page = make_document(source_id="page", title="Notes").model_copy(
+        update={"publication_id": "new-publication"}
+    )
+    store = AsyncMock()
+    store.list_documents.return_value = [first, page]
+    query = Query(text="notes", filter=Filter(workspace_ids=frozenset({"w"})))
+    ordered = [
+        Candidate(chunk=make_chunk(first, 0, "other"), score=0.03, scores={"dense": 0.8}),
+        Candidate(chunk=make_chunk(page, 0, "stale"), score=0.02, scores={"dense": 0.9}),
+    ]
+
+    assert await promote(store, query, ordered, require_dense_leader=True) is ordered

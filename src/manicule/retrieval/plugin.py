@@ -35,6 +35,7 @@ LEXICAL_NAME = "lexical"
 FUSION_NAME = "rrf"
 CROSS_ENCODER_NAME = "cross_encoder"
 COLLAPSE_NAME = "collapse"
+TITLE_MATCH_NAME = "title_match"
 
 
 def _config[T: BaseModel](context: BuildContext, expected: type[T]) -> T:
@@ -113,6 +114,24 @@ def build_fusion(context: BuildContext) -> RetrievalStage:
     return RRFStage(config=config, name=FUSION_NAME)
 
 
+def build_title_match(context: BuildContext) -> RetrievalStage:
+    """Read titles for candidates that have already been ranked by fusion."""
+    from manicule.retrieval.title_match import TitleMatchStage  # noqa: PLC0415
+
+    declared = context.settings.rag.pipeline
+    position = declared.index(TITLE_MATCH_NAME) if TITLE_MATCH_NAME in declared else len(declared)
+    earlier = declared[:position]
+    if FUSION_NAME not in earlier or DENSE_NAME not in earlier:
+        msg = (
+            f"rag.pipeline requires {DENSE_NAME!r} and {FUSION_NAME!r} before {TITLE_MATCH_NAME!r}"
+        )
+        raise ConfigError(msg)
+    if COLLAPSE_NAME in earlier:
+        msg = f"rag.pipeline requires {TITLE_MATCH_NAME!r} before {COLLAPSE_NAME!r}"
+        raise ConfigError(msg)
+    return TitleMatchStage(docstore=context.components.get(keys.DOC_STORE), name=TITLE_MATCH_NAME)
+
+
 def build_collapse(context: BuildContext) -> RetrievalStage:
     """Near-duplicate collapse within a conversation, reading document metadata.
 
@@ -188,6 +207,11 @@ class RetrievalPlugin:
             summary="Reciprocal rank fusion over named legs. Ranks only, never scores.",
         )
         registry.add(
+            keys.RETRIEVAL_STAGE.named(TITLE_MATCH_NAME),
+            build_title_match,
+            summary="Promotes an exact document title when the dense leader supports it.",
+        )
+        registry.add(
             keys.RETRIEVAL_STAGE.named(COLLAPSE_NAME),
             build_collapse,
             config_model=CollapseConfig,
@@ -214,10 +238,12 @@ __all__ = [
     "FUSION_NAME",
     "LEXICAL_NAME",
     "PLUGIN",
+    "TITLE_MATCH_NAME",
     "RetrievalPlugin",
     "build_collapse",
     "build_cross_encoder",
     "build_dense",
     "build_fusion",
     "build_lexical",
+    "build_title_match",
 ]

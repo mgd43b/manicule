@@ -384,7 +384,12 @@ async def measure(
 
     corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
     thread_dir = work / "threads"
-    if not args.reuse_mail_index:
+    if args.reuse_mail_index:
+        if not (thread_dir / tl.DATABASE).is_file():
+            msg = f"no reusable mail index at {thread_dir}"
+            raise RuntimeError(msg)
+        tl.unchanged([thread_dir], pinned)
+    else:
         shutil.rmtree(thread_dir, ignore_errors=True)
     indexed = await thread_duplication.index(
         corpus, thread_dir, overrides=overrides, reuse=args.reuse_mail_index

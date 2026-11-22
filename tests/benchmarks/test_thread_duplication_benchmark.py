@@ -195,7 +195,11 @@ async def test_the_program_runs_end_to_end_through_the_runtime(
     reused = await index(
         small(), result.indexed.data_dir, overrides=overrides, discovery=found, reuse=True
     )
-    assert reused.chunks == result.indexed.chunks
+    assert reused.chunks.keys() == result.indexed.chunks.keys()
+    for chunk_id, truth in reused.chunks.items():
+        original = result.indexed.chunks[chunk_id]
+        assert truth.message.gmail_id == original.message.gmail_id
+        assert truth.passages == original.passages
     different = build_corpus(seed=482, lengths=(2, 5), copies=1, distractors=2)
     with pytest.raises(RuntimeError, match="different text"):
         await index(

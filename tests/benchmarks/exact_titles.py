@@ -46,77 +46,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from unittest.mock import patch
-from urllib.parse import unquote, urlsplit
 
-from manicule.core.content import DocumentStatus
-from manicule.core.readers import admits
 from manicule.retrieval.fusion import RRFStage
+from manicule.retrieval.title_match import promote
 from tests.benchmarks import query_shapes as qs
 from tests.benchmarks.lexical_questions import TWO_WORDS
 
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from manicule.core.content import Document
     from manicule.core.protocols import DocStore
     from manicule.core.retrieval import Candidate, Query
-
-
-def _normalized(text: str) -> str:
-    return " ".join(text.casefold().split())
-
-
-def _matches(text: str, document: Document) -> bool:
-    title = _normalized(document.title)
-    if text == title:
-        return True
-    uri = urlsplit(document.uri)
-    if uri.scheme != "file":
-        return False
-    filename = PurePosixPath(unquote(uri.path))
-    return _normalized(filename.name) == title and _normalized(filename.stem) == text
-
-
-async def promote(
-    store: DocStore,
-    query: Query,
-    ordered: list[Candidate],
-    *,
-    require_dense_leader: bool,
-) -> list[Candidate]:
-    """Move one exact-title match, keeping the fused scores and the rest of the order."""
-    text = _normalized(query.text)
-    dense = [candidate for candidate in ordered if "dense" in candidate.scores]
-    if not text or not dense:
-        return ordered
-    ids = frozenset(candidate.chunk.document_id for candidate in ordered)
-    if query.filter.document_ids:
-        ids &= query.filter.document_ids
-    if not ids:
-        return ordered
-    scope = query.filter.model_copy(update={"document_ids": ids})
-    documents = await store.list_documents(scope, limit=len(ids))
-    matches = {
-        document.id
-        for document in documents
-        if document.id in ids
-        and document.status is DocumentStatus.INDEXED
-        and admits(scope.readers, document.access)
-        and _matches(text, document)
-    }
-    if len(matches) != 1 or ordered[0].chunk.document_id in matches:
-        return ordered
-    if require_dense_leader:
-        leader = min(dense, key=lambda c: (-c.scores["dense"], c.chunk.id))
-        if leader.chunk.document_id not in matches:
-            return ordered
-    for i, candidate in enumerate(ordered):
-        if candidate.chunk.document_id in matches and "dense" in candidate.scores:
-            return [candidate, *ordered[:i], *ordered[i + 1 :]]
-    return ordered
 
 
 @contextmanager

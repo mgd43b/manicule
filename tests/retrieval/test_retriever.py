@@ -388,13 +388,14 @@ def _settings(**rag: object) -> Settings:
     return Settings(rag=RagSettings(**rag))  # pyright: ignore[reportArgumentType]
 
 
-def test_the_plugin_registers_the_two_legs_the_fusion_the_collapse_and_a_reranker() -> None:
+def test_the_plugin_registers_the_builtin_stages_and_reranker() -> None:
     """Built-in components take the same route a third-party plugin takes."""
     registry = _registry()
     assert set(registry.names(keys.RETRIEVAL_STAGE.kind)) == {
         "dense",
         "lexical",
         "rrf",
+        "title_match",
         "collapse",
     }
     assert "cross_encoder" in registry.names(keys.RERANKER.kind)
@@ -439,6 +440,64 @@ def test_collapse_after_fusion_is_built(store: SqliteDocStore) -> None:
     assert isinstance(stage, CollapseStage)
 
 
+@pytest.mark.parametrize(
+    ("pipeline", "message"),
+    [
+        (("dense", "title_match", "rrf"), "before 'title_match'"),
+        (("dense", "rrf", "collapse", "title_match"), "before 'collapse'"),
+    ],
+)
+def test_title_match_requires_the_fused_ranking_before_collapse(
+    pipeline: tuple[str, ...], message: str
+) -> None:
+    container = Container(_settings(pipeline=pipeline), _registry())
+    with pytest.raises(ConfigError, match=message):
+        container.get(keys.RETRIEVAL_STAGE.named("title_match"))
+
+
+async def test_title_match_promotes_one_hit_in_the_hybrid_pipeline(
+    store: SqliteDocStore, tmp_path: Path
+) -> None:
+    target = make_document(
+        source_id="release", title="Release notes.md", uri="file:///Release%20notes.md"
+    )
+    other = make_document(source_id="other")
+    target_chunk = make_chunk(target, 0, "Detailed maintenance procedures.")
+    other_chunk = make_chunk(other, 0, "Release notes are published every month.")
+    for document, chunk in ((target, target_chunk), (other, other_chunk)):
+        await store.upsert_document(document)
+        await store.replace_chunks(document.id, [chunk])
+
+    registry = _registry()
+    registry.add(keys.EMBEDDER.named("fake"), lambda _: HashEmbedder())
+    registry.add(
+        keys.VECTOR_STORE.named("memory"), lambda _: ListVectorStore([target_chunk, other_chunk])
+    )
+    registry.add(keys.DOC_STORE.named("bound"), lambda _: store)
+    settings = _settings()
+    settings.embedding.provider = "fake"
+    settings.storage.vector_db = "memory"  # pyright: ignore[reportAttributeAccessIssue]
+    settings.storage.db = "bound"  # pyright: ignore[reportAttributeAccessIssue]
+    settings.data_dir = tmp_path
+
+    query = Query(
+        text="Release notes",
+        filter=Filter(workspace_ids=SCOPE, kinds=frozenset({BlockKind.PROSE})),
+    )
+    async with Container(settings, registry) as container:
+        retriever = await build_retriever(container)
+        result = await retriever.retrieve(query)
+        cached = await retriever.retrieve(query)
+
+    assert [c.chunk.id for c in result.candidates] == [target_chunk.id, other_chunk.id]
+    assert result.candidates[0].scores["rrf"] < result.candidates[1].scores["rrf"]
+    assert result.trace.pipeline.stages == ("dense", "lexical", "rrf", "title_match", "collapse")
+    title_match = next(span for span in result.trace.stages if span.name == "title_match")
+    assert title_match.diagnostics == {"promoted": True}
+    assert cached.trace.cached
+    assert cached.candidates == result.candidates
+
+
 def test_a_pipeline_naming_one_stage_twice_is_refused_before_construction() -> None:
     """Misconfiguration fails before construction, with the reason named."""
     problems = check_wiring(_settings(pipeline=("dense", "dense", "rrf")), _registry())
@@ -474,7 +533,13 @@ async def test_the_composition_root_assembles_a_working_retriever(
         retriever = await build_retriever(container)
         result = await retriever.retrieve(a_query("authentication"))
 
-    assert [span.name for span in result.trace.stages] == ["dense", "lexical", "rrf", "collapse"]
+    assert [span.name for span in result.trace.stages] == [
+        "dense",
+        "lexical",
+        "rrf",
+        "title_match",
+        "collapse",
+    ]
     assert result.trace.pipeline.rrf_k == 60
     assert result.trace.pipeline.embed_fingerprint
     assert result.context.passages

@@ -105,7 +105,7 @@ PIPELINES: dict[str, tuple[str, ...]] = {
     "lexical": ("lexical",),
     "hybrid+collapse": ("dense", "lexical", "rrf", "collapse"),
 }
-"""Report order. ``hybrid`` is the shipped ``rag.pipeline`` default."""
+"""Report order. ``hybrid`` measures fusion alone and ``hybrid+collapse`` adds collapse."""
 
 KS = (5, 10)
 SOURCE = "mail"
