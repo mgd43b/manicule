@@ -136,20 +136,25 @@ def test_a_loss_confined_to_the_gated_headings_fails_however_the_family_averages
         Asked(f"u{i}", f"The rule that heading {i} states", "headings", (("a.md", f"9.{i}"),))
         for i in range(38)
     ]
+    example = Asked(ungated[0].id, "Example", "example")
     shipped = [
         _outcome(title, 2),
+        _outcome(example, None),
         *(_outcome(a, 1) for a in gated),
         *(_outcome(a, 3) for a in ungated),
     ]
     candidate = [
         _outcome(title, 1),
+        _outcome(example, None),
         *(_outcome(a, 10) for a in gated),
         *(_outcome(a, 1) for a in ungated),
     ]
     dense = [_outcome(title, 1)]
     docs = dict.fromkeys(CANDIDATES, shipped) | {"short-dense": candidate}
     threads: dict[str, list[thread_duplication.Outcome]] = {name: [] for name in CANDIDATES}
-    selected = dict.fromkeys(CANDIDATES, frozenset({title.id, *(a.id for a in gated)}))
+    selected = dict.fromkeys(
+        CANDIDATES, frozenset({title.score_id, example.score_id, *(a.score_id for a in gated)})
+    )
 
     found = verdicts(dense, docs, threads, selected)["short-dense"]
     assert found.families["headings"].interval[0] > 0

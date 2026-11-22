@@ -248,15 +248,15 @@ def _reciprocals(
 ) -> dict[str, float]:
     groups, forms, only_gated = family
     found = {
-        o.asked.id: lq.reciprocal(o.rank)
+        o.asked.score_id: lq.reciprocal(o.rank)
         for o in docs
-        if o.asked.group in groups and (not only_gated or o.asked.id in gated)
+        if o.asked.group in groups and (not only_gated or o.asked.score_id in gated)
     }
     found.update(
         {
-            o.asked.query.id: lq.reciprocal(o.first)
+            o.asked.score_id: lq.reciprocal(o.first)
             for o in threads
-            if o.asked.form in forms and (not only_gated or o.asked.query.id in gated)
+            if o.asked.form in forms and (not only_gated or o.asked.score_id in gated)
         }
     )
     return found
@@ -440,8 +440,8 @@ async def measure(
                 [item.text for item in asked] + [item.query.text for item in thread_asked],
                 selected,
             )
-            selected = {item.id for item in asked if item.text in selected} | {
-                item.query.id for item in thread_asked if item.query.text in selected
+            selected = {item.score_id for item in asked if item.text in selected} | {
+                item.score_id for item in thread_asked if item.query.text in selected
             }
         gated[name] = frozenset(selected)
         progress(f"{name} asked, {selected_count} distinct queries gated")

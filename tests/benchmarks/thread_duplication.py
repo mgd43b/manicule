@@ -332,6 +332,11 @@ class Asked:
     form: str
     """``question`` or ``keywords``: the lexical leg sees only the second."""
 
+    @property
+    def score_id(self) -> str:
+        """Keep mail question IDs separate from docs question IDs."""
+        return f"mail:{self.form}:{self.query.id}"
+
 
 FORMS = ("question", "keywords")
 
@@ -519,7 +524,7 @@ async def run_pipeline(
         )
         for item in asked:
             result = await for_question(
-                item.query.id, system.search(item.query.text, limit=max(ks))
+                item.score_id, system.search(item.query.text, limit=max(ks))
             )
             single_leg = any(r.startswith(LEXICAL_EMPTY) for r in result.incomparable)
             refused = [
@@ -544,7 +549,7 @@ async def run_pipeline(
                 for rank, entry in enumerate(result.items, start=1)
             ]
             pool = await for_question(
-                item.query.id,
+                item.score_id,
                 retriever.retrieve(
                     Query(text=item.query.text, limit=max(ks), filter=Filter(workspace_ids=scope))
                 ),

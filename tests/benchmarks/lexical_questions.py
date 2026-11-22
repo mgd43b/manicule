@@ -720,6 +720,11 @@ class Asked:
     documents: frozenset[str] = frozenset()
     """For a title probe: the documents that are the answer."""
 
+    @property
+    def score_id(self) -> str:
+        """Qualify the ID by question source before combining sets."""
+        return f"docs:{self.group}:{self.id}"
+
 
 def _section_matches(heading: str, number: str) -> bool:
     first = heading.split(" ", 1)[0].rstrip(".")
@@ -900,7 +905,8 @@ async def run_docs(
             scope = Filter(workspace_ids=frozenset({runtime.workspace}))
             for item in asked:
                 result = await thread_duplication.for_question(
-                    item.id, retriever.retrieve(Query(text=item.text, limit=max(KS), filter=scope))
+                    item.score_id,
+                    retriever.retrieve(Query(text=item.text, limit=max(KS), filter=scope)),
                 )
                 refused = [
                     reason
