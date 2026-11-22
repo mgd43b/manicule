@@ -212,6 +212,21 @@ specific to this corpus and kept the shipped rule. Prose costs more under Qwen3 
 BGE-M3 — authored MRR 0.635 against 0.716 for the conjunction — and the held-out thread questions
 are what bring the pooled figure level.
 
+**Round 7 (#489).** Over the same frozen docs export and mail corpus as round 6, compare
+shipped hybrid with moving the highest fused chunk that has dense evidence from the sole
+exact-title match in the candidate pool to first. Match the entire query after case folding and
+whitespace normalization, also allowing a file title's stem when its basename is the stored
+title. Leave an already-first document in place. In tie order, test a match only when the
+dense leader belongs to that document, then a match anywhere in the pool. The scores and the
+order of the other chunks stay as fused. Run :mod:`tests.benchmarks.exact_titles` under BGE-M3
+and Qwen3-Embedding-0.6B, against each model's own dense and shipped baselines at ``k = 10``.
+A candidate closes at least half the title MRR gap with no title worse. The lower bound of its
+95% paired bootstrap interval must exceed -0.02 in each other round 6 family, the two-word
+identifier family on its own, and each nonempty subset within those families where it promoted
+a chunk. All unanswerable queries must stay in ``none``. Choose among candidates that pass under
+both models by their average non-title gain, breaking ties within 0.005 by candidate order.
+If none qualifies, keep the shipped order.
+
 Everything is local: no network, temporary directories, and the only thing read from outside the
 repository is the embedding model, from the local model cache.
 """

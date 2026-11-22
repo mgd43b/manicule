@@ -58,7 +58,7 @@ from tests.benchmarks import query_shapes as qs
 from tests.benchmarks.lexical_questions import TWO_WORDS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from manicule.core.content import Document
     from manicule.core.protocols import DocStore
@@ -122,7 +122,7 @@ async def promote(
 @contextmanager
 def _promotion(
     store: DocStore, selected: set[str], *, require_dense_leader: bool
-) -> Iterator[None]:
+) -> Generator[None]:
     shipped = RRFStage.run
 
     async def run(stage: RRFStage, query: Query, candidates: list[Candidate]) -> list[Candidate]:

@@ -127,7 +127,7 @@ from tests.benchmarks.thread_corpus import build_corpus
 from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Generator, Iterable, Mapping, Sequence
+    from collections.abc import AsyncGenerator, Generator, Iterable, Mapping, Sequence
     from contextlib import AbstractContextManager
 
     from manicule.config.settings import Settings
@@ -339,7 +339,7 @@ async def _substituted(
     name: str,
     selected: set[str],
     candidates: Mapping[str, Substitution] | None,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None]:
     if candidates is None:
         with gated_weighting(CANDIDATES[name], selected):
             yield
