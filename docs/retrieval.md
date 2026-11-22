@@ -1146,8 +1146,9 @@ Across 2,895 docs questions and 252 mail queries, including their glossary-expan
 `Surfaces` was the sole non-title lookup that matched a stored title or file stem. The paired
 check replayed every eligible query through the harness. Queries with no title match in the
 corpus contribute a zero difference because neither candidate can alter their order.
-The mail comparison runs conversation collapse after fusion for the incumbent and both
-candidates, as in the default pipeline.
+The original mail comparison at `2533c3e` ended at fusion. The round 7 harness now runs
+conversation collapse after fusion for the incumbent and both candidates, as in the default
+pipeline. The decision command requires that mail pipeline in both verdict files.
 On BGE-M3 both candidates promoted a chunk from the titled document for `Surfaces`, and the
 expected section stayed eighth. On Qwen3 the section stayed fourth. Every non-title family's
 paired MRR difference was zero, including the two-word identifier set, and all 11 unanswerable

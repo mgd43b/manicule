@@ -129,18 +129,30 @@ async def test_the_title_stage_returns_a_fresh_list_on_a_no_op() -> None:
     assert output is not empty
 
 
-def test_choosing_needs_two_distinct_required_models(tmp_path: Path) -> None:
+def test_choosing_needs_both_models_on_the_expected_mail_pipeline(tmp_path: Path) -> None:
     models = frozenset({"BAAI/bge-m3", "qwen3-embedding:0.6b"})
+    hybrid = ("dense", "lexical", "rrf")
+    with_collapse = (*hybrid, "collapse")
+    verdicts = {"dense-leader-title": (True, 0.0)}
     files: list[Path] = []
     for i, model in enumerate(sorted(models)):
         path = tmp_path / f"verdict-{i}.json"
-        payload = ModelVerdicts(model=model, verdicts={"dense-leader-title": (True, 0.0)})
+        payload = ModelVerdicts(model=model, mail_pipeline=with_collapse, verdicts=verdicts)
         path.write_text(payload.model_dump_json(), encoding="utf-8")
         files.append(path)
     first, second = files
-    assert len(load_model_verdicts([first, second], models)) == 2
+    assert len(load_model_verdicts([first, second], models, with_collapse)) == 2
     with pytest.raises(ValueError, match="one verdict file per model"):
-        load_model_verdicts([first, first], models)
+        load_model_verdicts([first, first], models, with_collapse)
+    fusion_only = ModelVerdicts(
+        model="qwen3-embedding:0.6b", mail_pipeline=hybrid, verdicts=verdicts
+    )
+    second.write_text(fusion_only.model_dump_json(), encoding="utf-8")
+    with pytest.raises(ValueError, match="requires both verdicts to use the mail pipeline"):
+        load_model_verdicts([first, second], models, with_collapse)
+    second.write_text(fusion_only.model_dump_json(exclude={"mail_pipeline"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="mail_pipeline"):
+        load_model_verdicts([first, second], models, with_collapse)
 
 
 def test_round_seven_measures_mail_with_conversation_collapse(

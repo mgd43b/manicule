@@ -489,14 +489,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 class ModelVerdicts(BaseModel):
-    """A verdict file whose model can be checked when combining runs."""
+    """A verdict file tied to the model and mail pipeline measured."""
 
     model: str
+    mail_pipeline: tuple[str, ...]
     verdicts: dict[str, tuple[bool, float]]
 
 
 def load_model_verdicts(
-    paths: Sequence[Path], required: frozenset[str]
+    paths: Sequence[Path], required: frozenset[str], mail_pipeline: tuple[str, ...]
 ) -> list[dict[str, tuple[bool, float]]]:
     results = [
         ModelVerdicts.model_validate_json(path.read_text(encoding="utf-8")) for path in paths
@@ -504,15 +505,22 @@ def load_model_verdicts(
     if len(results) != len(required) or frozenset(result.model for result in results) != required:
         msg = f"--choose requires one verdict file per model: {', '.join(sorted(required))}"
         raise ValueError(msg)
+    if any(result.mail_pipeline != mail_pipeline for result in results):
+        msg = f"--choose requires both verdicts to use the mail pipeline {mail_pipeline}"
+        raise ValueError(msg)
     return [result.verdicts for result in results]
 
 
-def _save_verdicts(found: Mapping[str, tl.Verdict], path: Path, model: str | None) -> None:
+def _save_verdicts(
+    found: Mapping[str, tl.Verdict], path: Path, model: str | None, mail_pipeline: tuple[str, ...]
+) -> None:
     if model is None:
         tl.saved(found, path)
     else:
         payload = ModelVerdicts(
-            model=model, verdicts={name: (v.fixes, v.gain) for name, v in found.items()}
+            model=model,
+            mail_pipeline=mail_pipeline,
+            verdicts={name: (v.fixes, v.gain) for name, v in found.items()},
         )
         path.write_text(payload.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
@@ -562,7 +570,9 @@ def run_cli(
             per_model = (
                 [tl.loaded(path) for path in args.choose]
                 if required_models is None
-                else load_model_verdicts(args.choose, required_models)
+                else load_model_verdicts(
+                    args.choose, required_models, thread_duplication.PIPELINES[mail_pipeline]
+                )
             )
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
@@ -592,7 +602,10 @@ def run_cli(
         found = report(measured, emit, round_number=round_number, families=families)
         if args.verdicts is not None:
             _save_verdicts(
-                found, args.verdicts, args.model if required_models is not None else None
+                found,
+                args.verdicts,
+                args.model if required_models is not None else None,
+                thread_duplication.PIPELINES[mail_pipeline],
             )
 
 
