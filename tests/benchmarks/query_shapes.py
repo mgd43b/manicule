@@ -344,7 +344,7 @@ async def _substituted(
         with gated_weighting(CANDIDATES[name], selected):
             yield
     else:
-        async with Runtime(settings) as runtime:
+        async with Runtime(settings, writer=False) as runtime:
             store = cast("SqliteDocStore", await runtime.documents())
             with candidates[name](store, selected):
                 yield
@@ -383,8 +383,12 @@ async def measure(
     emit(f"docs/ from {root}: {len(index.places)} chunks with {args.model}; {len(asked)} queries")
 
     corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
-    shutil.rmtree(work / "threads", ignore_errors=True)
-    indexed = await thread_duplication.index(corpus, work / "threads", overrides=overrides)
+    thread_dir = work / "threads"
+    if not args.reuse_mail_index:
+        shutil.rmtree(thread_dir, ignore_errors=True)
+    indexed = await thread_duplication.index(
+        corpus, thread_dir, overrides=overrides, reuse=args.reuse_mail_index
+    )
     indexes.append(indexed.data_dir)
     tl.unchanged(indexes, pinned)
     _, thread_asked = thread_duplication.queries(corpus)
@@ -490,6 +494,9 @@ def run_cli(
     parser.add_argument("--copies", type=int, default=lq.HELD_OUT_COPIES)
     parser.add_argument("--distractors", type=int, default=lq.HELD_OUT_DISTRACTORS)
     parser.add_argument("--work", type=Path, default=None, help="keep the indexes here")
+    parser.add_argument(
+        "--reuse-mail-index", action="store_true", help="reuse and verify the mail index in --work"
+    )
     args = parser.parse_args(argv)
     out = console()
 
@@ -509,6 +516,8 @@ def run_cli(
         return
     if args.docs is None:
         parser.error("--docs is required to measure")
+    if args.reuse_mail_index and args.work is None:
+        parser.error("--reuse-mail-index requires --work")
     args.docs = args.docs.resolve()
     if args.verdicts is not None:
         args.verdicts = args.verdicts.resolve()

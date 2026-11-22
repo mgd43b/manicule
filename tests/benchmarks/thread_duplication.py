@@ -77,7 +77,8 @@ from manicule.cli.render import console
 from manicule.config.settings import Settings
 from manicule.connectors.gmail_client import PAGE_SIZE
 from manicule.core.anchors import LineAnchor
-from manicule.core.content import RawDocument
+from manicule.core.content import DocumentStatus, RawDocument
+from manicule.core.ids import content_hash
 from manicule.core.retrieval import Filter, Query
 from manicule.evaluation.corpus import corpus_version_of
 from manicule.evaluation.queries import EvalQuery, Intent, Provenance, QuerySet
@@ -230,8 +231,9 @@ async def index(
     *,
     overrides: Mapping[str, Any],
     discovery: Discovery | None = None,
+    reuse: bool = False,
 ) -> Indexed:
-    """Serve the corpus from the synthetic Gmail and sync it through the shipped pipeline."""
+    """Sync synthetic Gmail, or verify a completed index against the same generated messages."""
     clock = SimulatedTime()
     server = FakeGmail(clock=clock, page_size=PAGE_SIZE)
     for thread in corpus.threads:
@@ -244,24 +246,33 @@ async def index(
         message.gmail_id = server.add_message(message.raw).id
 
     started = time.perf_counter()
-    async with Runtime(settings_for(data_dir, overrides), discovery=discovery) as runtime:
-        connector = connector_over(server, clock, name=SOURCE)
-        await connector.setup()
-        try:
-            report = await (await runtime.pipeline()).run(connector)
-        finally:
-            await connector.teardown()
+    messages = corpus.messages
+    async with Runtime(
+        settings_for(data_dir, overrides), discovery=discovery, writer=not reuse
+    ) as runtime:
+        if not reuse:
+            connector = connector_over(server, clock, name=SOURCE)
+            await connector.setup()
+            try:
+                report = await (await runtime.pipeline()).run(connector)
+            finally:
+                await connector.teardown()
+            if report.error or report.indexed != len(messages):
+                msg = f"indexed {report.indexed} of {len(messages)} messages: {report.error or '-'}"
+                raise RuntimeError(msg)
         elapsed = time.perf_counter() - started
-        messages = corpus.messages
-        if report.error or report.indexed != len(messages):
-            msg = f"indexed {report.indexed} of {len(messages)} messages: {report.error or '-'}"
-            raise RuntimeError(msg)
         store = cast("SqliteDocStore", await runtime.documents())
+        if reuse and (total := await store.count_documents()) != len(messages):
+            msg = f"the reused mail index has {total} documents; expected {len(messages)}"
+            raise RuntimeError(msg)
         truth: dict[str, ChunkTruth] = {}
         for message in messages:
             document = await store.find_document(SOURCE, message.gmail_id)
-            if document is None:
+            if document is None or document.status is not DocumentStatus.INDEXED:
                 msg = f"message {message.key} was not indexed"
+                raise RuntimeError(msg)
+            if reuse and document.content_hash != content_hash(message.raw):
+                msg = f"the reused mail index has different text for {message.key}"
                 raise RuntimeError(msg)
             located = locate(await canonical_lines(message.raw), message.carries)
             for chunk in await store.document_chunks(document.id):

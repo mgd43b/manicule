@@ -28,6 +28,7 @@ from tests.benchmarks.thread_duplication import (
     Hit,
     canonical_lines,
     carried,
+    index,
     locate,
     measure,
     rows,
@@ -190,3 +191,13 @@ async def test_the_program_runs_end_to_end_through_the_runtime(
     assert rows(result.outcomes, pipeline="hybrid", k=10)[-1].queries == len(
         result.query_set.queries
     )
+
+    reused = await index(
+        small(), result.indexed.data_dir, overrides=overrides, discovery=found, reuse=True
+    )
+    assert reused.chunks == result.indexed.chunks
+    different = build_corpus(seed=482, lengths=(2, 5), copies=1, distractors=2)
+    with pytest.raises(RuntimeError, match="different text"):
+        await index(
+            different, result.indexed.data_dir, overrides=overrides, discovery=found, reuse=True
+        )
