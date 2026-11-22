@@ -116,6 +116,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from pydantic import BaseModel
+
 from manicule.app.runtime import Runtime
 from manicule.cli.render import console
 from manicule.core.retrieval import ConfidenceBand
@@ -129,6 +131,7 @@ from tests.benchmarks.thread_duplication import _isolate  # pyright: ignore[repo
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Generator, Iterable, Mapping, Sequence
     from contextlib import AbstractContextManager
+    from typing import Any
 
     from manicule.config.settings import Settings
     from manicule.core.retrieval import Query
@@ -247,13 +250,13 @@ def _reciprocals(
     found = {
         o.asked.id: lq.reciprocal(o.rank)
         for o in docs
-        if o.asked.group in groups and (not only_gated or o.asked.text in gated)
+        if o.asked.group in groups and (not only_gated or o.asked.id in gated)
     }
     found.update(
         {
             o.asked.query.id: lq.reciprocal(o.first)
             for o in threads
-            if o.asked.form in forms and (not only_gated or o.asked.query.text in gated)
+            if o.asked.form in forms and (not only_gated or o.asked.query.id in gated)
         }
     )
     return found
@@ -350,6 +353,24 @@ async def _substituted(
                 yield
 
 
+async def _index_mail(
+    args: argparse.Namespace, directory: Path, overrides: Mapping[str, Any], pinned: str
+) -> tuple[thread_duplication.Indexed, list[thread_duplication.Asked]]:
+    corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
+    if args.reuse_mail_index:
+        if not (directory / tl.DATABASE).is_file():
+            msg = f"no reusable mail index at {directory}"
+            raise RuntimeError(msg)
+        tl.unchanged([directory], pinned)
+    else:
+        shutil.rmtree(directory, ignore_errors=True)
+    indexed = await thread_duplication.index(
+        corpus, directory, overrides=overrides, reuse=args.reuse_mail_index
+    )
+    _, asked = thread_duplication.queries(corpus)
+    return indexed, asked
+
+
 async def measure(
     args: argparse.Namespace,
     work: Path,
@@ -382,21 +403,9 @@ async def measure(
     tl.unchanged(indexes, pinned)
     emit(f"docs/ from {root}: {len(index.places)} chunks with {args.model}; {len(asked)} queries")
 
-    corpus = build_corpus(seed=args.seed, copies=args.copies, distractors=args.distractors)
-    thread_dir = work / "threads"
-    if args.reuse_mail_index:
-        if not (thread_dir / tl.DATABASE).is_file():
-            msg = f"no reusable mail index at {thread_dir}"
-            raise RuntimeError(msg)
-        tl.unchanged([thread_dir], pinned)
-    else:
-        shutil.rmtree(thread_dir, ignore_errors=True)
-    indexed = await thread_duplication.index(
-        corpus, thread_dir, overrides=overrides, reuse=args.reuse_mail_index
-    )
+    indexed, thread_asked = await _index_mail(args, work / "threads", overrides, pinned)
     indexes.append(indexed.data_dir)
     tl.unchanged(indexes, pinned)
-    _, thread_asked = thread_duplication.queries(corpus)
     progress("mail threads indexed")
     thread_settings = lq.settings_for(indexed.data_dir, overrides, lq.PIPELINES["hybrid"])
 
@@ -424,14 +433,18 @@ async def measure(
                     counted=frozenset({lq.EXHAUSTED_BUDGET}),
                 )
         threads[name] = run.outcomes
+        selected_count = len(selected)
         if candidates is None:
             exactly_the_counted(
                 CANDIDATES[name],
                 [item.text for item in asked] + [item.query.text for item in thread_asked],
                 selected,
             )
+            selected = {item.id for item in asked if item.text in selected} | {
+                item.query.id for item in thread_asked if item.query.text in selected
+            }
         gated[name] = frozenset(selected)
-        progress(f"{name} asked, {len(selected)} distinct queries gated")
+        progress(f"{name} asked, {selected_count} distinct queries gated")
     tl.unchanged(indexes, pinned)
     return Measured(dense, docs, threads, gated)
 
@@ -472,6 +485,35 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_cli(argv, description=__doc__)
 
 
+class ModelVerdicts(BaseModel):
+    """A verdict file whose model can be checked when combining runs."""
+
+    model: str
+    verdicts: dict[str, tuple[bool, float]]
+
+
+def load_model_verdicts(
+    paths: Sequence[Path], required: frozenset[str]
+) -> list[dict[str, tuple[bool, float]]]:
+    results = [
+        ModelVerdicts.model_validate_json(path.read_text(encoding="utf-8")) for path in paths
+    ]
+    if len(results) != len(required) or frozenset(result.model for result in results) != required:
+        msg = f"--choose requires one verdict file per model: {', '.join(sorted(required))}"
+        raise ValueError(msg)
+    return [result.verdicts for result in results]
+
+
+def _save_verdicts(found: Mapping[str, tl.Verdict], path: Path, model: str | None) -> None:
+    if model is None:
+        tl.saved(found, path)
+    else:
+        payload = ModelVerdicts(
+            model=model, verdicts={name: (v.fixes, v.gain) for name, v in found.items()}
+        )
+        path.write_text(payload.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+
 def run_cli(
     argv: Sequence[str] | None,
     *,
@@ -479,6 +521,7 @@ def run_cli(
     candidates: Mapping[str, Substitution] | None = None,
     round_number: int = 6,
     families: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], bool]] = FAMILIES,
+    required_models: frozenset[str] | None = None,
 ) -> None:
     """Run a fusion experiment on the docs and mail questions, or combine its verdicts."""
     parser = argparse.ArgumentParser(
@@ -511,10 +554,16 @@ def run_cli(
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     if args.choose:
-        if candidates is not None and len(args.choose) != 2:
-            parser.error("--choose requires the BGE-M3 and Qwen3 verdicts")
+        try:
+            per_model = (
+                [tl.loaded(path) for path in args.choose]
+                if required_models is None
+                else load_model_verdicts(args.choose, required_models)
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         chosen = choose(
-            [tl.loaded(path) for path in args.choose],
+            per_model,
             candidates=CANDIDATES if candidates is None else candidates,
         )
         emit(f"-> {'ship ' + chosen if chosen else 'no change'}")
@@ -536,7 +585,9 @@ def run_cli(
         measured = asyncio.run(measure(args, work, emit, candidates=candidates))
         found = report(measured, emit, round_number=round_number, families=families)
         if args.verdicts is not None:
-            tl.saved(found, args.verdicts)
+            _save_verdicts(
+                found, args.verdicts, args.model if required_models is not None else None
+            )
 
 
 if __name__ == "__main__":

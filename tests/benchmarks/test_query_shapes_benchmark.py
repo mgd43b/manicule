@@ -149,7 +149,7 @@ def test_a_loss_confined_to_the_gated_headings_fails_however_the_family_averages
     dense = [_outcome(title, 1)]
     docs = dict.fromkeys(CANDIDATES, shipped) | {"short-dense": candidate}
     threads: dict[str, list[thread_duplication.Outcome]] = {name: [] for name in CANDIDATES}
-    selected = dict.fromkeys(CANDIDATES, frozenset({"Auth", "Scope", "retrieval"}))
+    selected = dict.fromkeys(CANDIDATES, frozenset({title.id, *(a.id for a in gated)}))
 
     found = verdicts(dense, docs, threads, selected)["short-dense"]
     assert found.families["headings"].interval[0] > 0

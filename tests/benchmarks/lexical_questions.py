@@ -899,8 +899,8 @@ async def run_docs(
                 raise TypeError(msg)
             scope = Filter(workspace_ids=frozenset({runtime.workspace}))
             for item in asked:
-                result = await retriever.retrieve(
-                    Query(text=item.text, limit=max(KS), filter=scope)
+                result = await thread_duplication.for_question(
+                    item.id, retriever.retrieve(Query(text=item.text, limit=max(KS), filter=scope))
                 )
                 refused = [
                     reason

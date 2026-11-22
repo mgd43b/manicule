@@ -53,6 +53,7 @@ from manicule.retrieval.fusion import RRFStage
 from manicule.retrieval.title_match import promote
 from tests.benchmarks import query_shapes as qs
 from tests.benchmarks.lexical_questions import TWO_WORDS
+from tests.benchmarks.thread_duplication import QUESTION_ID
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -71,7 +72,11 @@ def _promotion(
         ordered = await shipped(stage, query, candidates)
         promoted = await promote(store, query, ordered, require_dense_leader=require_dense_leader)
         if promoted is not ordered:
-            selected.add(query.text)
+            question_id = QUESTION_ID.get()
+            if question_id is None:
+                msg = "title promotion ran outside a benchmark question"
+                raise RuntimeError(msg)
+            selected.add(question_id)
         return promoted
 
     with patch.object(RRFStage, "run", run):
@@ -99,7 +104,14 @@ FAMILIES = _WHOLE_FAMILIES | {
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    qs.run_cli(argv, description=__doc__, candidates=CANDIDATES, round_number=7, families=FAMILIES)
+    qs.run_cli(
+        argv,
+        description=__doc__,
+        candidates=CANDIDATES,
+        round_number=7,
+        families=FAMILIES,
+        required_models=frozenset({"BAAI/bge-m3", "qwen3-embedding:0.6b"}),
+    )
 
 
 if __name__ == "__main__":

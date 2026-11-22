@@ -205,3 +205,10 @@ async def test_the_program_runs_end_to_end_through_the_runtime(
         await index(
             different, result.indexed.data_dir, overrides=overrides, discovery=found, reuse=True
         )
+    changed_chunker = overrides | {
+        "plugins": {"config": {"chunker.structural": {"max_tokens": 256}}}
+    }
+    with pytest.raises(RuntimeError, match="different chunk fingerprint"):
+        await index(
+            small(), result.indexed.data_dir, overrides=changed_chunker, discovery=found, reuse=True
+        )

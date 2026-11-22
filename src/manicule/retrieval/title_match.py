@@ -94,8 +94,9 @@ class TitleMatchStage:
 
     async def run(self, query: Query, candidates: list[Candidate]) -> list[Candidate]:
         ordered = await promote(self._docstore, query, candidates, require_dense_leader=True)
-        record(promoted=ordered is not candidates)
-        return ordered
+        promoted = ordered is not candidates
+        record(promoted=promoted)
+        return ordered if promoted else list(candidates)
 
 
 __all__ = ["TitleMatchStage", "promote"]

@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
 
 from manicule.core.content import DocumentStatus
 from manicule.core.retrieval import Candidate, Filter, Query
-from manicule.retrieval.title_match import promote
+from manicule.retrieval.fusion import RRFStage
+from manicule.retrieval.title_match import TitleMatchStage, promote
+from tests.benchmarks.exact_titles import CANDIDATES
+from tests.benchmarks.query_shapes import ModelVerdicts, load_model_verdicts
+from tests.benchmarks.thread_duplication import for_question
 from tests.storage_helpers import make_chunk, make_document
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.mark.parametrize(
@@ -87,3 +95,48 @@ async def test_a_title_from_a_new_publication_does_not_promote_a_stale_chunk() -
     ]
 
     assert await promote(store, query, ordered, require_dense_leader=True) is ordered
+
+
+async def test_expanded_query_promotion_is_counted_under_the_original_question() -> None:
+    target = make_document(source_id="target", title="Access Tokens")
+    other = make_document(source_id="other")
+    store = AsyncMock()
+    store.list_documents.return_value = [target, other]
+    candidates = [
+        Candidate(chunk=make_chunk(target, 0, "target"), score=0.9, scores={"dense": 0.9}),
+        Candidate(
+            chunk=make_chunk(other, 0, "other"),
+            score=0.8,
+            scores={"dense": 0.8, "lexical": 1.0},
+        ),
+    ]
+    rewritten = Query(text="Access Tokens", filter=Filter(workspace_ids=frozenset({"w"})))
+    selected: set[str] = set()
+    stage = RRFStage()
+    with CANDIDATES["dense-leader-title"](store, selected):
+        ordered = await for_question("heading-original", stage.run(rewritten, candidates))
+    assert ordered[0].chunk.document_id == target.id
+    assert selected == {"heading-original"}
+
+
+async def test_the_title_stage_returns_a_fresh_list_on_a_no_op() -> None:
+    scope = Filter(workspace_ids=frozenset({"w"}))
+    empty: list[Candidate] = []
+    stage = TitleMatchStage(docstore=AsyncMock())
+    output = await stage.run(Query(text="notes", filter=scope), empty)
+    assert output == []
+    assert output is not empty
+
+
+def test_choosing_needs_two_distinct_required_models(tmp_path: Path) -> None:
+    models = frozenset({"BAAI/bge-m3", "qwen3-embedding:0.6b"})
+    files: list[Path] = []
+    for i, model in enumerate(sorted(models)):
+        path = tmp_path / f"verdict-{i}.json"
+        payload = ModelVerdicts(model=model, verdicts={"dense-leader-title": (True, 0.0)})
+        path.write_text(payload.model_dump_json(), encoding="utf-8")
+        files.append(path)
+    first, second = files
+    assert len(load_model_verdicts([first, second], models)) == 2
+    with pytest.raises(ValueError, match="one verdict file per model"):
+        load_model_verdicts([first, first], models)

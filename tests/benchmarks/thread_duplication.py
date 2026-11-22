@@ -68,6 +68,7 @@ import statistics
 import tempfile
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -76,6 +77,7 @@ from manicule.app.runtime import Runtime
 from manicule.cli.render import console
 from manicule.config.settings import Settings
 from manicule.connectors.gmail_client import PAGE_SIZE
+from manicule.container import keys
 from manicule.core.anchors import LineAnchor
 from manicule.core.content import DocumentStatus, RawDocument
 from manicule.core.ids import content_hash
@@ -94,8 +96,9 @@ from tests.connectors.fake_gmail import FakeGmail, SimulatedTime
 from tests.connectors.gmail_support import connector_over
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Awaitable, Iterable, Mapping, Sequence
 
+    from manicule.container.container import Container
     from manicule.plugins import Discovery
     from manicule.storage.docstore import SqliteDocStore
 
@@ -113,6 +116,16 @@ CARRIES = 0.5
 """The share of a passage's characters a chunk must hold to count as carrying it."""
 
 _QUOTE_MARKERS = re.compile(r"^\s*(?:>\s?)+")
+QUESTION_ID: ContextVar[str | None] = ContextVar("benchmark_question_id", default=None)
+
+
+async def for_question[T](question_id: str, retrieval: Awaitable[T]) -> T:
+    """Carry a question's identity across its original and glossary-expanded passes."""
+    token = QUESTION_ID.set(question_id)
+    try:
+        return await retrieval
+    finally:
+        QUESTION_ID.reset(token)
 
 
 # --- where each passage sits ---------------------------------------------------------------------
@@ -262,9 +275,8 @@ async def index(
                 raise RuntimeError(msg)
         elapsed = time.perf_counter() - started
         store = cast("SqliteDocStore", await runtime.documents())
-        if reuse and (total := await store.count_documents()) != len(messages):
-            msg = f"the reused mail index has {total} documents; expected {len(messages)}"
-            raise RuntimeError(msg)
+        if reuse:
+            await verify_reusable(runtime, store, len(messages))
         truth: dict[str, ChunkTruth] = {}
         for message in messages:
             document = await store.find_document(SOURCE, message.gmail_id)
@@ -287,6 +299,20 @@ async def index(
         chunk_count=len(truth),
         seconds=elapsed,
     )
+
+
+async def verify_reusable(runtime: Runtime, store: SqliteDocStore, expected: int) -> None:
+    """Check corpus size and the same resolved chunk fingerprint ingest uses."""
+    if (total := await store.count_documents()) != expected:
+        msg = f"the reused mail index has {total} documents; expected {expected}"
+        raise RuntimeError(msg)
+    chunker = await cast("Container", runtime.container_view).aget(keys.CHUNKER)
+    middleware = await runtime.middleware()
+    requested = chunker.fingerprint.with_middleware(middleware.declarations())
+    recorded = (await store.index_fingerprints()).chunk
+    if recorded is None or recorded.canonical() != requested.canonical():
+        msg = "the reused mail index has a different chunk fingerprint"
+        raise RuntimeError(msg)
 
 
 # --- the queries ---------------------------------------------------------------------------------
@@ -492,7 +518,9 @@ async def run_pipeline(
             retriever, config_label=name, corpus_version=version, workspace_ids=scope
         )
         for item in asked:
-            result = await system.search(item.query.text, limit=max(ks))
+            result = await for_question(
+                item.query.id, system.search(item.query.text, limit=max(ks))
+            )
             single_leg = any(r.startswith(LEXICAL_EMPTY) for r in result.incomparable)
             refused = [
                 r
@@ -515,8 +543,11 @@ async def run_pipeline(
                 Hit(rank, entry.score or 0.0, indexed.chunks[entry.chunk_id or ""])
                 for rank, entry in enumerate(result.items, start=1)
             ]
-            pool = await retriever.retrieve(
-                Query(text=item.query.text, limit=max(ks), filter=Filter(workspace_ids=scope))
+            pool = await for_question(
+                item.query.id,
+                retriever.retrieve(
+                    Query(text=item.query.text, limit=max(ks), filter=Filter(workspace_ids=scope))
+                ),
             )
             companion_pool = next(
                 (
