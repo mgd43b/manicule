@@ -117,14 +117,32 @@ def _run(path: Path) -> float:
     return float(out[0])
 
 
+def _refusal(path: Path) -> str | None:
+    """What onnxruntime says when it will not open ``path``, or ``None`` when it opens it."""
+    try:
+        _run(path)
+    except Exception as error:  # noqa: BLE001 - the message of whatever it raises is the subject
+        return str(error)
+    return None
+
+
 def test_onnxruntime_refuses_the_sharded_layout_which_is_why_any_of_this_exists(
     tmp_path: Path,
 ) -> None:
-    """The control. If this stops raising, ``colocated`` has nothing left to do."""
+    """The control: where onnxruntime refuses the layout, it has to be the refusal this fix targets.
+
+    onnxruntime 1.32 opens the sharded layout, and the project still supports releases back to
+    its declared floor that refuse it, so ``colocated`` stays. On a runtime that accepts the
+    layout this skips, naming the version, rather than failing: the helper is then idle on that
+    installation, not wrong. Raise the floor past the last refusing release to retire the helper.
+    """
     graph = _snapshot(tmp_path, sharded=True)
 
-    with pytest.raises(Exception, match="escapes model directory"):
-        _run(graph)
+    refusal = _refusal(graph)
+
+    if refusal is None:
+        pytest.skip(f"onnxruntime {ort.__version__} opens the sharded layout without staging")
+    assert "escapes model directory" in refusal
 
 
 def test_the_sharded_layout_opens_once_its_weights_are_beside_the_graph(tmp_path: Path) -> None:
