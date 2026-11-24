@@ -197,7 +197,9 @@ def _stable_hash(text: str) -> int:
     one run to the next, and the dense leg's similarity floor makes a ranking test flaky on that.
     """
     return int.from_bytes(
-        hashlib.blake2b(text.encode(), digest_size=8).digest(), "big", signed=True
+        hashlib.blake2b(text.encode(errors="surrogatepass"), digest_size=8).digest(),
+        "big",
+        signed=True,
     )
 
 
