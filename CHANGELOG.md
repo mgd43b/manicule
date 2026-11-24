@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.31](https://github.com/mgd43b/manicule/compare/v0.2.30...v0.2.31) (2026-11-24)
+
+
+### Bug Fixes
+
+* **deps:** bump astral-sh/uv ([#575](https://github.com/mgd43b/manicule/issues/575)) ([1c6d85a](https://github.com/mgd43b/manicule/commit/1c6d85ac895f2165ff92d673cad9dfd2e92c70f0))
+* **deps:** bump the index-affecting-embedding group with 2 updates ([#573](https://github.com/mgd43b/manicule/issues/573)) ([33869a5](https://github.com/mgd43b/manicule/commit/33869a52228cad65f0091a3c3c9ffb90a878b7d4))
+* **deps:** bump the runtime group with 8 updates ([#578](https://github.com/mgd43b/manicule/issues/578)) ([4cbf3a8](https://github.com/mgd43b/manicule/commit/4cbf3a8b6dc9ea322727384a96e119eef20a6358))
+* **deps:** bump tree-sitter-language-pack ([#576](https://github.com/mgd43b/manicule/issues/576)) ([8559f7f](https://github.com/mgd43b/manicule/commit/8559f7fc927dc634f752f16e76939218a8abf92f))
+* **deps:** bump tree-sitter-language-pack ([#576](https://github.com/mgd43b/manicule/issues/576)) ([061fc41](https://github.com/mgd43b/manicule/commit/061fc418b8b8bf30b6b64aff2e54fb32ad415433))
+* **retrieval:** promote exact titles supported by the dense leader ([#571](https://github.com/mgd43b/manicule/issues/571)) ([319119b](https://github.com/mgd43b/manicule/commit/319119b02e66836026aa370048f27faf5b2f1c02))
+
 ## [0.2.30](https://github.com/mgd43b/manicule/compare/v0.2.29...v0.2.30) (2026-11-21)
 
 
