@@ -194,7 +194,7 @@ serve = [          # #8 — the CLI and the MCP server. #11 — the HTTP API. #1
   # passes; what the ceiling stands between is an *installation* that resolved the newest Typer
   # (the `dist` job in ci.yml, and anybody running `pip install manicule`). Lift it by moving the
   # shared options to a public mechanism, not by teaching this constructor a second shape.
-  "typer>=0.15,<0.30",
+  "typer>=0.15,<0.29",
   # Rich renders the tables, progress and diagnostics. MIT.
   "rich>=13.9",
   # FastMCP is decorators over functions: the tool surface is the service surface, with no
