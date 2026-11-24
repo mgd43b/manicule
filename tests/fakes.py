@@ -193,10 +193,8 @@ class BlockChunker:
 def _stable_hash(text: str) -> int:
     """A signed 64-bit hash of ``text`` that is the same in every process.
 
-    The builtin ``hash`` is salted per interpreter, so vectors built from it differ from one run
-    to the next. The dense leg floors on similarity, and a salt that happened to put two passages
-    far apart dropped one of them from the leg, which failed a test that asserted both legs
-    scored every hit, about one run in forty.
+    The builtin ``hash`` is salted per interpreter, so vectors built from it would differ from
+    one run to the next, and the dense leg's similarity floor makes a ranking test flaky on that.
     """
     return int.from_bytes(
         hashlib.blake2b(text.encode(), digest_size=8).digest(), "big", signed=True
