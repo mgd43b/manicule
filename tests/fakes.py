@@ -10,6 +10,7 @@ Deliberately kept honest. Where an implementation would be wrong, there is a mat
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -189,8 +190,24 @@ class BlockChunker:
         return chunks
 
 
+def _stable_hash(text: str) -> int:
+    """A signed 64-bit hash of ``text`` that is the same in every process.
+
+    The builtin ``hash`` is salted per interpreter, so vectors built from it differ from one run
+    to the next. The dense leg floors on similarity, and a salt that happened to put two passages
+    far apart dropped one of them from the leg, which failed a test that asserted both legs
+    scored every hit, about one run in forty.
+    """
+    return int.from_bytes(
+        hashlib.blake2b(text.encode(), digest_size=8).digest(), "big", signed=True
+    )
+
+
 class HashEmbedder:
     """Deterministic vectors at whatever dimension its fingerprint declares.
+
+    Deterministic across processes as well as within one: the same text is the same vector on
+    every run, on every machine.
 
     The dimension is a constructor argument, so a test can ask for an unusual one and see
     whether anything downstream had assumed a common one.
@@ -223,7 +240,8 @@ class HashEmbedder:
     async def embed(self, texts: Sequence[str]) -> list[Vector]:
         self.seen.extend(texts)
         dimension = self.fingerprint.dimension
-        return [[((hash(text) >> (i * 3)) % 100) / 100 for i in range(dimension)] for text in texts]
+        digests = [_stable_hash(text) for text in texts]
+        return [[((digest >> (i * 3)) % 100) / 100 for i in range(dimension)] for digest in digests]
 
 
 class TruncatingEmbedder(HashEmbedder):
